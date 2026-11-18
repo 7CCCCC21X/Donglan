@@ -241,7 +241,8 @@ class StatusTest(unittest.TestCase):
             self.assertEqual(await server.route("GET", "/healthz", {}, {}), (200, "text/plain; charset=utf-8", "ok"))
             self.assertEqual((await server.route("GET", "/status", {}, {}))[0], 403)
             self.assertEqual((await server.route("GET", "/status", {"key": ["k" * 12]}, {}))[2], "状态")
-            self.assertEqual((await server.route("POST", "/pause", {}, {"x-status-key": "k" * 12}))[2], "pause:状态页")
+            self.assertEqual((await server.route("POST", "/pause", {}, {"x-status-key": "k" * 12}))[0], 403)  # no X-RT: refused
+            self.assertEqual((await server.route("POST", "/pause", {}, {"x-status-key": "k" * 12, "x-rt": "1"}))[2], "pause:状态页")
             self.assertEqual((await server.route("GET", "/pause", {"key": ["k" * 12]}, {}))[0], 405)
         asyncio.run(go())
 

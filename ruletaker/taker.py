@@ -38,6 +38,7 @@ from typing import Any
 from . import VERSION
 from . import http as nethttp
 from .clock import day_spans_text
+from . import console
 from .config import Config, RuleSettings
 from .predict import (API_BASES, PREDICT_REST, RPC_URLS, Chain, NotSent, OrderRejected, PredictApi, book_up_first,
                       category_market, http_status, market_start_price, order_fill, order_final, order_price,
@@ -126,7 +127,7 @@ MODE_RANK = {"off": 0, "paper": 1, "on": 2}
 
 class RuleTaker:
     def __init__(self, config: Config, store: Any, *, api: Any = None, wallet: Any = None, chain: Any = None, stream: Any = None,
-                 index: Any = None, telegram: Any = None, clock: Any = None):
+                 index: Any = None, telegram: Any = None, clock: Any = None, base_env: dict | None = None):
         from .stream import BookStream
         self.config = config
         self.store = store
@@ -134,7 +135,15 @@ class RuleTaker:
         self.env_mode = config.rules.mode
         saved = str(store.get("control:mode") or "")
         mode = saved if saved in MODE_RANK and MODE_RANK[saved] < MODE_RANK[self.env_mode] else self.env_mode
-        self.settings: RuleSettings = config.rules.with_mode(mode)
+        # the control page's saved settings over the settings file's (console.py); one that no longer parses is dropped and told
+        self.base_env = {k: str(v) for k, v in (base_env if base_env is not None else console.current(config.rules, config.max_daily_loss_usd)).items()
+                         if k.startswith("RULE_") and k != "RULE_TAKER"}
+        settings, self.loss_cap, self.saved_settings, self.settings_dropped = console.settle_saved(
+            self.base_env, dict(store.get(console.SAVED) or {}), mode)
+        if self.settings_dropped:
+            store.put(console.SAVED, self.saved_settings)
+        self.settings: RuleSettings = settings
+        self.review_held: dict = {}
         self.wallet = wallet if wallet is not None else (Wallet(config.private_key, config.chain_id, config.account) if config.private_key else None)
         base = API_BASES.get(config.chain_id, PREDICT_REST)
         self.api = api if api is not None else PredictApi(base, config.api_key, self.wallet, config.rate_per_min)
@@ -297,7 +306,7 @@ class RuleTaker:
     def loss_floor(self) -> float | None:
         """The day's settled P&L at which no new order goes out (RULE_MAX_DAILY_LOSS_USD below zero, or below the P&L at which
         the operator resumed after a stop that day); None with no cap."""
-        cap = self.config.max_daily_loss_usd
+        cap = self.loss_cap
         if not cap:
             return None
         today = day_of(self.now())
@@ -1772,9 +1781,9 @@ class RuleTaker:
             floor = self.loss_floor()
             pnl = day_pnl(self.recs, day_of(self.now()))
             if floor is not None and pnl <= floor:
-                self.loss_floor_at = {"day": day_of(self.now()), "floor": pnl - self.config.max_daily_loss_usd}
+                self.loss_floor_at = {"day": day_of(self.now()), "floor": pnl - self.loss_cap}
                 self.store.put("control:loss_floor", self.loss_floor_at)
-                parts.append(f"今日停机线移到 {money(self.loss_floor_at['floor'])}（从现在的 {money(pnl)} 起再亏 ${self.config.max_daily_loss_usd:g} 再停）")
+                parts.append(f"今日停机线移到 {money(self.loss_floor_at['floor'])}（从现在的 {money(pnl)} 起再亏 ${self.loss_cap:g} 再停）")
             return "▶️ " + ("；".join(parts) if parts else "本来就没有暂停") + f"｜现在：{self.mode_text()}"
         if what == "mode":
             want = arg.strip().lower()
@@ -1782,7 +1791,7 @@ class RuleTaker:
                 return "用法：/mode off | paper | on（不会高于部署变量 RULE_TAKER）"
             if MODE_RANK[want] > MODE_RANK[self.env_mode]:
                 return f"部署变量 RULE_TAKER={self.env_mode}，这里最多调到 {self.env_mode}（要真实吃单先改部署变量再重启）"
-            self.configure(self.config.rules.with_mode(want))
+            self.configure(self.settings.with_mode(want))
             self.store.put("control:mode", want if want != self.env_mode else "")
             line = await self.withdraw_all("改成" + MODES[want]) if want != "on" else ""
             return f"规则吃单改成：{MODES[want]}" + (f"\n{line}" if line else "")
@@ -1799,6 +1808,98 @@ class RuleTaker:
         if command == "/mode":
             return await self.control("mode", args)
         return "命令：/status /pause /resume /mode off|paper|on /id"
+
+    # -- the control page and the review page --
+    async def save_settings(self, values: dict) -> str:
+        """The control page's save: checked whole against the settings file with the other saved values (a wrong one changes
+        nothing), saved — in force now and after a restart — and the windows planned again with it at the next tick."""
+        values = console.clean(values)
+        saved = {**self.saved_settings, **values}
+        settings, cap = console.build(self.base_env, saved, self.settings.mode)
+        self.saved_settings, self.loss_cap = saved, cap
+        self.store.put(console.SAVED, saved)
+        await asyncio.to_thread(self.store.flush, 10.0)
+        self.configure(settings)
+        names = "、".join(console.FIELDS[k][1] + "＝" + (v or "（空）") for k, v in values.items())
+        self.notify(f"⚙️ 规则吃单设置已改（控制台）：{names}")
+        return f"已保存：{names}"
+
+    async def reset_settings(self, keys: list) -> str:
+        """Back to the settings file's value for these fields (all of them when ``keys`` is empty)."""
+        keys = [k for k in (keys or list(self.saved_settings)) if k in self.saved_settings]
+        saved = {k: v for k, v in self.saved_settings.items() if k not in keys}
+        settings, cap = console.build(self.base_env, saved, self.settings.mode)
+        self.saved_settings, self.loss_cap = saved, cap
+        self.store.put(console.SAVED, saved)
+        await asyncio.to_thread(self.store.flush, 10.0)
+        self.configure(settings)
+        return "已恢复部署设置：" + ("、".join(console.FIELDS[k][1] for k in keys if k in console.FIELDS) or "（没有网页保存的值）")
+
+    def settings_view(self) -> list:
+        return console.view(self.settings, self.loss_cap, self.saved_settings)
+
+    def review_data(self, days: int = 30) -> dict:
+        """The review page's numbers (review.review), kept 30 s; not worked out in the race's seconds — the one kept is given
+        then (a few ms with hundreds of records, but never on an order's way)."""
+        from .review import review
+        now = self.now()
+        held = self.review_held.get(days)
+        if held is not None and (now - held[0] < 30_000 or self.quiet_ms(now) > 0):
+            return {**held[1], "computed_ms": held[0]}
+        if self.quiet_ms(now) > 0:
+            return {"busy": "抢单时刻前后这几秒不算复盘数据，稍后再刷新", "computed_ms": now}
+        data = review(self.recs, self.settings, now, days)
+        self.review_held[days] = (now, data)
+        return {**data, "computed_ms": now}
+
+    def state(self) -> dict:
+        """The control page's view of now: the mode and why no order goes out, the account, the connections, the per-second
+        hours and the makers' moments ahead, each rule's next window and what its last look said, the speed, the network,
+        the problems, the settings."""
+        now, s = self.now(), self.settings
+        lags = list(self.loop_lags)
+        host = getattr(self.api, "host", "")
+        net = nethttp.HTTP_NET.get(host) or {}
+        trips = list(getattr(self.api, "trips", ()) or ())
+        mid = lambda xs: round(statistics.median(xs), 1) if xs else None
+        reads, writes = [ms for m, ms in trips if m == "GET"], [ms for m, ms in trips if m != "GET"]
+        rules = []
+        for rule in RULES:
+            nxt = min((w for w in self.track.values() if w["rule"] == rule.key), key=lambda w: w["start"], default=None)
+            rules.append({"key": rule.key, "name": rule.name, "market": rule.market, "side": rule.side, "word": rule.word, "when": rule.when,
+                          "cents": s.price(rule.key) if s.on(rule.market) else 0, "live_cents": self.live_cents(rule),
+                          "next_ms": nxt["start"] if nxt else None, "moment_ms": self.moment(nxt) if nxt else None,
+                          "listed": bool(nxt and nxt["market"] is not None), "state": (nxt or {}).get("word", ""),
+                          "phase": self.phase(nxt, now) if nxt else ""})
+        wait = s.fast_in(now)
+        floor = self.loss_floor()
+        return {"version": VERSION, "now_ms": now, "region": self.region, "mode": s.mode, "env_mode": self.env_mode, "modes": MODES,
+                "paused": self.paused, "blocked": self.block(0.0) if s.mode == "on" else "", "ready": self.ready,
+                "not_ready": self.not_ready_why if s.mode == "on" and not self.ready else "", "trading_allowed": self.config.trading_allowed,
+                "account": {"kind": self.wallet.kind if self.wallet else "", "maker": self.wallet.maker if self.wallet else "",
+                            "usdt": from_wei(self.usdt) if self.usdt is not None else None, "spendable": self.usd(),
+                            "bnb": from_wei(self.bnb) if self.bnb is not None else None, "balance_ms": self.balance_ms,
+                            "balance_error": self.balance_error, "signed_in": bool(self.api.fresh()) if hasattr(self.api, "fresh") else False},
+                "stream": {"connected": self.stream.connected, "alive": self.stream.alive(), "error": self.stream.error,
+                           "connects": self.stream.connects, "lag_ms": mid(list(self.stream.lags))},
+                "index": ({"connected": self.index.ws is not None, "error": self.index.error, "pushes": self.index.pushes}
+                          if self.index is not None else None),
+                "fast": {"hours": day_spans_text(s.fast), "active": self.fast, "next_ms": now + wait if wait else None,
+                         "looks": self.fast_looks, "verifies": self.verifies, "diffs": self.verify_diffs},
+                "lead_minutes": s.lead_minutes, "plan": self.first_plan(now),
+                "today": {"spent": round(spent_on(self.recent(), day_of(now), s.mode), 2), "pnl": round(self.today_pnl(), 4),
+                          "max_day_usd": s.max_day_usd, "loss_cap": self.loss_cap, "loss_floor": floor,
+                          "open_cost": round(open_cost(self.recs), 2)},
+                "rules": rules, "speed": speed_stats(self.recs, now - 30 * DAY_MS),
+                "net": {"region": self.region, "host": host, "edge": net.get("edge", ""), "connect_ms": mid(list(net.get("connect") or ())),
+                        "read_ms": mid(reads), "read_best_ms": round(min(reads), 1) if reads else None,
+                        "write_ms": mid(writes), "write_best_ms": round(min(writes), 1) if writes else None},
+                "process": {"loop_lag_ms": mid(lags), "loop_lag_max_ms": round(max(lags), 1) if lags else None,
+                            "native_signing": native_signing(), "presigned": self.presigned, "presign_hits": self.presign_hits,
+                            "first_ticks": self.first_ticks, "eager": EAGER, "python": f"{sys.version_info[0]}.{sys.version_info[1]}"},
+                "errors": [{"at": at, "text": text} for at, text in list(self.errors)[-12:]][::-1],
+                "settings": self.settings_view(), "settings_dropped": self.settings_dropped,
+                "fast_line": self.fast_line(now)}
 
     def mode_text(self) -> str:
         why = self.block(0.0) if self.settings.mode == "on" else ""

@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>规则吃单 · 控制台</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1d2330;--mut:#667085;--line:#e4e7ec;--acc:#2f6fed;--ok:#12805c;--bad:#c62f2f;--warn:#b25e09;--chip:#eef2f8;--up:#12805c;--down:#c62f2f}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1218;--card:#171b23;--ink:#e6e9ef;--mut:#98a2b3;--line:#2a303b;--acc:#6b9bff;--ok:#3ccf91;--bad:#ff6b6b;--warn:#f0a44b;--chip:#222836;--up:#3ccf91;--down:#ff6b6b}}
+:root[data-theme="dark"]{--bg:#0f1218;--card:#171b23;--ink:#e6e9ef;--mut:#98a2b3;--line:#2a303b;--acc:#6b9bff;--ok:#3ccf91;--bad:#ff6b6b;--warn:#f0a44b;--chip:#222836;--up:#3ccf91;--down:#ff6b6b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif}
+header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line)}
+.bar{max-width:1180px;margin:0 auto;padding:10px 16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.bar h1{font-size:16px;margin:0 8px 0 0}
+.tabs{display:flex;gap:4px}
+.tabs button{border:0;background:none;color:var(--mut);font:inherit;padding:6px 12px;border-radius:8px;cursor:pointer}
+.tabs button.on{background:var(--chip);color:var(--ink);font-weight:600}
+.spacer{flex:1}
+.tiny{font-size:12px;color:var(--mut)}
+main{max-width:1180px;margin:0 auto;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:14px;min-width:0}
+.grid .card{margin:0}
+.card h2{font-size:15px;margin:0 0 10px}
+.card h3{font-size:13px;margin:14px 0 6px;color:var(--mut);font-weight:600}
+.k{font-size:12px;color:var(--mut)}
+.v{font-size:20px;font-weight:650;margin-top:2px;word-break:break-word}
+.v.s{font-size:15px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.mut{color:var(--mut)}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;background:var(--chip);font-size:12px;margin-left:6px;vertical-align:1px}
+.pill.ok{background:color-mix(in srgb,var(--ok) 15%,transparent)}.pill.bad{background:color-mix(in srgb,var(--bad) 15%,transparent)}.pill.warn{background:color-mix(in srgb,var(--warn) 15%,transparent)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button.b{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:6px 12px;cursor:pointer}
+button.b:hover{border-color:var(--acc)}
+button.b.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+button.b.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 50%,var(--line))}
+button.b.sel{background:var(--chip);border-color:var(--acc);font-weight:600}
+button.b:disabled{opacity:.45;cursor:not-allowed}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-right:1px solid var(--line);background:var(--card);color:var(--ink);font:inherit;padding:6px 12px;cursor:pointer}
+.seg button:last-child{border-right:0}.seg button.sel{background:var(--acc);color:#fff}.seg button:disabled{opacity:.4;cursor:not-allowed}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top;white-space:nowrap}
+th{color:var(--mut);font-weight:600;font-size:12px}
+td.wrap{white-space:normal;min-width:220px}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.line{margin:4px 0;word-break:break-word}
+.fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px}
+.field{border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.field .fh{display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
+.field .cur{font-weight:650}
+.field .presets{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 6px}
+.field .presets button{font:inherit;font-size:12px;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:99px;padding:2px 10px;cursor:pointer}
+.field .presets button.sel{border-color:var(--acc);background:var(--chip);font-weight:600}
+.field input{font:inherit;width:120px;padding:5px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
+.field details{margin-top:6px;font-size:12px;color:var(--mut)}
+.field summary{cursor:pointer}
+details.more>summary{cursor:pointer;color:var(--acc);margin:6px 0}
+#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:9px 16px;border-radius:10px;font-size:13px;max-width:92vw;opacity:0;transition:opacity .2s;pointer-events:none;z-index:9}
+#toast.show{opacity:.95}#toast.bad{background:var(--bad);color:#fff}
+.chart{width:100%;height:220px;display:block}
+.chart .grid line{stroke:var(--line)}.chart text{fill:var(--mut);font-size:11px}
+.chart .on{fill:none;stroke:var(--acc);stroke-width:2}.chart .paper{fill:none;stroke:var(--mut);stroke-width:1.6;stroke-dasharray:5 4}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--mut);margin-top:4px}.legend i{display:inline-block;width:18px;height:0;border-top:2px solid var(--acc);vertical-align:middle;margin-right:4px}.legend i.p{border-top:2px dashed var(--mut)}
+.hide{display:none!important}
+.empty{color:var(--mut);padding:8px 0}
+</style>
+</head>
+<body>
+<header><div class="bar">
+  <h1>规则吃单</h1>
+  <div class="tabs"><button id="t-console" class="on" type="button">控制台</button><button id="t-review" type="button">复盘</button></div>
+  <span class="spacer"></span>
+  <span class="tiny" id="clock"></span>
+  <button class="b" id="theme" type="button" title="深色 / 浅色">◐</button>
+</div></header>
+<main>
+<section id="p-console">
+  <div class="grid" id="summary"></div>
+  <div class="card" style="margin-top:14px">
+    <h2>操作</h2>
+    <div class="row">
+      <span class="k">模式</span><span class="seg" id="modes"></span>
+      <button class="b" id="pause" type="button">暂停</button>
+      <button class="b danger" id="withdraw" type="button">撤掉全部挂单</button>
+    </div>
+    <div class="tiny" id="modehint" style="margin-top:8px"></div>
+  </div>
+  <div class="card"><h2>每条规则的下一场</h2><div class="scroll"><table id="next"></table></div><div class="tiny" id="plan" style="margin-top:8px"></div></div>
+  <div class="card"><h2>速度与网络</h2><div id="speed"></div></div>
+  <div class="card"><h2>设置 <span class="tiny">（保存后立即生效，重启后仍然有效；“恢复部署设置”回到设置文件里的值）</span></h2><div id="settings"></div></div>
+  <div class="card"><h2>最近问题</h2><div id="errors"></div></div>
+</section>
+<section id="p-review" class="hide">
+  <div class="card"><div class="row"><span class="k">时间范围（按场次开场）</span><span class="seg" id="ranges"></span>
+    <span class="spacer"></span><a class="tiny" id="csv" href="api/records.csv">导出全部订单 CSV</a></div>
+    <div class="tiny" id="rnote" style="margin-top:6px"></div></div>
+  <div class="grid" id="totals"></div>
+  <div class="card" style="margin-top:14px"><h2>累计盈亏（已结算）</h2><div id="chart"></div></div>
+  <div class="card"><h2>按规则</h2><div id="byrule"></div></div>
+  <div class="card"><h2>盘口观察 <span class="tiny">（卖单出现、被吃的时间按 Predict 盘口自己的时间戳）</span></h2><div id="watch"></div></div>
+  <div class="card"><h2>抢单记录</h2><div id="races"></div></div>
+  <div class="card"><h2>按日期</h2><div id="daily"></div></div>
+  <div class="card"><h2>最近的场次</h2><div id="recent"></div></div>
+</section>
+</main>
+<div id="toast"></div>
+<script>
+"use strict";
+const KEY="rt-status-key";let key="";try{key=localStorage.getItem(KEY)||""}catch(e){}
+const $=id=>document.getElementById(id);
+function h(tag,attrs,...kids){const e=document.createElement(tag);for(const[k,v]of Object.entries(attrs||{})){if(v==null||v===false)continue;if(k==="class")e.className=v;else if(k.startsWith("on"))e.addEventListener(k.slice(2),v);else e.setAttribute(k,v===true?"":v)}for(const c of kids.flat()){if(c==null||c===false)continue;e.append(c instanceof Node?c:String(c))}return e}
+function toast(text,bad){const t=$("toast");t.textContent=text;t.className="show"+(bad?" bad":"");clearTimeout(toast.t);toast.t=setTimeout(()=>t.className="",bad?6000:3000)}
+async function api(path,opts={}){
+  const headers={...(opts.headers||{})};if(key)headers["X-Status-Key"]=key;
+  if(opts.method==="POST"){headers["X-RT"]="1";headers["Content-Type"]="application/json"}
+  const r=await fetch(path,{...opts,headers,cache:"no-store"});
+  if(r.status===403&&!opts.retried){const k=prompt("请输入状态页口令（STATUS_KEY）");if(k!==null){key=k.trim();try{localStorage.setItem(KEY,key)}catch(e){}return api(path,{...opts,retried:true})}}
+  if(!r.ok)throw new Error("HTTP "+r.status+" "+(await r.text()).slice(0,200));
+  return r.json()}
+const post=(path,body)=>api(path,{method:"POST",body:JSON.stringify(body)});
+const pad=n=>String(n).padStart(2,"0");
+function bj(ms,day=true){if(!ms)return"—";const d=new Date(ms+8*3600e3);const s=d.toISOString();return day?s.slice(5,10)+" "+s.slice(11,16):s.slice(11,16)}
+const bjs=ms=>ms?new Date(ms+8*3600e3).toISOString().slice(11,23):"—";
+const money=x=>x==null?"—":(x>=0?"+$":"−$")+Math.abs(x).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+const usd=x=>x==null?"—":"$"+Number(x).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+const num=x=>x==null?"—":Number(x).toLocaleString("en-US",{maximumFractionDigits:2});
+const cent=x=>x==null?"—":(x*100).toFixed(1)+"¢";
+const ms=x=>x==null?"—":Math.round(x)+" ms";
+const pn=x=>h("span",{class:x==null?"mut":x>0?"ok":x<0?"bad":"mut"},money(x));
+const MODE={off:"关",paper:"只记录",on:"真实吃单"},RES={up:"涨",down:"跌",split:"平"},side=s=>s==="up"?"涨":"跌";
+function table(head,rows,nums=[]){if(!rows.length)return h("div",{class:"empty"},"还没有记录");
+  return h("div",{class:"scroll"},h("table",{},h("thead",{},h("tr",{},head.map((x,i)=>h("th",{class:nums.includes(i)?"num":null},x)))),
+    h("tbody",{},rows.map(r=>h("tr",{},r.map((c,i)=>h("td",{class:nums.includes(i)?"num":(typeof c==="string"&&c.length>40?"wrap":null)},c)))))))}
+function big(rows,shown,make){if(rows.length<=shown)return make(rows);const d=h("details",{class:"more"},h("summary",{},"展开全部 "+rows.length+" 行"),make(rows.slice(shown)));return h("div",{},make(rows.slice(0,shown)),d)}
+function card(k,v,cls,sub){return h("div",{class:"card"},h("div",{class:"k"},k),h("div",{class:"v"+(String(v).length>14?" s":"")+(cls?" "+cls:"")},v),sub?h("div",{class:"tiny"},sub):null)}
+// theme
+(function(){let t="";try{t=localStorage.getItem("rt-theme")||""}catch(e){}if(t)document.documentElement.dataset.theme=t;
+  $("theme").onclick=()=>{const cur=document.documentElement.dataset.theme||(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");const n=cur==="dark"?"light":"dark";document.documentElement.dataset.theme=n;try{localStorage.setItem("rt-theme",n)}catch(e){}}})();
+// tabs
+let tab="console";
+function show(t){tab=t;$("p-console").classList.toggle("hide",t!=="console");$("p-review").classList.toggle("hide",t!=="review");$("t-console").classList.toggle("on",t==="console");$("t-review").classList.toggle("on",t==="review");try{location.hash=t}catch(e){}if(t==="review")loadReview();else loadState()}
+$("t-console").onclick=()=>show("console");$("t-review").onclick=()=>show("review");
+
+// ---------- 控制台 ----------
+let state=null,settingsShown=false;
+async function loadState(){try{state=await api("api/state");renderState(state);$("clock").textContent="更新于 "+bjs(Date.now()).slice(0,8)+"（北京时间）"}catch(e){$("clock").textContent="读不到状态："+e.message}}
+function renderState(s){
+  const a=s.account||{},t=s.today||{},st=s.stream||{},f=s.fast||{};
+  const blocked=s.mode==="on"?(s.blocked||""):"";
+  $("summary").replaceChildren(
+    card("模式",MODE[s.mode]||s.mode,s.mode==="on"?(blocked?"warn":"ok"):"mut",(s.env_mode!==s.mode?"部署设置 RULE_TAKER="+s.env_mode+"，运行中调成 "+s.mode:"RULE_TAKER="+s.env_mode)+(s.paused?"｜已暂停："+s.paused:"")),
+    card("现在下不下单",s.mode!=="on"?(s.mode==="paper"?"只记录，不下单":"关"):(blocked?"不下单":"会下单"),s.mode==="on"?(blocked?"bad":"ok"):"mut",blocked||(s.mode==="on"?"盘口一出现规则价以内的卖单就买":"")),
+    card("账户 USDT",a.usdt==null?"—":usd(a.usdt),"",a.usdt==null?(a.balance_error||"还没读到"):("可用 "+usd(a.spendable)+(a.bnb!=null?"｜BNB "+a.bnb.toFixed(4):"")+(a.signed_in?"｜已登录":"｜未登录"))),
+    card("今天（北京时间）",money(t.pnl),t.pnl>0?"ok":t.pnl<0?"bad":"","已结算盈亏｜已花 "+usd(t.spent)+(t.max_day_usd?" / 上限 $"+t.max_day_usd:"")+(t.loss_floor!=null?"｜停机线 "+money(t.loss_floor):"")+(t.open_cost?"｜在途和未结算 "+usd(t.open_cost):"")),
+    card("推送",st.connected?(st.alive?"已连接":"连接无心跳"):"未连接",st.connected&&st.alive?"ok":"bad",(st.lag_ms!=null?"推送延迟中位 "+ms(st.lag_ms):"")+(st.error&&!st.connected?"｜"+st.error:"")+(s.index?"｜币安指数 "+(s.index.connected?"已连接":"未连接"):"")),
+    card("每秒检查",f.active?"进行中":"没在进行",f.active?"ok":"mut","时段 "+f.hours+(f.next_ms&&!f.active?"｜下一次 "+bj(f.next_ms,false):"")+(s.lead_minutes?"｜对手提前 "+s.lead_minutes+" 分钟的时刻前后也每秒查":""))
+  );
+  // the mode switch: never above the settings file's RULE_TAKER
+  const rank={off:0,paper:1,on:2};
+  $("modes").replaceChildren(...["off","paper","on"].map(m=>h("button",{type:"button",class:s.mode===m?"sel":null,disabled:rank[m]>rank[s.env_mode],
+    title:rank[m]>rank[s.env_mode]?"高于部署设置 RULE_TAKER="+s.env_mode+"：要先改设置文件再重启":null,
+    onclick:async()=>{if(m==="on"&&!confirm("切到真实吃单？"))return;await act({action:"mode",arg:m})}},MODE[m])));
+  $("modehint").textContent=(s.env_mode!=="on"?"部署设置 RULE_TAKER="+s.env_mode+"：这里最多调到 "+MODE[s.env_mode]+"。":"")+(s.not_ready?"未就绪："+s.not_ready:"")+(s.trading_allowed?"":"｜LIVE_TRADING_ALLOWED 不是 on：不会真实下单");
+  const pb=$("pause");pb.textContent=s.paused?"恢复":"暂停";pb.className="b"+(s.paused?" pri":"");
+  pb.onclick=async()=>{if(s.paused)await act({action:"resume"});else if(confirm("暂停开新单？挂着的单会当场撤掉"))await act({action:"pause",arg:"控制台"})};
+  $("withdraw").onclick=async()=>{if(confirm("撤掉规则吃单所有挂着的单？"))await act({action:"withdraw"})};
+  // the rules' next windows
+  $("next").replaceChildren(h("thead",{},h("tr",{},["规则","买","价格","下一场（北京）","对手挂单时刻","现在"].map(x=>h("th",{},x)))),
+    h("tbody",{},(s.rules||[]).map(r=>{const off=!r.cents&&!r.live_cents;return h("tr",{class:off?"mut":null},
+      h("td",{},r.name),h("td",{},h("span",{class:r.side==="up"?"ok":"bad"},r.word)),
+      h("td",{},off?"不做":(r.cents?"≤"+r.cents+"¢":"盘前不买")+(r.live_cents?"｜盘中 ≤"+r.live_cents+"¢":"")),
+      h("td",{},off?"—":bj(r.next_ms)),h("td",{},off||!r.moment_ms?"—":bj(r.moment_ms)),
+      h("td",{class:"wrap"},off?r.when:(r.state||(r.listed?"已找到市场":"等发布"))))})));
+  $("plan").textContent=s.plan||"";
+  // speed and network
+  const sp=s.speed,n=s.net||{},p=s.process||{},b=(sp&&sp.best)||{};
+  const lines=[];
+  lines.push("服务在 "+(n.region||"未知区域")+"｜Python "+p.python+(p.eager?"（盘口一到当场处理）":"（建议 3.12 以上）")+"｜签名 "+(p.native_signing?"原生 secp256k1":"纯 Python")+"｜主循环延迟中位 "+ms(p.loop_lag_ms)+"，最长 "+ms(p.loop_lag_max_ms));
+  lines.push("到 "+(n.host||"Predict")+"："+(n.connect_ms!=null?"新建连接 "+ms(n.connect_ms)+"，":"")+"读一次 "+ms(n.read_ms)+(n.read_best_ms!=null?"（最快 "+ms(n.read_best_ms)+"）":"")+"，下单 / 撤单一次 "+ms(n.write_ms)+(n.edge?"｜入口 "+n.edge:""));
+  if(sp)lines.push("近 30 天真实订单 "+sp.orders+" 张（"+sp.filled+" 张有成交）：盘口变化→推送到达 "+ms(sp.lag)+(b.lag!=null?"（最快 "+ms(b.lag)+"）":"")+"、到达→发出 "+ms(sp.own)+(b.own!=null?"（最快 "+ms(b.own)+"）":"")+"、发出→应答 "+ms(sp.trip)+(b.trip!=null?"（最快 "+ms(b.trip)+"）":""));
+  lines.push("预先签好 "+p.presigned+" 张，下单时用上 "+p.presign_hits+" 张；推送当场处理 "+p.first_ticks+" 次"+(s.fast_line?"｜"+s.fast_line:""));
+  $("speed").replaceChildren(...lines.map(x=>h("div",{class:"line"},x)));
+  $("errors").replaceChildren(...((s.errors||[]).length?s.errors.map(e=>h("div",{class:"line"},h("span",{class:"tiny"},bj(e.at)+" "),e.text)):[h("div",{class:"empty"},"没有")]));
+  if(!settingsShown){renderSettings(s.settings||[],s.settings_dropped||[]);settingsShown=true}}
+async function act(body){try{const r=await post("api/control",body);toast(r.message||"好了",!r.ok)}catch(e){toast(e.message,true)}await loadState()}
+function fmtv(f,v){if(f.kind==="choice")return(f.presets.find(o=>o[0]===v)||[v,v])[1];if(v==="0"&&f.zero)return"0（"+f.zero+"）";if(f.unit==="$")return"$"+v;return v+(f.unit?" "+f.unit:"")}
+async function saveField(body){try{const r=await post("api/settings",body);toast(r.message,!r.ok);if(r.ok)await refreshSettings()}catch(e){toast(e.message,true)}}
+function renderSettings(groups,dropped){
+  const box=$("settings");box.replaceChildren();
+  if(dropped.length)box.append(h("p",{class:"warn"},"启动时这些网页保存的值和设置文件冲突，已删掉："+dropped.join("、")));
+  for(const g of groups){
+    const grid=h("div",{class:"fields"});
+    for(const f of g.fields){
+      const input=f.kind==="choice"?null:h("input",{value:f.value,inputmode:f.kind==="number"?"decimal":null,"aria-label":f.label});
+      const presets=f.kind==="choice"?f.presets.map(o=>h("button",{type:"button",class:o[0]===f.value?"sel":null,onclick:()=>saveField({values:{[f.key]:o[0]}})},o[1]))
+        :f.presets.map(v=>h("button",{type:"button",class:v===f.value?"sel":null,onclick:()=>saveField({values:{[f.key]:v}})},fmtv(f,v)));
+      const reset=f.saved?h("button",{class:"b",type:"button",onclick:()=>saveField({reset:[f.key]})},"恢复部署设置"):null;
+      grid.append(h("div",{class:"field"},
+        h("div",{class:"fh"},h("b",{},f.label),h("span",{class:"tiny"},"现在"),h("span",{class:"cur"},fmtv(f,f.value)),
+          h("span",{class:"pill"+(f.saved?" warn":"")},f.saved?"网页保存":"部署设置")),
+        h("div",{class:"presets"},presets),
+        input||reset?h("div",{class:"row"},input,input?h("button",{class:"b",type:"button",onclick:()=>saveField({values:{[f.key]:input.value}})},"保存"):null,reset):null,
+        h("details",{},h("summary",{},"说明"),h("p",{},f.help))))}
+    box.append(h("h3",{},g.group),grid)}
+  if(groups.some(g=>g.fields.some(f=>f.saved)))box.append(h("div",{class:"row",style:"margin-top:12px"},
+    h("button",{class:"b danger",type:"button",onclick:()=>{if(confirm("所有网页保存的设置都回到设置文件里的值？"))saveField({reset:[]})}},"全部恢复部署设置")))}
+async function refreshSettings(){try{const s=await api("api/state");state=s;renderState(s);renderSettings(s.settings||[],s.settings_dropped||[])}catch(e){toast(e.message,true)}}
+
+// ---------- 复盘 ----------
+let range="30";
+$("ranges").replaceChildren(...[["7","近 7 天"],["30","近 30 天"],["90","近 90 天"],["all","全部"]].map(([v,t])=>h("button",{type:"button",class:v===range?"sel":null,onclick:e=>{range=v;[...$("ranges").children].forEach(b=>b.classList.remove("sel"));e.target.classList.add("sel");loadReview()}},t)));
+$("csv").onclick=async e=>{e.preventDefault();try{const headers=key?{"X-Status-Key":key}:{};const r=await fetch("api/records.csv",{headers,cache:"no-store"});if(!r.ok)throw new Error("HTTP "+r.status);const blob=await r.blob();const a=h("a",{href:URL.createObjectURL(blob),download:"ruletaker-records.csv"});document.body.append(a);a.click();a.remove()}catch(err){toast(err.message,true)}};
+async function loadReview(){try{const r=await api("api/review?days="+range);renderReview(r)}catch(e){toast(e.message,true)}}
+function renderReview(r){
+  if(r.busy){$("rnote").textContent=r.busy;return}
+  $("rnote").textContent="数据算于 "+bj(r.computed_ms)+"（北京时间）｜现在："+(MODE[r.mode]||r.mode)+"；"+Object.values(r.markets||{}).map(x=>x.name+(x.on?"开（每场最多 "+x.shares+" 份）":"关")).join("、")
+    +(r.max_day_usd?"；每天最多 $"+r.max_day_usd:"")+"；每秒检查 "+r.fast+(r.lead_minutes?"；对手提前 "+r.lead_minutes+" 分钟":"");
+  const T=r.totals||{};
+  $("totals").replaceChildren(...[["on","真实吃单"],["paper","只记录（没真买）"]].map(([m,name])=>{const t=T[m]||{};
+    return h("div",{class:"card"},h("div",{class:"k"},name),h("div",{class:"v "+(t.pnl>0?"ok":t.pnl<0?"bad":"")},money(t.pnl||0)),
+      h("div",{class:"tiny"},"已结算 "+(t.settled||0)+" 场（赢 "+(t.wins||0)+" 输 "+(t.losses||0)+"）"+(t.roi!=null?"｜回报率 "+(t.roi*100).toFixed(1)+"%":"")),
+      h("div",{class:"tiny"},"买到 "+(t.windows||0)+" 场 "+num(t.shares||0)+" 份，成本 "+usd(t.cost||0)+(t.open?"｜待结算 "+t.open+" 场":"")))}));
+  $("chart").replaceChildren(chart(r.daily||{}));
+  const rows=r.rules||[];
+  $("byrule").replaceChildren(table(["规则","买","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏","待结算"],
+    rows.map(x=>[x.name,side(x.side)+(x.cents?" ≤"+x.cents+"¢":x.live_cents?"（盘前不买）":"（已关）")+(x.live_cents?"｜盘中 ≤"+x.live_cents+"¢":""),MODE[x.mode]||x.mode,
+      num(x.windows),num(x.shares),x.shares?cent(x.cost/x.shares):"—",usd(x.cost),num(x.settled),x.wins+"/"+x.losses,x.settled?pn(x.pnl):"—",num(x.open)]),[3,4,5,6,7,9,10]),
+    ...(rows.some(x=>x.course&&x.course.windows)?[h("h3",{},"其中盘中买的（开场后，规则方向领先时）"),table(["规则","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏"],
+      rows.filter(x=>x.course&&x.course.windows).map(x=>[x.name,MODE[x.mode]||x.mode,num(x.course.windows),num(x.course.shares),x.course.shares?cent(x.course.cost/x.course.shares):"—",usd(x.course.cost),num(x.course.settled),x.course.wins+"/"+x.course.losses,x.course.settled?pn(x.course.pnl):"—"]),[2,3,4,5,6,8])]:[]));
+  const sp=r.speed,b=(sp&&sp.best)||{};
+  const wt=rows.filter(x=>x.watch&&x.watch.watched);
+  $("watch").replaceChildren(...(sp?[h("p",{class:"tiny"},"下单速度（真实订单 "+sp.orders+" 张，"+sp.filled+" 张有成交）：盘口变化→推送到达 中位 "+ms(sp.lag)+(b.lag!=null?"（最快 "+ms(b.lag)+"）":"")+"、到达→发出 "+ms(sp.own)+(b.own!=null?"（最快 "+ms(b.own)+"）":"")+"、发出→应答 "+ms(sp.trip)+(b.trip!=null?"（最快 "+ms(b.trip)+"）":""))]:[]),
+    table(["规则","模式","看了几场","有规则价以内卖单","平均可买份数","最低卖价中位","撮合开启在开场前","卖单出现在开场前","没买到就没了","买到的"],
+      wt.map(x=>{const w=x.watch;return[x.name,MODE[x.mode]||x.mode,num(w.watched),num(w.offered),w.offer_avg==null?"—":num(w.offer_avg),w.best_mid==null?"—":cent(w.best_mid),
+        w.open_lead==null?"—":"中位 "+Math.round(w.open_lead)+" 秒",w.offer_lead==null?"—":"中位 "+Math.round(w.offer_lead)+" 分钟",
+        w.lost?w.lost+" 场"+(w.life==null?"":"（存活中位 "+(w.life/1000).toFixed(1)+" 秒）"):"—",w.won?w.won+" 场"+(w.won_life==null?"":"（出现到被吃掉中位 "+(w.won_life/1000).toFixed(1)+" 秒）"):"—"]}),[2,3,4]));
+  const sec=v=>v==null?"—":(v/1000).toFixed(2)+" 秒";
+  const ord=o=>o.paper?"只记录 "+num(o.shares)+" 份":["rejected","not_sent","not_found"].includes(o.state)?"要 "+num(o.shares)+"：没下成"+(o.error?"（"+o.error+"）":""):
+    "要 "+num(o.shares)+" 成交 "+num(o.filled)+(o.after==null?"":"，出现后 "+o.after+" ms 发出")+(o.lag==null?"":"，推送 "+o.lag+" ms")+(o.own==null?"":"，到达→发出 "+o.own+" ms")+(o.presigned?"（预先签好）":"")+(o.trip==null?"":"，往返 "+o.trip+" ms");
+  const rc=r.races||[];
+  $("races").replaceChildren(big(rc,12,part=>table(["场次","规则","卖单出现","开场前","最多份数","开始被吃","被吃光","买到","我们的单"],
+    part.map(x=>[bj(x.start_ms)+" "+(x.window||"").replace(/^\S+ 15分涨跌 /,""),x.name,x.offer_at?bjs(x.offer_at):"没记到",x.lead_min==null?"—":x.lead_min+" 分钟",x.offer_at?num(x.peak):"—",
+      sec(x.cut_ms),x.gone_ms==null?(x.offer_at&&x.open?"还在":"—"):sec(x.gone_ms),x.orders.length?(x.bought?num(x.bought)+"/"+num(x.asked):"没买到"):"没下单",x.orders.map(ord).join("；")||"—"]),[4])));
+  const dl=[...((r.daily||{}).on||[]).map(d=>({...d,mode:"on"})),...((r.daily||{}).paper||[]).map(d=>({...d,mode:"paper"}))].sort((a,b)=>a.day<b.day?1:a.day>b.day?-1:a.mode<b.mode?-1:1);
+  $("daily").replaceChildren(big(dl,14,part=>table(["日期（北京）","模式","场次","赢/输","份数","成本","当日盈亏","累计"],
+    part.map(d=>[d.day,MODE[d.mode]||d.mode,num(d.windows),d.wins+"/"+d.losses,num(d.shares),usd(d.cost),pn(d.pnl),pn(d.cum)]),[2,4,5,6,7])));
+  const rec=r.recent||[];
+  $("recent").replaceChildren(big(rec,15,part=>table(["场次","规则","买","份数","均价","成本","结果","盈亏","模式"],
+    part.map(x=>[bj(x.start_ms)+" "+(x.window||"").replace(/^\S+ 15分涨跌 /,""),x.name,side(x.side),num(x.shares)+(x.live?"（盘中 "+num(x.live)+"）":""),cent(x.avg),usd(x.cost),RES[x.result]||"待结算",x.pnl==null?"—":pn(x.pnl),MODE[x.mode]||x.mode]),[3,4,5,7])))}
+function chart(daily){
+  const series=[["on",daily.on||[]],["paper",daily.paper||[]]].filter(([,d])=>d.length);
+  if(!series.length)return h("div",{class:"empty"},"还没有结算的场次");
+  const days=[...new Set(series.flatMap(([,d])=>d.map(x=>x.day)))].sort();
+  const vals=series.flatMap(([,d])=>d.map(x=>x.cum)).concat([0]);
+  const lo=Math.min(...vals),hi=Math.max(...vals),span=hi-lo||1;
+  const W=900,H=220,L=56,R=12,Tp=12,B=26;
+  const x=i=>L+(days.length===1?(W-L-R)/2:i*(W-L-R)/(days.length-1)),y=v=>Tp+(hi-v)*(H-Tp-B)/span;
+  const ns="http://www.w3.org/2000/svg",el=(t,a)=>{const e=document.createElementNS(ns,t);for(const[k,v]of Object.entries(a))e.setAttribute(k,v);return e};
+  const svg=el("svg",{viewBox:"0 0 "+W+" "+H,class:"chart",role:"img","aria-label":"累计盈亏"});
+  const g=el("g",{class:"grid"});for(let i=0;i<=4;i++){const v=lo+span*i/4;g.append(el("line",{x1:L,x2:W-R,y1:y(v),y2:y(v)}));const t=el("text",{x:L-6,y:y(v)+4,"text-anchor":"end"});t.textContent=(v>=0?"$":"−$")+Math.abs(v).toFixed(v>=100||v<=-100?0:1);g.append(t)}
+  svg.append(g);
+  const zero=el("line",{x1:L,x2:W-R,y1:y(0),y2:y(0),stroke:"currentColor","stroke-opacity":".35"});svg.append(zero);
+  for(const[m,d]of series){let run=null;const pts=days.map((day,i)=>{const hit=d.find(z=>z.day===day);if(hit)run=hit.cum;return run==null?null:x(i).toFixed(1)+","+y(run).toFixed(1)}).filter(Boolean);
+    svg.append(el("polyline",{points:pts.join(" "),class:m}))}
+  const step=Math.max(1,Math.ceil(days.length/6));days.forEach((d,i)=>{if(i%step===0||i===days.length-1){const t=el("text",{x:x(i),y:H-6,"text-anchor":i===0?"start":i===days.length-1?"end":"middle"});t.textContent=d.slice(5);svg.append(t)}});
+  return h("div",{},svg,h("div",{class:"legend"},h("span",{},h("i",{}),"真实吃单"),h("span",{},h("i",{class:"p"}),"只记录")))}
+
+// ---------- start ----------
+const start=(location.hash||"").replace("#","")==="review"?"review":"console";
+show(start);
+setInterval(()=>{if(!document.hidden&&tab==="console")loadState()},3000);
+setInterval(()=>{if(!document.hidden&&tab==="review")loadReview()},60000);
+</script>
+</body>
+</html>

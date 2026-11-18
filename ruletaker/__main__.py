@@ -40,16 +40,20 @@ def gce_zone(timeout: float = 1.0) -> str:
         return ""
 
 
-def load_config(env_file: str | None) -> Config:
+def load_env(env_file: str | None) -> dict:
     env = dict(os.environ)
     for path in [env_file] if env_file else ["/etc/ruletaker/ruletaker.env", ".env"]:
         if path and os.path.isfile(path):
             env = load_env_file(path, env)
             break
-    return Config.from_env(env)
+    return env
 
 
-async def run_service(config: Config) -> int:
+def load_config(env_file: str | None) -> Config:
+    return Config.from_env(load_env(env_file))
+
+
+async def run_service(config: Config, env: dict | None = None) -> int:
     from .index import IndexFeed
     from .notify import Telegram
     from .rules import RULES, live_price_of
@@ -62,7 +66,7 @@ async def run_service(config: Config) -> int:
     region = config.region or await asyncio.to_thread(gce_zone) or os.environ.get("RAILWAY_REPLICA_REGION", "")
     in_play = [r for r in RULES if live_price_of(config.rules, r) > 0]
     index = IndexFeed(sorted({r.spec.symbol for r in in_play}), config.binance_fapi, config.binance_ws) if in_play else None
-    taker = RuleTaker(config, store, index=index)
+    taker = RuleTaker(config, store, index=index, base_env={k: v for k, v in (env or {}).items() if k.startswith("RULE_")} if env is not None else None)
     taker.region = region
     telegram = Telegram(config.telegram_token, config.telegram_chats, config.admin_user_id, config.telegram_commands,
                         handler=taker.command, enabled=bool(config.telegram_token))
@@ -84,6 +88,9 @@ async def run_service(config: Config) -> int:
             await asyncio.sleep(0.5)
         telegram.send(f"🚀 规则吃单 {VERSION} 已启动（{region or '未知区域'}）：{taker.mode_text()}")
     told = asyncio.create_task(announce(), name="announce")
+    if taker.settings_dropped:
+        telegram.send("⚠️ 控制台保存的这些设置和设置文件冲突，已删掉（改用设置文件的值）：" + "、".join(taker.settings_dropped))
+        LOG.warning("控制台保存的设置和设置文件冲突，已删掉：%s", "、".join(taker.settings_dropped))
     try:
         await running
     finally:
@@ -256,7 +263,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-order-probe", action="store_true", help="check 时不向下单接口发空订单")
     args = parser.parse_args(argv)
     try:
-        config = load_config(args.env)
+        env = load_env(args.env)
+        config = Config.from_env(env)
     except ValueError as error:
         print(f"设置有误：{error}", file=sys.stderr)
         return 2
@@ -268,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "check":
         return asyncio.run(check(config, not args.no_order_probe))
-    return asyncio.run(run_service(config))
+    return asyncio.run(run_service(config, env))
 
 
 if __name__ == "__main__":

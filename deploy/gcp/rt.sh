@@ -4,6 +4,7 @@
 #   bash deploy/gcp/rt.sh deploy          第一次：在东京建一台虚拟机（asia-northeast1），装好、启动
 #   bash deploy/gcp/rt.sh update          代码更新后：重新上传代码、跑测试、重启（设置不动）
 #   bash deploy/gcp/rt.sh env [文件]      上传新的设置文件（默认 ./ruletaker.env）并重启
+#   bash deploy/gcp/rt.sh console         打开网页控制台和复盘页（通过 Cloud Shell 的“网页预览”，不开公网端口）
 #   bash deploy/gcp/rt.sh status          看状态（就是 huice 的 /rules）
 #   bash deploy/gcp/rt.sh logs            看实时日志（Ctrl+C 退出）
 #   bash deploy/gcp/rt.sh check           自检：登录、账户、余额、授权、这个区域能不能下单（只读）
@@ -79,7 +80,7 @@ setup() {
 
 status_call() {  # GET or POST on the service's own status page, on the VM (127.0.0.1)
   local method="$1" path="$2"
-  remote "sudo bash -c 'F=/etc/ruletaker/ruletaker.env; K=\$(grep -E \"^STATUS_KEY=\" \$F | tail -1 | cut -d= -f2-); P=\$(grep -E \"^STATUS_PORT=\" \$F | tail -1 | cut -d= -f2-); curl -s -X $method -H \"X-Status-Key: \$K\" \"http://127.0.0.1:\${P:-8080}$path\"; echo'"
+  remote "sudo bash -c 'F=/etc/ruletaker/ruletaker.env; K=\$(grep -E \"^STATUS_KEY=\" \$F | tail -1 | cut -d= -f2-); P=\$(grep -E \"^STATUS_PORT=\" \$F | tail -1 | cut -d= -f2-); curl -s -X $method -H \"X-RT: 1\" -H \"X-Status-Key: \$K\" \"http://127.0.0.1:\${P:-8080}$path\"; echo'"
 }
 
 cmd="${1:-help}"
@@ -105,6 +106,18 @@ case "$cmd" in
   env)
     upload_env "${1:-}"
     setup
+    ;;
+  console)
+    # The page on the VM listens on 127.0.0.1 only: an SSH tunnel brings it to this Cloud Shell's port, and Cloud Shell's web
+    # preview shows that port in the browser, behind the Google login — no port is opened to the internet.
+    LOCAL="${1:-8080}"
+    REMOTE_PORT="$(gcloud compute ssh "$VM" "${G[@]}" "${Z[@]}" --quiet --command "sudo grep -E '^STATUS_PORT=' /etc/ruletaker/ruletaker.env | tail -1 | cut -d= -f2-" 2>/dev/null | tr -d '[:space:]')"
+    REMOTE_PORT="${REMOTE_PORT:-8080}"
+    echo "控制台通道：Cloud Shell 端口 $LOCAL → 虚拟机 $VM 的 127.0.0.1:$REMOTE_PORT"
+    echo "现在点 Cloud Shell 工具栏右上角的「网页预览」（方框里一个眼睛的图标）→「在端口 $LOCAL 上预览」，浏览器会打开控制台和复盘页。"
+    echo "（用自己电脑上的 gcloud 也行：gcloud compute ssh $VM --zone $ZONE -- -N -L $LOCAL:127.0.0.1:$REMOTE_PORT，然后打开 http://localhost:$LOCAL）"
+    echo "这个窗口保持打开，看完按 Ctrl+C 关掉通道。"
+    gcloud compute ssh "$VM" "${G[@]}" "${Z[@]}" --quiet -- -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L "$LOCAL:127.0.0.1:$REMOTE_PORT"
     ;;
   status) status_call GET /status ;;
   json) status_call GET /status.json ;;

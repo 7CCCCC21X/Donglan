@@ -1,23 +1,34 @@
-"""A small HTTP server for the operator (STATUS_HOST:STATUS_PORT, 127.0.0.1:8080 by default — reached through `gcloud compute ssh`):
+"""The operator's HTTP server (STATUS_HOST:STATUS_PORT, 127.0.0.1:8080 by default — reached through an SSH tunnel: rt.sh console):
 
+  GET  /                   the control page and the review page (控制台 · 复盘), one page
   GET  /healthz            "ok" while the taker's loop runs (no key)
   GET  /status             the status in text, what /rules said in huice
-  GET  /status.json        the same in numbers
-  POST /pause  /resume     no new orders / orders again (the pause is saved: it outlives a restart)
-  POST /mode?to=off|paper|on   the mode, never above RULE_TAKER (the deploy's setting is the ceiling)
+  GET  /status.json        a summary in numbers
+  GET  /api/state          the control page's data
+  GET  /api/review?days=30 the review page's data (7 / 30 / 90 / all)
+  GET  /api/records.csv    every order of every window
+  POST /api/control        {"action": "pause" | "resume" | "mode" | "withdraw", "arg": ...}
+  POST /api/settings       {"values": {"RULE_GOLD_SHUT_CENTS": "60", ...}} or {"reset": ["RULE_…"] (empty: all)}
+  POST /pause  /resume  /mode?to=off|paper|on   (rt.sh)
 
-With STATUS_KEY set every path but /healthz needs it (?key=… or the X-Status-Key header); a server on another address than
-the machine itself is refused at the start without one (Config)."""
+With STATUS_KEY set every path but / and /healthz needs it (?key=… or the X-Status-Key header). Every POST also needs the header
+X-RT: 1 — a page of another site can send neither (no cross-site form can set a header, and no preflight is ever approved), so
+nobody can pause or change the settings through a logged-in browser. A server on another address than the machine itself is
+refused at the start without a key (Config)."""
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import hmac
 import json
+import os
 import urllib.parse
 from typing import Any
 
-from .util import LOG
+from .util import LOG, clean_error
+
+PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "console.html")
+MAX_BODY = 65_536
 
 
 class StatusServer:
@@ -29,7 +40,7 @@ class StatusServer:
         if not self.port:
             return
         self.server = await asyncio.start_server(self.handle, self.host, self.port)
-        LOG.info("状态页：http://%s:%d/status", self.host, self.port)
+        LOG.info("控制台：http://%s:%d/  状态：http://%s:%d/status", self.host, self.port, self.host, self.port)
 
     async def stop(self) -> None:
         if self.server is not None:
@@ -44,43 +55,98 @@ class StatusServer:
         return hmac.compare_digest(given.encode(), self.key.encode())
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        extra = ""
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
             lines = head.decode("latin-1").split("\r\n")
             method, target, _ = (lines[0].split(" ") + ["", "", ""])[:3]
             headers = {k.strip().lower(): v.strip() for k, _, v in (line.partition(":") for line in lines[1:] if ":" in line)}
             length = int(headers.get("content-length") or 0)
-            if 0 < length <= 4096:
-                await asyncio.wait_for(reader.readexactly(length), 5)
+            body = b""
+            if length > MAX_BODY:
+                raise ValueError("body too large")
+            if length > 0:
+                body = await asyncio.wait_for(reader.readexactly(length), 5)
             url = urllib.parse.urlsplit(target)
             query = urllib.parse.parse_qs(url.query)
-            status, kind, body = await self.route(method.upper(), url.path, query, headers)
+            status, kind, text = await self.route(method.upper(), url.path, query, headers, body)
+            if kind.startswith("text/csv"):
+                extra = "Content-Disposition: attachment; filename=\"ruletaker-records.csv\"\r\n"
         except Exception as error:  # (a malformed request: answered and closed, never the service's problem)
-            status, kind, body = 400, "text/plain; charset=utf-8", f"bad request: {type(error).__name__}"
-        data = body.encode("utf-8")
-        writer.write(f"HTTP/1.1 {status} {'OK' if status == 200 else 'Error'}\r\nContent-Type: {kind}\r\n"
-                     f"Content-Length: {len(data)}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n".encode() + data)
+            status, kind, text = 400, "text/plain; charset=utf-8", f"bad request: {type(error).__name__}"
+        data = text.encode("utf-8")
+        writer.write(f"HTTP/1.1 {status} {'OK' if status == 200 else 'Error'}\r\nContent-Type: {kind}\r\n{extra}"
+                     f"Content-Length: {len(data)}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                     f"Referrer-Policy: no-referrer\r\nConnection: close\r\n\r\n".encode() + data)
         with contextlib.suppress(Exception):
             await writer.drain()
             writer.close()
 
-    async def route(self, method: str, path: str, query: dict, headers: dict) -> tuple[int, str, str]:
-        text = "text/plain; charset=utf-8"
+    async def route(self, method: str, path: str, query: dict, headers: dict, body: bytes = b"") -> tuple[int, str, str]:
+        text, js = "text/plain; charset=utf-8", "application/json; charset=utf-8"
         if path == "/healthz":
             ok = self.taker.healthy()
             return (200 if ok else 503), text, "ok" if ok else "not running"
+        if path in {"/", "/console", "/index.html"} and method == "GET":
+            try:
+                with open(PAGE, encoding="utf-8") as f:
+                    return 200, "text/html; charset=utf-8", f.read()
+            except OSError:
+                return 500, text, "控制台页面文件不见了（ruletaker/web/console.html）"
         if not self.allowed(query, headers):
             return 403, text, "need ?key=STATUS_KEY"
-        if path in {"/", "/status"} and method == "GET":
-            return 200, text, self.taker.status()
-        if path == "/status.json" and method == "GET":
-            return 200, "application/json; charset=utf-8", json.dumps(self.taker.summary(), ensure_ascii=False, default=str)
+        if method == "GET":
+            if path == "/status":
+                return 200, text, self.taker.status()
+            if path == "/status.json":
+                return 200, js, json.dumps(self.taker.summary(), ensure_ascii=False, default=str)
+            if path == "/api/state":
+                return 200, js, json.dumps(self.taker.state(), ensure_ascii=False, default=str)
+            if path == "/api/review":
+                raw = (query.get("days") or ["30"])[0]
+                days = 0 if raw == "all" else max(1, min(3650, int(raw))) if raw.isdigit() else 30
+                return 200, js, json.dumps(self.taker.review_data(days), ensure_ascii=False, default=str)
+            if path == "/api/records.csv":
+                from .review import records_csv
+                return 200, "text/csv; charset=utf-8", "﻿" + records_csv(self.taker.recs)  # (the BOM: Excel reads it as UTF-8)
+            return (405 if path in {"/pause", "/resume", "/mode", "/api/control", "/api/settings"} else 404), text, "use POST" if path.startswith(("/pause", "/resume", "/mode", "/api/")) else "not found"
         if method != "POST":
-            return 405, text, "use POST for /pause, /resume, /mode"
+            return 405, text, "method not allowed"
+        if headers.get("x-rt") != "1":
+            return 403, text, "POST needs the header X-RT: 1"
         if path == "/pause":
             return 200, text, await self.taker.control("pause", (query.get("why") or ["状态页"])[0])
         if path == "/resume":
             return 200, text, await self.taker.control("resume", "")
         if path == "/mode":
             return 200, text, await self.taker.control("mode", (query.get("to") or [""])[0])
-        return 404, text, "not found"
+        try:
+            data = json.loads(body or b"{}")
+        except ValueError:
+            return 400, js, json.dumps({"ok": False, "message": "请求不是 JSON"}, ensure_ascii=False)
+        if not isinstance(data, dict):
+            return 400, js, json.dumps({"ok": False, "message": "请求不是 JSON 对象"}, ensure_ascii=False)
+        try:
+            if path == "/api/control":
+                action, arg = str(data.get("action") or ""), str(data.get("arg") or "")
+                if action == "withdraw":
+                    message = await self.taker.withdraw_all("控制台撤单") or "没有挂着的规则吃单订单"
+                elif action in {"pause", "resume", "mode"}:
+                    message = await self.taker.control(action, arg or ("控制台" if action == "pause" else ""))
+                else:
+                    return 400, js, json.dumps({"ok": False, "message": f"不认识的操作：{action}"}, ensure_ascii=False)
+            elif path == "/api/settings":
+                if "reset" in data:
+                    message = await self.taker.reset_settings([str(k) for k in data.get("reset") or []])
+                else:
+                    values = data.get("values")
+                    if not isinstance(values, dict) or not values:
+                        return 400, js, json.dumps({"ok": False, "message": "没有要保存的值"}, ensure_ascii=False)
+                    message = await self.taker.save_settings(values)
+            else:
+                return 404, js, json.dumps({"ok": False, "message": "not found"}, ensure_ascii=False)
+        except ValueError as error:  # (a setting that does not parse: nothing changed, and why)
+            return 200, js, json.dumps({"ok": False, "message": str(error)}, ensure_ascii=False)
+        except Exception as error:
+            return 500, js, json.dumps({"ok": False, "message": clean_error(error) or type(error).__name__}, ensure_ascii=False)
+        return 200, js, json.dumps({"ok": True, "message": message}, ensure_ascii=False)
