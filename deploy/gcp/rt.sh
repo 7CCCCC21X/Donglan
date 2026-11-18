@@ -61,7 +61,7 @@ create_vm() {
 upload_code() {
   local name="$1" zone="$2"
   echo "上传代码…"
-  (cd "$ROOT" && tar czf - ruletaker tests requirements.txt deploy/gcp) | gcloud compute ssh "$name" "${G[@]}" --zone "$zone" --quiet \
+  (cd "$ROOT" && tar czf - --exclude=__pycache__ ruletaker tests requirements.txt deploy/gcp) | gcloud compute ssh "$name" "${G[@]}" --zone "$zone" --quiet \
     --command "sudo mkdir -p /opt/ruletaker && sudo rm -rf /opt/ruletaker/ruletaker /opt/ruletaker/tests /opt/ruletaker/deploy && sudo tar xzf - -C /opt/ruletaker"
 }
 

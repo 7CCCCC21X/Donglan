@@ -38,7 +38,7 @@ if [ ! -f /etc/ruletaker/ruletaker.env ]; then
 fi
 
 echo "== 设置自检 =="
-sudo -u ruletaker env STATE_DB=/var/lib/ruletaker/ruletaker.sqlite3 "$APP/venv/bin/python" -m ruletaker plan --env /etc/ruletaker/ruletaker.env | head -5
+sudo -u ruletaker "$APP/venv/bin/python" -m ruletaker plan --env /etc/ruletaker/ruletaker.env   # (a setting that does not parse stops here)
 
 install -m 644 "$APP/deploy/gcp/ruletaker.service" /etc/systemd/system/ruletaker.service
 systemctl daemon-reload
