@@ -293,10 +293,11 @@ class PredictApi:
             raise RemoteError("订单簿格式异常")
         return predict_levels(data.get("bids"), True), predict_levels(data.get("asks"), False)
 
-    async def create_order(self, body: Any, digest: str) -> dict:
+    async def create_order(self, body: Any, digest: str, checked: bool = True) -> dict:
         """POST /orders -> {"order_id", "hash"}; ``body`` the request (a dict, or its JSON bytes made beforehand), ``digest`` the
-        order's hash (before_send's check). A 2xx answer without an order id is no refusal: the order may be there."""
-        answer = await self.authed("POST", "/orders", body, timeout=ORDER_TIMEOUT, priority=True, check=digest)
+        order's hash (before_send's check — ``checked`` False for the operator's order test alone). A 2xx answer without an order
+        id is no refusal: the order may be there."""
+        answer = await self.authed("POST", "/orders", body, timeout=ORDER_TIMEOUT, priority=True, check=digest if checked else "")
         data = answer.get("data") if isinstance(answer, dict) else None
         if not isinstance(data, dict):
             raise RemoteError("下单应答没有可读的内容（订单可能已被接受，按哈希核对）：" + brief_error(json.dumps(answer, ensure_ascii=False), 120))

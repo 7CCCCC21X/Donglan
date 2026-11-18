@@ -42,7 +42,7 @@ from . import console
 from .config import Config, RuleSettings
 from .predict import (API_BASES, PREDICT_REST, RPC_URLS, Chain, NotSent, OrderRejected, PredictApi, book_up_first,
                       category_market, http_status, market_start_price, order_fill, order_final, order_price,
-                      outcome_for_side, parse_market, predict_resolution, DUPLICATE_WORDS, DOWN_WORDS, UP_WORDS)
+                      outcome_for_side, parse_market, predict_resolution, DUPLICATE_WORDS, DOWN_WORDS, UP_WORDS)  # noqa: F401
 from .rules import (FINAL_STATES, MARKET_NAMES, MODES, NEVER_PLACED, PREFIX, RACES_SHOWN, RULE_OF, RULES, WATCH, Rule, avg_price,
                     claims, cost, course_part, course_speed, course_stats, filled, held, in_flight, lead_note, live_price_of,
                     live_rule, net, offered, open_cost, open_orders, race_summary, race_text, races, rid, speed_stats, spent_on,
@@ -1767,6 +1767,10 @@ class RuleTaker:
 
     # -- the operator --
     async def control(self, what: str, arg: str) -> str:
+        if what == "check":
+            return await self.self_check()
+        if what == "test":
+            return await self.order_test()
         if what == "pause":
             self.paused = arg or "手动暂停"
             self.store.put("control:paused", self.paused)
@@ -1807,7 +1811,250 @@ class RuleTaker:
             return await self.control("resume", "")
         if command == "/mode":
             return await self.control("mode", args)
-        return "命令：/status /pause /resume /mode off|paper|on /id"
+        if command in {"/check", "/selfcheck"}:
+            return await self.self_check()
+        if command == "/test":
+            return await self.order_test()
+        return "命令：/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜/id"
+
+    # -- the self-check and the order test (Telegram /check /test, the control page's buttons, rt.sh check / test) --
+    async def self_check(self) -> str:
+        """Everything a real order needs, looked at now and said in one message (huice's /live check, and more): the mode and its
+        stops, the sign-in, the Predict account's owner on-chain, the balance, the exchange allowances, whether Predict's order
+        endpoint takes orders from this region (an empty order: refused as invalid, never placed), a read's round trip, the push
+        connection, the index (in-play rules), the records' store, the windows found, the last problems — and a conclusion."""
+        now, s = self.now(), self.settings
+        lines = [f"🔎 规则吃单自检 {bj(now)}（{self.region or '未知区域'}，版本 {VERSION}）"]
+        bad: list[str] = []
+
+        def ok(text: str) -> None:
+            lines.append("✅ " + text)
+
+        def no(text: str) -> None:
+            lines.append("❌ " + text)
+            bad.append(text)
+
+        def warn(text: str) -> None:
+            lines.append("⚠️ " + text)
+        floor = self.loss_floor()
+        lines.append(f"模式：{MODES.get(s.mode, s.mode)}（RULE_TAKER={self.env_mode}）｜LIVE_TRADING_ALLOWED "
+                     f"{'允许' if self.config.trading_allowed else '不是 on（不会真实下单）'}｜{('已暂停：' + self.paused) if self.paused else '没暂停'}"
+                     f"｜今天已结算 {money(self.today_pnl())}" + (f"（停机线 {money(floor)}）" if floor is not None else "（不设日亏损停机）"))
+        live = s.mode == "on"
+        if live and not self.config.trading_allowed:
+            no("LIVE_TRADING_ALLOWED 不是 on：真实吃单模式也不会下单")
+        if live and floor is not None and self.today_pnl() <= floor:
+            no(f"今天已到日亏损停机线 {money(floor)}：今天不再开新单（/resume 从现在的盈亏起再给一个额度）")
+        if self.wallet is None:
+            (no if live else warn)("没有设置 PREDICT_PRIVATE_KEY：只能 off / paper")
+        else:
+            try:
+                await self.api.ensure_auth()
+                exp = int(getattr(self.api, "jwt_exp", 0) or 0)
+                self.ready_error, self.ready_ms = "", now
+                ok("Predict 登录：成功" + (f"（token 到 {bj(exp * 1000)}）" if exp else ""))
+            except Exception as error:
+                self.ready_error = clean_error(error) or type(error).__name__
+                no(f"Predict 登录失败：{self.ready_error}")
+            if self.wallet.predict_account:
+                await self.prepare()  # (the owner's check, as at a start)
+                if self.account_error:
+                    no(f"账户：{self.account_error}")
+                elif self.account_checked:
+                    ok(f"账户：Predict 账户 {self.wallet.maker[:6]}…{self.wallet.maker[-4:]}，私钥是它的控制钥匙（链上核对）")
+                else:
+                    no("账户：链上核对还没完成")
+            else:
+                ok(f"账户：普通钱包 {self.wallet.maker[:6]}…{self.wallet.maker[-4:]}")
+            await self.refresh_balance()
+            if self.usdt is None:
+                no(f"余额没读到：{self.balance_error or '链上节点没回答'}")
+            else:
+                need = max((s.shares_of(r.market) * s.price(r.key) / 100 for r in RULES if live_rule(s, r)), default=0.0)
+                text = f"余额：USDT {from_wei(self.usdt):,.2f}（可用 {self.usd():,.2f}）" + (f"｜签名钱包 BNB {from_wei(self.bnb):.4f}" if self.bnb is not None else "")
+                (warn if need and (self.usd() or 0) < need else ok)(text + (f"｜不够买满一场（最多要 ${need:,.2f}）" if need and (self.usd() or 0) < need else ""))
+            if self.chain is not None:
+                yielding = any(bool((w["market"] or {}).get("isYieldBearing")) for w in self.track.values() if w["market"] is not None)
+                for key, name, needed in (("CTF_EXCHANGE", "标准交易所", not yielding), ("YIELD_BEARING_CTF_EXCHANGE", "收益型交易所", yielding)):
+                    try:
+                        got = await self.read_allowance(key)
+                        if got[1] >= 10 ** 20:
+                            ok(f"授权：{name} USDT 额度已授权")
+                        else:
+                            (no if needed else warn)(f"授权：{name} 没有 USDT 额度" + ("（规则吃单的市场要用：在 Predict 网站用这个账户交易一次）" if needed
+                                                                             else "（现在跟踪的市场用不到）"))
+                    except Exception as error:
+                        warn(f"授权：{name} 没读到（{clean_error(error) or type(error).__name__}）")
+            if self.api.fresh() if hasattr(self.api, "fresh") else False:
+                try:
+                    await self.api.authed("POST", "/orders", {"data": {}}, priority=True)
+                    warn("下单接口对空订单没有报错（意外），请用 /test 挂单测试确认")
+                except Exception as error:
+                    status = http_status(error)
+                    if status == 403:
+                        no(f"下单接口 403：这个区域可能不允许交易（{clean_error(error)}）")
+                    elif status == 401:
+                        no(f"下单接口 401：登录被拒（{clean_error(error)}）")
+                    elif 400 <= status < 500:
+                        ok(f"下单接口在这个区域可用（空订单被拒为无效：HTTP {status}，这是预期的；要连签名一起验证用 /test）")
+                    else:
+                        warn(f"下单接口没回答清楚：{clean_error(error) or type(error).__name__}")
+        if self.config.api_key:
+            mid = next((str(w["market"]["id"]) for w in sorted(self.track.values(), key=lambda w: w["start"]) if w["market"] is not None), "")
+            began = time.perf_counter()
+            try:
+                if mid:
+                    await self.api.orderbook(mid)
+                else:
+                    await category_market(self.api, f"btc-updown-15m-{(now - now % 900_000) // 1000}")
+                took = (time.perf_counter() - began) * 1000
+                net = nethttp.HTTP_NET.get(getattr(self.api, "host", "")) or {}
+                (ok if took < 150 else warn)(f"Predict 读取：一次往返 {took:.0f} ms" + (f"｜入口 {net['edge']}" if net.get("edge") else "")
+                                              + ("" if took < 150 else "（偏慢：rt.sh probe 量一下别的区域）"))
+            except Exception as error:
+                no(f"Predict 读取失败：{clean_error(error) or type(error).__name__}")
+        elif s.mode != "off":
+            no("没有 API Key（RULE_API_KEY / PREDICT_API_KEY）")
+        if self.by_market:
+            if self.stream.connected and self.stream.alive():
+                lag = statistics.median(self.stream.lags) if self.stream.lags else None
+                ok(f"推送：已连接（共连接过 {self.stream.connects} 次）" + (f"，推送延迟中位 {lag:.0f} ms" if lag is not None else ""))
+            else:
+                (no if s.mode != "off" else warn)(f"推送没连上：{self.stream.error or '连接中'}（推送断开时靠 REST 轮流读，慢很多）")
+        elif s.mode != "off":
+            warn("推送：还没有已发布的规则场次要订阅（场次在开场前约 24 小时发布）")
+        if any(self.live_cents(r) > 0 for r in RULES):
+            feed = self.index
+            if feed is None or feed.ws is None:
+                no("币安指数没连上：盘中吃单不会买" + (f"（{feed.error}）" if feed is not None and feed.error else ""))
+            else:
+                ages = [f"{sym} {fmt(feed.price(sym))}（{(now - int(feed.priced_ms.get(sym) or 0)) / 1000:.1f} 秒前）" for sym in feed.symbols if feed.price(sym)]
+                ok("币安指数：已连接" + (f"，{'、'.join(ages)}" if ages else ""))
+        if error := str(getattr(self.store, "error", "") or ""):
+            no(f"记录：{error}（数据库写不进去时不开新单）")
+        else:
+            ok("记录：数据库正常" + ("，订单日志已打开" if self.journal_fd is not None else "（订单日志没打开：发单前改为等数据库写完，慢一点）"))
+        listed = [w for w in self.track.values() if w["market"] is not None]
+        soonest = min(self.track.values(), key=lambda w: w["start"], default=None)
+        if s.mode == "off":
+            warn("规则场次：模式是关，不跟踪场次")
+        elif soonest is None:
+            warn("规则场次：接下来一天没有开着的规则场次（价格都是 0、市场关了，或者是周末 / 节假日）")
+        else:
+            ok(f"规则场次：接下来一天 {len(self.track)} 场，已找到市场 {len(listed)} 场；下一场 {bj(soonest['start'])} {RULE_OF[soonest['rule']].name}"
+               + (f"（{soonest['word']}）" if soonest.get("word") else ""))
+        if self.settings_dropped:
+            warn("启动时删掉了和设置文件冲突的网页设置：" + "、".join(self.settings_dropped))
+        if self.errors:
+            lines.append("最近问题：")
+            lines.extend(f"  {bj(at)} {text}" for at, text in list(self.errors)[-5:])
+        if bad:
+            lines.append("结论：❌ 先解决上面 ❌ 的几项")
+        elif s.mode == "on":
+            lines.append("结论：✅ 可以真实吃单" + ("（但现在暂停着）" if self.paused else ""))
+        else:
+            lines.append(f"结论：✅ 没发现问题（现在是{MODES.get(s.mode, s.mode)}；真实吃单前可以发 /test 做一次挂单测试）")
+        return "\n".join(lines)
+
+    TEST_MAX_PRICE = D("0.02")   # the order test's bid: 2¢ at the most, and a cent under the best bid — never at or above the best ask
+    TEST_USD = 1.0               # ...for about a dollar (Predict's least order)
+    TEST_SECONDS = 600           # ...signed to expire ten minutes on, whatever happens to the cancel
+
+    async def order_test(self) -> str:
+        """The real order path end to end with about a dollar for a few seconds (huice's /live test): a LIMIT buy of Up far under
+        the market (2¢ at the most, a cent under the best bid, never at or above the best ask: it rests), on a rule window whose
+        matching is open — else the BTC quarter hour running now; read back by its hash, withdrawn, read again. Each step with
+        Predict's answer and its round trip. The order is signed to expire in ten minutes, and is no rule order (not recorded as
+        one, nothing follows it but this)."""
+        import math
+        now = self.now()
+        if self.wallet is None:
+            return "❌ 没有设置 PREDICT_PRIVATE_KEY，做不了挂单测试"
+        if self.stop.is_set():
+            return "服务正在停止"
+        try:
+            await self.api.ensure_auth()
+        except Exception as error:
+            return f"❌ Predict 登录失败：{clean_error(error) or type(error).__name__}"
+        markets = [(slug, w["market"]) for slug, w in sorted(self.track.items(), key=lambda kv: kv[1]["start"]) if w["market"] is not None]
+        btc = f"btc-updown-15m-{(now - now % 900_000) // 1000}"
+        try:
+            found = await category_market(self.api, btc)
+            if found is not None:
+                markets.append((btc, found))
+        except Exception:
+            pass
+        tried = []
+        for slug, market in markets[:4]:
+            try:
+                market = {**market, **(await self.api.market(str(market["id"])))}
+            except Exception as error:
+                tried.append(f"{slug}：读不到详情（{clean_error(error) or type(error).__name__}）")
+                continue
+            if str(market.get("tradingStatus") or "").upper() != "OPEN":
+                tried.append(f"{slug}：撮合没开启（{market.get('tradingStatus') or '?'}）")
+                continue
+            info = parse_market(market, self.config.fee_bps)
+            outcome, assumed = outcome_for_side("up", info.outcomes)
+            if outcome is None or assumed:
+                tried.append(f"{slug}：认不出涨的代币")
+                continue
+            bids, asks = await self.api.orderbook(info.market_id)
+            best_bid = bids[0][0] if bids else D(0)
+            best_ask = asks[0][0] if asks else D(1)
+            price = max(D("0.01"), min(self.TEST_MAX_PRICE, best_bid - D("0.01")))
+            if price >= best_ask:
+                tried.append(f"{slug}：最低卖价 {float(best_ask) * 100:g}¢，放不下一张不成交的测试单")
+                continue
+            shares = D(math.ceil(self.TEST_USD / float(price)))
+            amounts = limit_amounts(True, to_wei(price), to_wei(shares))
+            fields = build_order(self.wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, now // 1000 + self.TEST_SECONDS)
+            digest, signature = self.wallet.sign_order(fields, info.neg_risk, info.yield_bearing)
+            body = dumps_bytes({"data": {"order": {**fields, "signature": signature, "hash": digest}, "strategy": "LIMIT",
+                                         "pricePerShare": str(amounts["price_per_share"])}})
+            name = market.get("question") or market.get("title") or slug
+            lines = [f"🧪 挂单测试 {bj(now)}：{name}（市场 {info.market_id}）买涨 {float(price) * 100:g}¢ × {shares:g} 份，"
+                     f"最多花 ${from_wei(amounts['maker']):.2f}，{self.TEST_SECONDS // 60} 分钟后自动过期；盘口最高买价 {float(best_bid) * 100:g}¢、最低卖价 {float(best_ask) * 100:g}¢"]
+            record = {"at": now, "slug": slug, "market_id": info.market_id, "price": float(price), "shares": float(shares), "hash": digest.lower(), "steps": lines}
+            self.store.put(f"test:{digest.lower()}", record)
+            began = time.perf_counter()
+            try:
+                result = await self.api.create_order(body, digest, checked=False)
+            except Exception as error:
+                lines.append(f"1/4 下单失败（{(time.perf_counter() - began) * 1000:.0f} ms）：{clean_error(error) or type(error).__name__}")
+                self.store.put(f"test:{digest.lower()}", {**record, "steps": lines})
+                lines.append("结论：❌ 这张测试单没下成：看上面 Predict 的说法" + ("（403 = 这个区域不能交易）" if http_status(error) == 403 else ""))
+                return "\n".join(lines)
+            oid = str(result.get("order_id") or "")
+            lines.append(f"1/4 下单成功：订单 #{oid}（往返 {(time.perf_counter() - began) * 1000:.0f} ms）")
+            began = time.perf_counter()
+            try:
+                row = await self.api.order(oid, digest)
+                filled_now, status = order_fill(row, float(shares)) if row else (0.0, "")
+                lines.append(f"2/4 按哈希查到：{status or '?'}，成交 {filled_now:g}/{shares:g}（往返 {(time.perf_counter() - began) * 1000:.0f} ms）" if row
+                             else f"2/4 按哈希暂时查不到（往返 {(time.perf_counter() - began) * 1000:.0f} ms）：Predict 的记录可能晚一点出现")
+            except Exception as error:
+                lines.append(f"2/4 查询失败：{clean_error(error) or type(error).__name__}")
+            began = time.perf_counter()
+            removed = False
+            try:
+                answer = await self.api.remove_orders([oid])
+                removed = oid in (answer.get("removed") or []) or oid in (answer.get("noop") or [])
+                lines.append(("3/4 撤单成功" if removed else "3/4 撤单请求发出，Predict 的应答里没有它") + f"（往返 {(time.perf_counter() - began) * 1000:.0f} ms）")
+            except Exception as error:
+                lines.append(f"3/4 撤单失败：{clean_error(error) or type(error).__name__}（它 {self.TEST_SECONDS // 60} 分钟后自己过期）")
+            filled_end = 0.0
+            try:
+                row = await self.api.order(oid, digest)
+                filled_end, status = order_fill(row, float(shares)) if row else (0.0, "")
+                lines.append(f"4/4 最终状态：{status or '查不到'}，成交 {filled_end:g} 份" + (f"（花了约 ${filled_end * float(price):.2f}，这几份照常结算）" if filled_end > DUST else ""))
+            except Exception as error:
+                lines.append(f"4/4 最终状态没读到：{clean_error(error) or type(error).__name__}")
+            lines.append("结论：" + ("✅ 下单、查询、撤单都正常：签名、授权、这个区域都没问题，可以真实吃单" if removed
+                                  else "⚠️ 下单成功但撤单没确认：到 Predict 网站看一下这张单（10 分钟后自己过期）"))
+            self.store.put(f"test:{digest.lower()}", {**record, "steps": lines, "order_id": oid, "removed": removed, "filled": filled_end})
+            return "\n".join(lines)
+        return "❌ 没找到能做挂单测试的市场（需要撮合已开启、最低卖价高于 1¢）：\n" + "\n".join(tried[:6])
 
     # -- the control page and the review page --
     async def save_settings(self, values: dict) -> str:

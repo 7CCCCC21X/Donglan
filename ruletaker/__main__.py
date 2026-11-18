@@ -69,7 +69,7 @@ async def run_service(config: Config, env: dict | None = None) -> int:
     taker = RuleTaker(config, store, index=index, base_env={k: v for k, v in (env or {}).items() if k.startswith("RULE_")} if env is not None else None)
     taker.region = region
     telegram = Telegram(config.telegram_token, config.telegram_chats, config.admin_user_id, config.telegram_commands,
-                        handler=taker.command, enabled=bool(config.telegram_token))
+                        handler=taker.command, enabled=bool(config.telegram_token), command_token=config.telegram_command_token)
     taker.telegram = telegram
     status = StatusServer(taker, config.status_host, config.status_port, config.status_key)
     loop = asyncio.get_running_loop()

@@ -101,7 +101,9 @@ bash deploy/gcp/rt.sh latency   # 到 Predict 的延迟（只读）
 bash deploy/gcp/rt.sh status    # 状态，就是 huice 的 /rules
 ```
 
-`check` 最后会向下单接口发一个**空订单**（内容为空，Predict 只会拒为“无效”，不可能成交）来看这个区域能不能交易：返回 400 是正常的，返回 403 说明这个区域不能下单，要换区域。**请自己确认 Predict.fun 的服务条款允许你在这个地区使用。**
+（设了 Telegram 命令机器人的话，也可以直接给它发 `/check`；`bash deploy/gcp/rt.sh test` 或 `/test` 再做一次真实的挂单测试。）
+
+`check` 会向下单接口发一个**空订单**（内容为空，Predict 只会拒为“无效”，不可能成交）来看这个区域能不能交易：返回 400 是正常的，返回 403 说明这个区域不能下单，要换区域。**请自己确认 Predict.fun 的服务条款允许你在这个地区使用。**
 
 ### 6. 切到真实吃单
 
@@ -129,6 +131,8 @@ bash deploy/gcp/rt.sh env
 |---|---|
 | `bash deploy/gcp/rt.sh console` | 打开网页控制台和复盘页（见下一节） |
 | `bash deploy/gcp/rt.sh status` | 状态（文字版）：模式、推送、账户余额、每秒检查时段、下一个抢单时刻、每条规则的下一场、抢单记录、今天的成交和盈亏 |
+| `bash deploy/gcp/rt.sh check` | **自检**：登录、账户、余额、授权、下单接口在这个区域能不能用、读一次多快、推送、记录、场次，最后一句结论（和 Telegram `/check`、控制台“自检”按钮一样） |
+| `bash deploy/gcp/rt.sh test` | **挂单测试**：挂一张约 $1、远低于市价的买单，查到后马上撤掉，每一步写 Predict 的回答和往返用时（和 Telegram `/test` 一样） |
 | `bash deploy/gcp/rt.sh logs` | 实时日志（`Ctrl+C` 退出） |
 | `bash deploy/gcp/rt.sh pause` / `resume` | 暂停（不开新单，挂着的单当场撤）/ 恢复；暂停在重启后仍然有效。今日亏损停机后 `resume` 会从现在的盈亏起再给一个 `RULE_MAX_DAILY_LOSS_USD` |
 | `bash deploy/gcp/rt.sh mode paper` | 运行中切换模式（off / paper / on），**不会高于**设置文件里的 `RULE_TAKER` |
@@ -138,9 +142,28 @@ bash deploy/gcp/rt.sh env
 | `bash deploy/gcp/rt.sh ssh` | 登录虚拟机 |
 | `bash deploy/gcp/rt.sh probe asia-east2-a` | 在别的区域临时开一台小机器量延迟，量完自动删除 |
 
-停止或重启时，服务会先等在途订单的应答（最多 15 秒）、撤掉还挂着的单，再退出。
+停止或重启时，服务会先等在途订单的应答（最多 25 秒）、撤掉还挂着的单，再退出。
 
-**Telegram**：设了 `TELEGRAM_BOT_TOKEN` 就会推送启动、每次成交、每场结算和告警。`TELEGRAM_COMMANDS=on`（并且用单独的机器人、设了 `ADMIN_USER_ID`）时，管理员可以发 `/status`、`/pause`、`/resume`、`/mode off|paper|on`；任何人可以发 `/id` 查自己的用户 ID。
+### Telegram：通知和命令（自检）
+
+设了 `TELEGRAM_BOT_TOKEN` 就会推送启动、每次成交、每场结算和告警；只发通知可以直接用 Railway 那个机器人的 Token。
+
+要在 Telegram 里**发命令自检**，给这个服务单独建一个机器人（同一个 Token 只能有一个进程收消息，和 Railway 共用会让两边都收不到命令）：
+
+1. 在 Telegram 找 **@BotFather**，`/newbot` 建一个机器人（名字随意，例如“规则吃单东京”），拿到 Token。
+2. 设置文件里加：`TELEGRAM_COMMANDS=on`、`TELEGRAM_COMMAND_TOKEN=新机器人的 Token`、`ADMIN_USER_ID=你的用户 ID`（不知道的话：先留 0 部署，给新机器人发 `/id` 拿到数字再填回去；或者用 Railway 那个机器人的 `/id`）。通知想继续走 Railway 那个机器人，就保留原来的 `TELEGRAM_BOT_TOKEN`；想都走新机器人，就把两个都填成新 Token。
+3. `bash deploy/gcp/rt.sh env` 上传并重启。新机器人输入框左下角的“菜单”里会出现这些命令：
+
+| 命令 | 作用 |
+|---|---|
+| `/check` | **自检**（huice `/live check` 的对应物，内容更多）：模式和停机线、Predict 登录、Predict 账户的控制钥匙（链上核对）、USDT 和 BNB 余额（够不够买满一场）、交易所授权、**下单接口在这个区域能不能用**（发一个空订单，Predict 拒为无效 = 能用，403 = 这个区域不能交易，空订单不可能成交）、读一次 Predict 的往返、推送连接和推送延迟、币安指数（盘中吃单开着时）、数据库和订单日志、接下来一天的场次和市场找到没有、最近问题，最后一句结论 |
+| `/test` | **挂单测试**（huice `/live test` 的对应物）：在一个撮合已开启的规则场次（没有的话用 BTC 当前的 15 分钟场次）挂一张买涨的限价单——最高 2¢、低于最高买价 1¢、**绝不高于最低卖价**（不会成交），约 $1，10 分钟后自动过期；按哈希查到它、撤掉、再查最终状态，每一步写 Predict 的回答和往返用时。签名、授权、这个区域能不能下单一次验证完。它不算规则吃单的单，不进记录 |
+| `/status` | 状态（和 `rt.sh status` 一样） |
+| `/pause`、`/resume` | 暂停（挂着的单当场撤）/ 恢复 |
+| `/mode off\|paper\|on` | 切换模式，不高于设置文件的 `RULE_TAKER` |
+| `/id` | 查你的用户 ID 和这个聊天的 ID（任何人都能用） |
+
+只认 `ADMIN_USER_ID` 发来的命令（`/id` 除外），别人发了不理。自检、挂单测试要几秒，机器人先回“自检中…”，结果随后发来。
 
 ---
 
@@ -263,7 +286,8 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 | `RULE_FAST_HOURS` | `01:00-07:00` | 每秒检查时段（北京时间），可多段，`off` 关 |
 | `RULE_LEAD_MINUTES` | 300 | 对手提前多少分钟挂单，0 = 不按这个时刻 |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `ADMIN_USER_ID` | | 通知（话题写 `群ID:话题ID`） |
-| `TELEGRAM_COMMANDS` | off | on = 收管理员命令（要单独的机器人） |
+| `TELEGRAM_COMMANDS` | off | on = 收管理员命令（`/check` 自检、`/test` 挂单测试等） |
+| `TELEGRAM_COMMAND_TOKEN` | 空 | 收命令的机器人（本服务专用）；空 = 用 `TELEGRAM_BOT_TOKEN` 收 |
 | `RULE_NOTIFY` | on | 成交、结算通知；off 只发告警 |
 | `STATUS_HOST` / `STATUS_PORT` / `STATUS_KEY` | 127.0.0.1 / 8080 / 空 | 状态页；不在本机监听时必须设口令 |
 | `RULE_WS_CONNECTIONS` | 1 | 推送连接条数 1～3，谁先送到用谁的 |

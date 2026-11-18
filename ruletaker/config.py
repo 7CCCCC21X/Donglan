@@ -142,6 +142,7 @@ class Config:
     max_daily_loss_usd: float = 0.0
     state_db: str = "data/ruletaker.sqlite3"
     telegram_token: str = ""
+    telegram_command_token: str = ""  # TELEGRAM_COMMAND_TOKEN: a bot of this service's own for the commands (the notifications may stay on TELEGRAM_BOT_TOKEN)
     telegram_chats: tuple = ()        # ((chat id, thread id or 0), ...)
     admin_user_id: int = 0
     telegram_commands: bool = False
@@ -208,6 +209,7 @@ class Config:
             max_daily_loss_usd=float(bounded(e, "RULE_MAX_DAILY_LOSS_USD", 0, 0, 1_000_000, float)),
             state_db=str(e.get("STATE_DB", "")).strip() or "data/ruletaker.sqlite3",
             telegram_token=str(e.get("TELEGRAM_BOT_TOKEN", "")).strip(),
+            telegram_command_token=str(e.get("TELEGRAM_COMMAND_TOKEN", "")).strip(),
             telegram_chats=tuple(chats),
             admin_user_id=int(bounded(e, "ADMIN_USER_ID", 0, 0, 10 ** 15)),
             telegram_commands=str(e.get("TELEGRAM_COMMANDS", "off")).strip().lower() in {"on", "1", "true", "yes"},
@@ -224,5 +226,6 @@ class Config:
         """Which secrets are set (never their values): the deploy's first log line."""
         return (f"secrets configured: predict_api_key={bool(self.api_key)} own_rule_key={self.own_key} "
                 f"predict_private_key={bool(self.private_key)} predict_account={bool(self.account)} "
-                f"telegram_token={bool(self.telegram_token)} status_key={bool(self.status_key)} mode={self.rules.mode} "
+                f"telegram_token={bool(self.telegram_token)} telegram_command_token={bool(self.telegram_command_token)} "
+                f"telegram_commands={self.telegram_commands} status_key={bool(self.status_key)} mode={self.rules.mode} "
                 f"trading_allowed={self.trading_allowed}")

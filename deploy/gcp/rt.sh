@@ -7,7 +7,8 @@
 #   bash deploy/gcp/rt.sh console         打开网页控制台和复盘页（通过 Cloud Shell 的“网页预览”，不开公网端口）
 #   bash deploy/gcp/rt.sh status          看状态（就是 huice 的 /rules）
 #   bash deploy/gcp/rt.sh logs            看实时日志（Ctrl+C 退出）
-#   bash deploy/gcp/rt.sh check           自检：登录、账户、余额、授权、这个区域能不能下单（只读）
+#   bash deploy/gcp/rt.sh check           自检：登录、账户、余额、授权、下单接口、推送、记录（和 Telegram /check 一样）
+#   bash deploy/gcp/rt.sh test            挂单测试：挂一张约 $1 的低价单、查到、撤掉（和 Telegram /test 一样）
 #   bash deploy/gcp/rt.sh latency         量这台机器到 Predict 的延迟（只读）
 #   bash deploy/gcp/rt.sh pause|resume    暂停 / 恢复开新单
 #   bash deploy/gcp/rt.sh mode off|paper|on   运行中切换模式（不会高于设置文件里的 RULE_TAKER）
@@ -125,7 +126,12 @@ case "$cmd" in
   resume) status_call POST /resume ;;
   mode) [ -n "${1:-}" ] || die "用法：rt.sh mode off|paper|on"; status_call POST "/mode?to=$1" ;;
   logs) remote "sudo journalctl -u ruletaker -f -n 200 --no-hostname -o cat" ;;
-  check) remote "sudo -u ruletaker /opt/ruletaker/venv/bin/python -m ruletaker check --env /etc/ruletaker/ruletaker.env" ;;
+  check|test)  # the running service's own self-check (or order test); the command-line check when the service is not running
+    remote "sudo bash -c 'F=/etc/ruletaker/ruletaker.env; K=\$(grep -E \"^STATUS_KEY=\" \$F | tail -1 | cut -d= -f2-); P=\$(grep -E \"^STATUS_PORT=\" \$F | tail -1 | cut -d= -f2-); \
+      curl -sf -m 90 -X POST -H \"X-RT: 1\" -H \"X-Status-Key: \$K\" -H \"Content-Type: application/json\" -d \"{\\\"action\\\":\\\"$cmd\\\"}\" \"http://127.0.0.1:\${P:-8080}/api/control\" \
+      | python3 -c \"import json,sys; print(json.load(sys.stdin)[\\\"message\\\"])\" \
+      || { [ $cmd = check ] && echo \"（服务没在运行：改用命令行自检）\" && sudo -u ruletaker /opt/ruletaker/venv/bin/python -m ruletaker check --env \$F; }'"
+    ;;
   latency) remote "sudo -u ruletaker /opt/ruletaker/venv/bin/python -m ruletaker latency --env /etc/ruletaker/ruletaker.env" ;;
   restart|stop|start) remote "sudo systemctl $cmd ruletaker && sudo systemctl --no-pager --lines=5 status ruletaker || true" ;;
   ssh) gcloud compute ssh "$VM" "${G[@]}" "${Z[@]}" ;;

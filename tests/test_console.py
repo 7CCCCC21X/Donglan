@@ -2,6 +2,7 @@
 settings file no longer agrees), the mode's ceiling, the API's routes and its header check, the review's sums, the CSV."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -159,3 +160,139 @@ class ReviewTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelfCheckTest(unittest.TestCase):
+    def test_self_check_all_good_then_a_region_that_may_not_trade(self) -> None:
+        from fakes import book, market_of
+        from test_taker import MID, SLUG, found
+
+        async def go() -> None:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            stream.take(MID, book(asks=[("0.65", "10")]))  # (nothing at the rule's price: no order)
+            text = await taker.self_check()
+            self.assertIn("✅ Predict 登录", text)
+            self.assertIn("✅ 下单接口在这个区域可用", text)
+            self.assertIn("✅ 推送：已连接", text)
+            self.assertIn("✅ 授权：标准交易所", text)
+            self.assertIn("结论：✅ 可以真实吃单", text)
+            self.assertEqual(api.created, [])  # a self-check places nothing
+            api.empty_order_answer = "HTTP 403: 访问被拒绝"
+            text = await taker.self_check()
+            self.assertIn("❌ 下单接口 403", text)
+            self.assertIn("结论：❌", text)
+            chain.allowed = 0
+            api.empty_order_answer = "HTTP 400: order is invalid"
+            self.assertIn("❌ 授权：标准交易所 没有 USDT 额度", await taker.self_check())
+            self.assertTrue(market_of)  # (imported for the next test's market)
+            self.assertTrue(SLUG)
+        run(go())
+
+    def test_order_test_rests_far_under_the_market_and_is_withdrawn(self) -> None:
+        from test_taker import MID, found
+
+        async def go() -> None:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            api.books[MID] = (((__import__("decimal").Decimal("0.30"), __import__("decimal").Decimal("10")),),
+                              ((__import__("decimal").Decimal("0.55"), __import__("decimal").Decimal("100")),))
+            records_before = dict(taker.recs)
+            text = await taker.order_test()
+            self.assertIn("1/4 下单成功", text)
+            self.assertIn("3/4 撤单成功", text)
+            self.assertIn("结论：✅", text)
+            sent = api.created[0]["data"]
+            self.assertEqual(sent["pricePerShare"], str(2 * 10 ** 16))            # 2¢: far under the 55¢ offer, a cent under the 30¢ bid at most
+            self.assertEqual(int(sent["order"]["takerAmount"]), 50 * 10 ** 18)    # $1 of it
+            self.assertGreater(int(sent["order"]["expiration"]), taker.now() // 1000)  # (not the rule's expiry: ten minutes on)
+            self.assertEqual(api.removed, ["id1"])
+            self.assertEqual(taker.recs, records_before)                         # no rule record: nothing else follows it
+            self.assertTrue(any(k.startswith("test:") for k, _ in taker.store.items("test:")))
+            # (the book as Predict answers the test's read — not pushed: an offer under the rule's price would be bought by the taker)
+            api.books[MID] = ((), ((__import__("decimal").Decimal("0.01"), __import__("decimal").Decimal("100")),))  # an offer at 1¢: no room
+            text = await taker.order_test()
+            self.assertIn("放不下一张不成交的测试单", text)
+            self.assertEqual(len(api.created), 1)
+        run(go())
+
+    def test_commands_reach_the_checks(self) -> None:
+        async def go() -> None:
+            taker, *_ = make_taker(START - 3_600_000)
+            self.assertIn("规则吃单自检", await taker.command("/check", ""))
+            self.assertIn("/check 自检", await taker.command("/help", ""))
+        run(go())
+
+
+class TelegramCommandsTest(unittest.TestCase):
+    def test_commands_through_a_bot_of_their_own(self) -> None:
+        from ruletaker.notify import Telegram
+
+        async def go() -> None:
+            taker, *_ = make_taker(START - 3_600_000)
+            calls: list[tuple] = []
+            updates = [[{"update_id": 1, "message": {"text": "/check", "chat": {"id": 42}, "from": {"id": 42}}},
+                        {"update_id": 2, "message": {"text": "/pause", "chat": {"id": 7}, "from": {"id": 7}}},          # not the admin
+                        {"update_id": 3, "message": {"text": "/id@rt_bot", "chat": {"id": -100, "type": "supergroup"}, "message_thread_id": 9, "from": {"id": 7}}}]]
+
+            async def fake_call(method: str, payload: dict, timeout: float = 15, token: str = ""):
+                calls.append((method, token, payload))
+                if method == "getUpdates":
+                    if updates:
+                        return updates.pop(0)
+                    await asyncio.sleep(3600)
+                return True
+            tg = Telegram("NOTIFY", ((1, 0),), admin=42, commands=True, handler=taker.command, command_token="CMD")
+            tg.call = fake_call
+            task = asyncio.create_task(tg.run())
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if sum(1 for c in calls if c[0] == "sendMessage") >= 3:
+                    break
+            tg.send("🎯 规则吃单成交：…")  # a notification: through the notifying bot, to the configured chat
+            await asyncio.sleep(1.0)
+            tg.stop()
+            await asyncio.wait_for(task, 10)
+            self.assertEqual(calls[0][0], "setMyCommands")
+            self.assertEqual(calls[0][1], "CMD")
+            sent = [(c[1], c[2]["chat_id"], c[2].get("message_thread_id"), c[2]["text"]) for c in calls if c[0] == "sendMessage"]
+            self.assertTrue(any(tok == "CMD" and chat == 42 and "自检中" in text for tok, chat, _, text in sent))
+            self.assertTrue(any(tok == "CMD" and chat == 42 and "规则吃单自检" in text for tok, chat, _, text in sent))
+            self.assertTrue(any(tok == "CMD" and chat == -100 and thread == 9 and "你的用户 ID：7" in text for tok, chat, thread, text in sent))
+            self.assertTrue(any(tok == "NOTIFY" and chat == 1 and "成交" in text for tok, chat, _, text in sent))
+            self.assertEqual(taker.paused, "")  # the stranger's /pause did nothing
+        run(go())
+
+
+class TelegramIdFirstTest(unittest.TestCase):
+    def test_id_answered_before_an_admin_is_set_nothing_else(self) -> None:
+        from ruletaker.notify import Telegram
+
+        async def go() -> None:
+            taker, *_ = make_taker(START - 3_600_000)
+            calls: list[tuple] = []
+            updates = [[{"update_id": 1, "message": {"text": "/id", "chat": {"id": 5}, "from": {"id": 5}}},
+                        {"update_id": 2, "message": {"text": "/pause", "chat": {"id": 5}, "from": {"id": 5}}}]]
+
+            async def fake_call(method: str, payload: dict, timeout: float = 15, token: str = ""):
+                calls.append((method, token, payload))
+                if method == "getUpdates":
+                    if updates:
+                        return updates.pop(0)
+                    await asyncio.sleep(3600)
+                return True
+            tg = Telegram("", (), admin=0, commands=True, handler=taker.command, command_token="CMD")
+            tg.call = fake_call
+            task = asyncio.create_task(tg.run())
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if any(c[0] == "sendMessage" for c in calls):
+                    break
+            await asyncio.sleep(0.5)
+            tg.stop()
+            await asyncio.wait_for(task, 10)
+            sent = [c[2]["text"] for c in calls if c[0] == "sendMessage"]
+            self.assertEqual(len(sent), 1)
+            self.assertIn("你的用户 ID：5", sent[0])
+            self.assertEqual(taker.paused, "")
+        run(go())

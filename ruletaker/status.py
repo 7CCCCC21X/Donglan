@@ -7,7 +7,7 @@
   GET  /api/state          the control page's data
   GET  /api/review?days=30 the review page's data (7 / 30 / 90 / all)
   GET  /api/records.csv    every order of every window
-  POST /api/control        {"action": "pause" | "resume" | "mode" | "withdraw", "arg": ...}
+  POST /api/control        {"action": "pause" | "resume" | "mode" | "withdraw" | "check"（自检） | "test"（挂单测试）, "arg": ...}
   POST /api/settings       {"values": {"RULE_GOLD_SHUT_CENTS": "60", ...}} or {"reset": ["RULE_…"] (empty: all)}
   POST /pause  /resume  /mode?to=off|paper|on   (rt.sh)
 
@@ -131,7 +131,7 @@ class StatusServer:
                 action, arg = str(data.get("action") or ""), str(data.get("arg") or "")
                 if action == "withdraw":
                     message = await self.taker.withdraw_all("控制台撤单") or "没有挂着的规则吃单订单"
-                elif action in {"pause", "resume", "mode"}:
+                elif action in {"pause", "resume", "mode", "check", "test"}:
                     message = await self.taker.control(action, arg or ("控制台" if action == "pause" else ""))
                 else:
                     return 400, js, json.dumps({"ok": False, "message": f"不认识的操作：{action}"}, ensure_ascii=False)

@@ -47,12 +47,20 @@ class FakeApi:
         self.jwt_ok = True
         self.stream: Any = None
         self.pre_send: Any = None
+        self.jwt_exp = 0
+        self.empty_order_answer = "HTTP 400: order is invalid"
 
     def fresh(self) -> bool:
         return self.jwt_ok
 
     async def ensure_auth(self) -> None:
         self.calls.append(("auth",))
+
+    async def authed(self, method: str, path: str, payload: Any = None, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append(("authed", method, path))
+        if method == "POST" and path == "/orders":  # the self-check's empty order: refused as invalid (or the region's 403)
+            raise RemoteError(self.empty_order_answer)
+        return await self.call(method, path, payload)
 
     async def call(self, method: str, path: str, payload: Any = None, *args: Any, **kwargs: Any) -> Any:
         self.calls.append((method, path))
@@ -74,11 +82,11 @@ class FakeApi:
             return self.stream.last[mid]  # (Predict's book is the one it last pushed)
         return self.books.get(mid, ((), ()))
 
-    async def create_order(self, body: dict, digest: str) -> dict:
+    async def create_order(self, body: dict, digest: str, checked: bool = True) -> dict:
         self.calls.append(("create", digest))
         if self.pre_send is not None:
             await self.pre_send()  # (whatever the request waited for before its bytes left: a token, a slot, a sign-in)
-        if self.before_send is not None and (why := self.before_send(digest)):
+        if checked and self.before_send is not None and (why := self.before_send(digest)):
             raise NotSent(why)
         if isinstance(body, (bytes, bytearray)):
             import json
