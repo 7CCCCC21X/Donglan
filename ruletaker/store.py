@@ -5,6 +5,7 @@ batches with synchronous=FULL. ``flush`` waits until everything queued so far is
 disk before its request leaves through the taker's own journal file (RuleTaker.journal), not through this store."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
@@ -103,7 +104,10 @@ class Store:
                     batch.append(self.queue.get_nowait())
                 except queue.Empty:
                     break
-            for attempt in range(5):
+            # A batch is written or tried again — never counted as written while it is not: flush() says False until it is (a
+            # full disk: the taker then sends no order, as nothing could find it after a restart), and error says why meanwhile
+            attempt = 0
+            while True:
                 try:
                     with conn:
                         for kind, key, text in batch:
@@ -115,9 +119,14 @@ class Store:
                     self.error = ""
                     break
                 except sqlite3.Error as error:
+                    attempt += 1
                     self.error = f"数据库写入失败：{error}"
-                    LOG.error("%s（第 %d 次）", self.error, attempt + 1)
-                    time.sleep(0.5 * (attempt + 1))
+                    LOG.error("%s（第 %d 次，稍后再试）", self.error, attempt)
+                    time.sleep(min(30.0, 0.5 * attempt))
+                    with contextlib.suppress(sqlite3.Error):
+                        conn.close()
+                    with contextlib.suppress(sqlite3.Error):
+                        conn = self.connect()
             with self.cond:
                 self.written += len(batch)
                 self.cond.notify_all()

@@ -46,6 +46,7 @@ class FakeApi:
         self.create_delay = 0.0
         self.jwt_ok = True
         self.stream: Any = None
+        self.pre_send: Any = None
 
     def fresh(self) -> bool:
         return self.jwt_ok
@@ -75,6 +76,8 @@ class FakeApi:
 
     async def create_order(self, body: dict, digest: str) -> dict:
         self.calls.append(("create", digest))
+        if self.pre_send is not None:
+            await self.pre_send()  # (whatever the request waited for before its bytes left: a token, a slot, a sign-in)
         if self.before_send is not None and (why := self.before_send(digest)):
             raise NotSent(why)
         if isinstance(body, (bytes, bytearray)):
@@ -179,7 +182,7 @@ def make_taker(clock_ms: int, store: Any = None, journal: bool = False, **env: s
     api.stream = stream
     taker = RuleTaker(config, store, api=api, chain=chain, stream=stream, clock=clock)
     taker.ready_error = ""
-    taker.usdt = chain.usdt
+    taker.usdt, taker.balance_asked_ms = chain.usdt, clock_ms - 60_000  # (the balance read a minute before the test begins)
     taker.running = True
     return taker, api, chain, stream, clock
 

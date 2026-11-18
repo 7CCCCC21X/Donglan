@@ -16,7 +16,9 @@ if ! dpkg -s python3-venv >/dev/null 2>&1; then
   apt-get -o DPkg::Lock::Timeout=300 update -qq   # (a new VM's first boot may hold the lock: unattended upgrades)
   apt-get -o DPkg::Lock::Timeout=300 install -y -qq python3 python3-venv python3-pip >/dev/null
 fi
-python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version' # (Ubuntu 24.04: 3.12, which also looks at a pushed book in the very turn it arrives)
+# Python 3.12 or later: a pushed book is looked at, and its order sent, in the very turn of the loop it arrives in (eager tasks).
+# Ubuntu 24.04 (the VM's image) has 3.12.
+python3 -c 'import sys; assert sys.version_info >= (3, 12), "需要 Python 3.12 以上（Ubuntu 24.04 自带 3.12），现在是 " + sys.version'
 
 if [ ! -x "$APP/venv/bin/python" ]; then
   python3 -m venv "$APP/venv"

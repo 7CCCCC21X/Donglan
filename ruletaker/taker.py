@@ -103,6 +103,9 @@ CONFLICT_GRACE_MS = 90_000
 CONFLICT_MISSES = 6
 LAST_WITHDRAW_S = 4.0
 BALANCE_BUSY_MS, BALANCE_IDLE_MS = 20_000, 120_000  # the USDT balance read again this often (busy: an order may go out soon)
+BALANCE_LAG_MS = 10_000       # ...and an order placed this long before a read began is taken as not in it yet (usd)
+RECENT_MS = 2 * DAY_MS        # the records an order's checks sum over (usd, the day's spend): those of the last two days' windows
+SEND_WAIT_S = 25.0            # at a stop: the orders on their way given this long for their answers (an order's request: 20 s at most)
 READY_RETRY_MS = 60_000
 STRIKE_EVERY_MS, STRIKE_FOR_MS = 5_000, 180_000  # 盘中: Predict's start price asked for this often, this long after the start
 WARM_CONN_S = 2.0             # through the busy stretches a pooled connection to Predict is kept used within this
@@ -152,6 +155,7 @@ class RuleTaker:
         self.usdt: int | None = None
         self.bnb: int | None = None
         self.balance_ms = 0
+        self.balance_asked_ms = 0
         self.balance_error = ""
         self.allowance: dict[str, tuple[int, int]] = {}
         # the loop
@@ -191,6 +195,11 @@ class RuleTaker:
         self.region = config.region
         self.recs: dict[str, dict] = {k.removeprefix(PREFIX): v for k, v in store.items(PREFIX) if isinstance(v, dict)}
         self.recover()
+        # the records the hot path sums (the balance spent, the day's spend) are a few: the windows of the last two days — kept
+        # apart from the 90 days the store holds, so an order's checks walk a dozen records, not hundreds
+        self.recent_keys: set[str] = {k for k, r in self.recs.items() if int(r.get("start_ms") or 0) >= self.now() - RECENT_MS}
+        self.pnl_epoch = 0          # bumped by each settlement: the day's P&L (the loss stop) summed again only then
+        self.pnl_held: tuple = ()
         self.stream.on_change = self.on_change
         if self.index is not None:
             self.index.on_change = self.on_index
@@ -206,7 +215,20 @@ class RuleTaker:
     def save(self, rec: dict) -> None:
         key = rid(rec["slug"], rec["mode"])
         self.recs[key] = rec
+        if int(rec.get("start_ms") or 0) >= self.now() - RECENT_MS:
+            self.recent_keys.add(key)
         self.store.put(PREFIX + key, rec)
+
+    def recent(self) -> dict[str, dict]:
+        """The records of the last two days' windows (every order placed today or yesterday is on one of them)."""
+        return {k: r for k in list(self.recent_keys) if (r := self.recs.get(k)) is not None}
+
+    def today_pnl(self) -> float:
+        """The real records' P&L settled today (Beijing): summed again after a settlement, a new record, a new day."""
+        mark = (day_of(self.now()), self.pnl_epoch, len(self.recs))
+        if not self.pnl_held or self.pnl_held[0] != mark:
+            self.pnl_held = (mark, day_pnl(self.recs, mark[0]))
+        return self.pnl_held[1]
 
     def note(self, text: str) -> None:
         self.error = text
@@ -230,8 +252,24 @@ class RuleTaker:
     def cooling(self) -> float:
         return float(getattr(self.api, "blocked_until", 0.0)) - time.monotonic()
 
-    def usd(self) -> float | None:
-        return from_wei(self.usdt) if self.usdt is not None else None
+    def usd(self, excluding: dict | None = None) -> float | None:
+        """The USDT this taker may still spend: the balance last read on-chain, less what the real orders placed since just
+        before that read began may have spent (a fill reaches the chain a few seconds after it is matched: BALANCE_LAG_MS) —
+        at their price for an order whose word is final, at their limit in full for one that is not. None before a read.
+        ``excluding``: an order not to count (before_send judges an order against what is left beside it)."""
+        if self.usdt is None:
+            return None
+        since = self.balance_asked_ms - BALANCE_LAG_MS
+        spent = 0.0
+        for rec in self.recent().values():
+            if rec.get("mode") != "on" or int(rec.get("start_ms") or 0) < since - DAY_MS:
+                continue
+            for o in rec.get("orders") or []:
+                if o is excluding or o.get("paper") or o.get("state") in NEVER_PLACED or int(o.get("at") or 0) < since:
+                    continue
+                spent += (float(o.get("filled") or 0) * float(o.get("avg") or o.get("limit") or 0) if o.get("state") in FINAL_STATES
+                          else float(o.get("shares") or 0) * float(o.get("limit") or 0))
+        return from_wei(self.usdt) - spent
 
     @property
     def ready(self) -> bool:
@@ -267,9 +305,9 @@ class RuleTaker:
             return float(self.loss_floor_at.get("floor") or -cap)
         return -cap
 
-    def block(self, usd: float) -> str:
+    def block(self, usd: float, excluding: dict | None = None) -> str:
         """Why no real order goes out now ("" to send): the mode, the deploy's switch, the pause, the day's loss stop, the
-        readiness, the API's cooldown, the balance."""
+        readiness, the records' store, the API's cooldown, the balance (spendable beside ``excluding``)."""
         if self.settings.mode != "on":
             return f"规则吃单是“{MODES.get(self.settings.mode, self.settings.mode)}”，不下单"
         if not self.config.trading_allowed:
@@ -278,24 +316,27 @@ class RuleTaker:
             return f"已暂停（{self.paused}）"
         floor = self.loss_floor()
         if floor is not None:
-            pnl = day_pnl(self.recs, day_of(self.now()))
+            pnl = self.today_pnl()
             if pnl <= floor:
                 return f"今日已结算 {money(pnl)} 已到 RULE_MAX_DAILY_LOSS_USD 的停机线（{money(floor)}），今天不再开新单"
         if not self.ready:
             return f"真实交易未就绪：{self.not_ready_why}"
+        if error := str(getattr(self.store, "error", "") or ""):
+            return f"记录写不进数据库（{error}），不开新单"  # (an order nothing could find after a restart is not sent)
         if (left := self.cooling()) > 0:
             return f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）"
-        usd_left = self.usd()
-        if usd_left is not None and usd_left < usd:
+        usd_left = self.usd(excluding)
+        if usd_left is not None and usd_left < usd - 1e-9:
             return f"USDT 余额 ${usd_left:,.2f} 不足本单 ${usd:,.2f}"
         return ""
 
     def halted(self) -> bool:
-        """No real order may be opened now by the operator's word: the mode, the deploy's switch, the pause, the loss stop."""
-        if self.settings.mode != "on" or not self.config.trading_allowed or self.paused:
+        """No real order may be opened now by the operator's word or the service's stop: the mode, the deploy's switch, the
+        pause, the loss stop, the process ending."""
+        if self.settings.mode != "on" or not self.config.trading_allowed or self.paused or self.stop.is_set():
             return True
         floor = self.loss_floor()
-        return floor is not None and day_pnl(self.recs, day_of(self.now())) <= floor
+        return floor is not None and self.today_pnl() <= floor
 
     def before_send(self, digest: str) -> str:
         """Judged right before an order's bytes go out: the gates again, the settings the look decided under, the window's start
@@ -313,9 +354,15 @@ class RuleTaker:
         order = next((o for o in rec.get("orders") or [] if o.get("hash") == digest), None)
         if order is None:
             return "订单记录不见了"
-        if int(order.get("expires") or 0) * 1000 - self.now() < SEND_MIN_LEFT_MS:
+        now = self.now()
+        if int(order.get("expires") or 0) * 1000 - now < SEND_MIN_LEFT_MS:
             return "距订单到期不足 5 秒（开场前 5 秒到期；盘中的单在这一场结束前 5 秒到期），不再发送"
-        if why := self.block(0.0):
+        if order.get("live"):
+            if now > int(rec.get("end_ms") or 0) - LIVE_STOP_MS:
+                return "离这一场结束不足 15 秒，盘中的单不再发送"
+        elif now > int(rec.get("start_ms") or 0) - STOP_MS:
+            return "离开场不足 15 秒，这张单不再发送（它在路上等了太久）"
+        if why := self.block(float(order.get("shares") or 0) * float(order.get("limit") or 0), excluding=order):
             return why
         if order.get("live") and (rule := RULE_OF.get(rec.get("rule"))) is not None:
             try:
@@ -360,9 +407,10 @@ class RuleTaker:
     async def refresh_balance(self) -> None:
         if self.chain is None:
             return
+        asked = self.now()
         try:
             self.usdt, self.bnb = await asyncio.gather(self.chain.usdt_balance(), self.chain.bnb_balance())
-            self.balance_ms, self.balance_error = self.now(), ""
+            self.balance_ms, self.balance_asked_ms, self.balance_error = self.now(), asked, ""
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -411,8 +459,8 @@ class RuleTaker:
                 await self.rest()
             self.running = False
             pending = [t for t in self.sends if not t.done()]
-            if pending:  # an order's answer still on its way: its record made whole before the process goes (15 s at the most)
-                await asyncio.wait(pending, timeout=15)
+            if pending:  # an order's answer still on its way: its record made whole (and its rest withdrawn: halted) before the process goes
+                await asyncio.wait(pending, timeout=SEND_WAIT_S)
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self.withdraw_all("服务停止"), LAST_WITHDRAW_S)
             with contextlib.suppress(Exception):
@@ -425,9 +473,10 @@ class RuleTaker:
             self.stream.stop()
             if self.index is not None:
                 self.index.stop()
-            for task in [*side, *self.side_tasks, *(t for t in (self.warming, self.verifying) if t is not None)]:
+            extra = [t for t in (self.warming, self.verifying) if t is not None]
+            for task in [*side, *self.side_tasks, *extra]:
                 task.cancel()
-            await asyncio.gather(*side, *self.side_tasks, return_exceptions=True)
+            await asyncio.gather(*side, *self.side_tasks, *extra, return_exceptions=True)
 
     async def lag_loop(self) -> None:
         while True:
@@ -440,7 +489,10 @@ class RuleTaker:
 
     async def rest(self) -> None:
         self.stream.pushed.clear()
-        self.wakeup.clear()
+        if self.wakeup.is_set():  # (set while the turn ran — an order's first read is due: the next turn at once)
+            self.wakeup.clear()
+            await asyncio.sleep(0)
+            return
         waits = {asyncio.ensure_future(self.stop.wait()), asyncio.ensure_future(self.stream.pushed.wait()),
                  asyncio.ensure_future(self.wakeup.wait())}
         try:
@@ -449,6 +501,7 @@ class RuleTaker:
             for w in waits:
                 w.cancel()
             await asyncio.gather(*waits, return_exceptions=True)
+            self.wakeup.clear()
 
     def wake_in(self, seconds: float) -> None:
         """The loop woken in ``seconds`` (an order's first read, FILL_READ_MS after its answer: not up to a tick later)."""
@@ -857,6 +910,7 @@ class RuleTaker:
             kept = (self.record(slug) or {}).get("seen") if fresh else None
             if isinstance(kept, dict) and kept.get("open"):
                 w["seen"] = {k: kept.get(k, v) for k, v in WATCH.items()}
+        self.recent_keys = {k for k in self.recent_keys if int((self.recs.get(k) or {}).get("start_ms") or 0) >= now - RECENT_MS}
         old = [key for key, r in self.recs.items()
                if int(r.get("start_ms") or 0) < now - KEEP_DAYS * DAY_MS and not in_flight(r) and (r.get("pnl") is not None or filled(r) <= DUST)]
         if old:
@@ -938,6 +992,14 @@ class RuleTaker:
         self.allowance[exchange] = got
         return got
 
+    async def read_allowance_quietly(self, exchange: str) -> None:
+        try:
+            await self.read_allowance(exchange)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.note(f"交易所授权额度没读到（沿用上一次的）：{clean_error(error) or type(error).__name__}")
+
     def busy_task(self, w: dict, name: str) -> bool:
         task = w.get(name)
         return task is not None and not task.done()
@@ -983,7 +1045,7 @@ class RuleTaker:
         if usd_left is not None and limit > 0:
             take = min(take, (D(str(max(usd_left, 0.0))) / limit).to_integral_value(rounding="ROUND_FLOOR"))
         if self.settings.max_day_usd and limit > 0:
-            left = self.settings.max_day_usd - spent_on(self.recs, day_of(now), self.settings.mode)
+            left = self.settings.max_day_usd - spent_on(self.recent(), day_of(now), self.settings.mode)
             take = min(take, D(str(max(left, 0.0))) / limit)
         return max(D(0), take.to_integral_value(rounding="ROUND_FLOOR"))
 
@@ -1142,7 +1204,7 @@ class RuleTaker:
                     return
                 take = min(take, afford)
         if self.settings.max_day_usd:
-            left = self.settings.max_day_usd - spent_on(self.recs, day_of(now), self.settings.mode)
+            left = self.settings.max_day_usd - spent_on(self.recent(), day_of(now), self.settings.mode)
             take = min(take, D(str(max(left, 0.0))) / limit)
             if left < 1.0:
                 w["word"] = f"今天已花 ${self.settings.max_day_usd - left:,.2f}，到了每天上限 ${self.settings.max_day_usd:g}（RULE_MAX_DAY_USD）"
@@ -1313,7 +1375,7 @@ class RuleTaker:
         cached = self.allowance.get(exchange)
         if self.chain is not None and cached is not None and cached[1] >= ALLOWANCE_UNLIMITED:
             if self.now() - cached[0] > ALLOWANCE_LONG_MS and not self.busy_task(self.__dict__, "allowance_task"):
-                self.allowance_task = self.spawn(self.read_allowance(exchange), "rules-allowance")  # (not on this order's way)
+                self.allowance_task = self.spawn(self.read_allowance_quietly(exchange), "rules-allowance")  # (not on this order's way)
         elif self.chain is not None and (cached is None or self.now() - cached[0] > ALLOWANCE_MS):
             cached = await self.read_allowance(exchange)
         if cached is not None and cached[1] < to_wei(usd):
@@ -1360,6 +1422,7 @@ class RuleTaker:
                  **({"live": True, **({"index_wall": int(w["index_wall"])} if w.get("index_wall") else {})} if course else {})}
         w["open_told"] = True
         rec["orders"].append(order)
+        self.sending[order["hash"]] = slug  # (on its way from here: follow() leaves it to send(), which ends it)
         self.save(rec)
         self.decided[order["hash"]] = settings
         body = dumps_bytes({"data": {"order": {**fields, "signature": signature, "hash": digest}, "strategy": "LIMIT",
@@ -1380,11 +1443,20 @@ class RuleTaker:
 
     async def send(self, slug: str, w: dict, rule: Rule, rec: dict, order: dict, body: bytes, take: D, limit: D) -> None:
         """One prepared order out: its hash on the disk first (a crash in between is found by it), then the request; Predict's
-        answer onto the record."""
+        answer onto the record. The order is "on its way" (self.sending — follow() leaves it alone) from the moment place()
+        recorded it until this is wholly done, its rest withdrawn when real trading stopped meanwhile."""
+        try:
+            await self.send_inner(slug, w, rule, rec, order, body, take, limit)
+        finally:
+            self.sending.pop(order["hash"], None)
+            self.decided.pop(order["hash"], None)
+
+    async def send_inner(self, slug: str, w: dict, rule: Rule, rec: dict, order: dict, body: bytes, take: D, limit: D) -> None:
         if not self.journal(rec, order) and not (self.store.writer is None or await asyncio.to_thread(self.store.flush)):
             order.update(state="not_sent", error="数据库写入未完成，没有发单")
-            self.decided.pop(order["hash"], None)
             self.save(rec)
+            w["word"] = f"没下成：{order['error']}"
+            self.note(f"{rec['name']} 没下成：{order['error']}")
             return
         self.sending[order["hash"]] = slug
         order["sent_wall"] = int(time.time() * 1000)
@@ -1408,10 +1480,11 @@ class RuleTaker:
                 order.update(state="unknown", error=text, next_ms=self.now() + (FILL_READ_MS if status == 409 else UNKNOWN_EVERY_MS),
                              **({"conflict": True} if status == 409 else {}))
         finally:
-            self.sending.pop(order["hash"], None)
             self.decided.pop(order["hash"], None)
             order["answered_wall"] = int(time.time() * 1000)
         if order["state"] == "open" and order.get("id") and self.halted():
+            # real trading stopped while the request was out (a pause, the mode, the loss stop, the service stopping): its
+            # rest withdrawn now, by the id this answer brought — not at its first read (a stop would leave it resting)
             await self.withdraw_one(order)
         self.save(rec)
         if order["state"] in {"open", "unknown"}:
@@ -1671,6 +1744,7 @@ class RuleTaker:
             pay = up if rec["side"] == "up" else 1 - up
             pnl = net(rec) * pay - cost(rec)
             rec.update(result="split" if up == 0.5 else "up" if up == 1.0 else "down", pnl=round(pnl, 6), settled_ms=now, settled_day=day_of(now))
+            self.pnl_epoch += 1
             self.save(rec)
             word = "赢" if pnl > DUST else "输" if pnl < -DUST else "平"
             rule = RULE_OF.get(rec.get("rule"))

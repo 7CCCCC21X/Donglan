@@ -240,7 +240,10 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 
 - **记录**：每场每个模式一条（真实 `rule:<场次链接>`，只记录 `rule:paper:<场次链接>`），存在虚拟机的 SQLite（`/var/lib/ruletaker/`）。格式和 huice 一样：订单哈希、成交份数、均价、手续费、结算结果、盈亏，以及每场的“盘口观察”（卖单什么时候出现、什么时候开始被吃、什么时候被吃光，按 Predict 盘口自己的时间戳）。
 - **发单前先落盘**：每张真实订单在请求发出前，先把哈希写进数据库旁边的订单日志（`ruletaker.sqlite3.rule-orders`）。进程在发单途中崩溃或重启，启动时按哈希去 Predict 核对，**绝不重发**。应答丢失、超时、裸 409 都按“结果未知”处理，按哈希找回。
-- **风控**：每场份数、每天上限、日亏损停机、`LIVE_TRADING_ALLOWED` 硬开关、暂停（会保存，重启后仍然暂停）；运行中切换模式不能高于设置文件。发单前最后一刻再核一次：设置是不是刚改过、是否暂停、是否就绪、离开场是否不足 5 秒、盘中指数是否还在规则方向。
+- **风控**：每场份数、每天上限、日亏损停机、`LIVE_TRADING_ALLOWED` 硬开关、暂停（会保存，重启后仍然暂停）；运行中切换模式不能高于设置文件。发单前最后一刻（请求真正发出的那一刻）再核一次：设置是不是刚改过、是否暂停、是否就绪、**离开场是否已不足 15 秒**（盘中：离结束）、余额够不够（扣掉同时在途的其他单）、盘中指数是否还在规则方向。
+- **余额**：链上读到的 USDT 扣掉读余额前后下的单可能已经花掉的钱（成交上链要几秒），几场同时有卖单时第二张单按剩下的钱下，不会被 Predict 以余额不足拒绝。
+- **数据库写不进去时不开新单**（例如磁盘满）：记录写不进去，重启后就找不到这张单，所以宁可不下；写入会一直重试，恢复后自动继续。
+- **停止时**：在途订单最多等 25 秒应答，应答一到就撤掉没成交的部分；`TimeoutStopSec=40` 够用。
 - **私钥**只放在虚拟机的 `/etc/ruletaker/ruletaker.env`（root 所有、服务用户组可读、640），不进代码仓库（`.gitignore` 已排除 `ruletaker.env`），日志只写“有没有设置”，不写值。状态页默认只在虚拟机本机监听，通过 `gcloud compute ssh` 访问。
 - **地区和条款**：Predict 不向受限地区开放交易（受限地区读取正常、下单 403）。部署后先跑 `rt.sh check`；是否允许在当地使用请以 Predict.fun 的服务条款为准。
 
@@ -258,7 +261,7 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 ## 本地运行与测试
 
 ```bash
-python3 -m venv venv && venv/bin/pip install -r requirements.txt
+python3 -m venv venv && venv/bin/pip install -r requirements.txt   # 需要 Python 3.12 以上
 venv/bin/python -m unittest discover -s tests      # 全部离线测试（不联网、不要 Key）
 venv/bin/python tests/bench_hotpath.py              # 推送帧 → 下单请求交出 的耗时
 venv/bin/python -m ruletaker plan                   # 接下来两天每条规则的场次（北京 / 纽约时间）

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import os
 import unittest
 from decimal import Decimal as D
 
@@ -436,4 +437,140 @@ class LoopTest(unittest.TestCase):
             taker.stop.set()
             await asyncio.wait_for(task, 10)
             self.assertFalse(taker.running)
+        run(go())
+
+
+class ReviewTest(unittest.TestCase):
+    """The independent review's findings (11-18), each a regression test."""
+
+    def test_a_store_that_cannot_write_holds_every_order(self) -> None:
+        import sqlite3
+        import tempfile
+        from ruletaker.store import Store
+
+        class Broken:
+            fail = False
+
+            def __init__(self, real):
+                self.real = real
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                if exc[0] is None:
+                    self.real.commit()
+                return False
+
+            def execute(self, *args):
+                if Broken.fail:
+                    raise sqlite3.OperationalError("database or disk is full")
+                return self.real.execute(*args)
+
+            def executemany(self, *args):
+                return self.execute(*args)
+
+            def close(self):
+                self.real.close()
+
+        class FullDisk(Store):
+            def connect(self):
+                real = super().connect()
+                return Broken(real) if getattr(self, "writer", None) is not None else real
+
+        async def go() -> None:
+            folder = tempfile.mkdtemp(prefix="ruletaker-full-")
+            store = FullDisk(os.path.join(folder, "t.sqlite3"))
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000, store=store)
+            await found(taker, api)
+            Broken.fail = True  # the disk fills up
+            store.put("probe", {"x": 1})
+            self.assertFalse(await asyncio.to_thread(store.flush, 1.5))  # never "saved" while it is not
+            self.assertIn("disk is full", store.error)
+            self.assertIn("记录写不进数据库", taker.block(0.0))
+            stream.take(MID, book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0)
+            self.assertEqual(api.created, [])
+            Broken.fail = False
+            self.assertTrue(await asyncio.to_thread(store.flush, 10))  # written once the disk takes it again
+            self.assertEqual(store.error, "")
+        run(go())
+
+    def test_the_15_second_line_holds_when_the_bytes_leave(self) -> None:
+        async def go() -> None:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            clock.ms = START - T.STOP_MS - 500  # decided half a second before the line...
+
+            async def waited():
+                clock.ms += 1_000  # ...its request held a second on the way (a token, a slot, a sign-in)
+            api.pre_send = waited
+            stream.take(MID, book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0)
+            await asyncio.gather(*taker.sends)
+            order = taker.record(SLUG, "on")["orders"][0]
+            self.assertEqual(order["state"], "not_sent")
+            self.assertIn("不足 15 秒", order["error"])
+            self.assertEqual(api.created, [])
+        run(go())
+
+    def test_an_order_answered_as_the_service_stops_is_withdrawn(self) -> None:
+        async def go() -> None:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            api.create_delay = 0.05
+            stream.take(MID, book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0.01)
+            self.assertEqual(len(api.created), 1)  # its bytes left...
+            taker.stop.set()                       # ...and the service is stopping before the answer came
+            await asyncio.gather(*taker.sends)
+            self.assertEqual(api.removed, ["id1"])
+            self.assertEqual(taker.record(SLUG, "on")["orders"][0]["state"], "cancelling")
+        run(go())
+
+    def test_follow_leaves_an_order_on_its_way_alone(self) -> None:
+        async def go() -> None:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            api.create_delay = 0.05
+            stream.take(MID, book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0.01)
+            order = taker.record(SLUG, "on")["orders"][0]
+            await taker.follow()
+            self.assertEqual(order["state"], "placing")
+            self.assertNotIn(("order", order["hash"]), api.calls)
+            await asyncio.gather(*taker.sends)
+            self.assertEqual(order["state"], "open")
+            self.assertEqual(taker.sending, {})
+        run(go())
+
+    def test_balance_counts_the_orders_placed_since_its_read(self) -> None:
+        async def go() -> None:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            taker.usdt, taker.balance_asked_ms = 40 * 10 ** 18, clock.ms - 1_000  # $40, read a second ago
+            await found(taker, api)
+            stream.take(MID, book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0)
+            await asyncio.gather(*taker.sends)
+            self.assertEqual(int(api.created[0]["data"]["order"]["takerAmount"]), 50 * 10 ** 18)  # $29
+            self.assertAlmostEqual(taker.usd(), 11.0)
+            second = START + 15 * 60_000
+            slug2 = f"xau-updown-15m-{second // 1000}"
+            listed(api, "77002", slug2, second)
+            clock.ms += T.PROBE_SLOW_S * 1000 + 1
+            await taker.turn()
+            stream.take("77002", book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0)
+            await asyncio.gather(*taker.sends)
+            self.assertEqual(int(api.created[1]["data"]["order"]["takerAmount"]), 18 * 10 ** 18)  # the $11 left: 18 shares
+        run(go())
+
+    def test_a_wakeup_during_the_turn_is_not_lost(self) -> None:
+        async def go() -> None:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            taker.wakeup.set()
+            began = asyncio.get_running_loop().time()
+            await taker.rest()
+            self.assertLess(asyncio.get_running_loop().time() - began, 0.2)
+            self.assertFalse(taker.wakeup.is_set())
         run(go())
