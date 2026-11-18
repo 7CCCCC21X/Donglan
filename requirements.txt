@@ -1,0 +1,8 @@
+# 签名 Predict 订单（EIP-712）和登录消息
+eth-account==0.14.0
+# Predict 的盘口推送、币安指数推送
+websockets==15.0.1
+# 原生 secp256k1：每张单签名从约 3 ms 降到约 0.2 ms（eth-keys 有它就用它）
+coincurve==21.0.0
+# 推送帧解析、订单请求编码更快
+orjson==3.13.0

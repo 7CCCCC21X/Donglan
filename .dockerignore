@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+ruletaker.env
+__pycache__
+**/__pycache__
+*.pyc
+data
+*.sqlite3
+*.sqlite3-*
+*.rule-orders
+venv
+.venv

@@ -1,0 +1,30 @@
+[Unit]
+Description=Rule taker for Predict.fun (规则吃单 · 独立服务)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ruletaker
+Group=ruletaker
+WorkingDirectory=/opt/ruletaker
+Environment=PYTHONUNBUFFERED=1
+Environment=STATE_DB=/var/lib/ruletaker/ruletaker.sqlite3
+# The service reads its settings file itself (inline comments allowed); the process environment above wins over it.
+ExecStart=/opt/ruletaker/venv/bin/python -u -m ruletaker run --env /etc/ruletaker/ruletaker.env
+Restart=always
+RestartSec=3
+# On a stop: the orders on their way get their answers and the resting rest is withdrawn (well inside this).
+TimeoutStopSec=40
+KillSignal=SIGTERM
+# A little ahead of everything else on the machine when the race is on.
+Nice=-5
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/ruletaker
+
+[Install]
+WantedBy=multi-user.target

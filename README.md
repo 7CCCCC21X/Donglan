@@ -1,0 +1,284 @@
+# 规则吃单 · 独立服务（Google Cloud 东京）
+
+把 [huice](https://github.com/7CCCCC21X/huice)（TG 合约昨收偏离提醒机器人）1.154.27 里的**规则吃单**（`rules.py`，`RULE_TAKER`）单独拿出来，做成一个只干这一件事的服务，部署在 Google Cloud 东京（`asia-northeast1`），目的是**吃单更快**。
+
+规则、价格、份数、变量名、记录格式、所有保护措施都和 huice 一样（Railway 上的设置可以直接抄过来）；改的是“怎么跑”：
+
+- **独立进程**：不再和原策略、预挂、复盘页挤在同一个事件循环里。huice 自己的记录里，盘口到了以后被主循环别的活儿占住的时间有 111 ms、2098 ms、2540 ms（σ 重算、复盘页重算、垃圾回收、几万条预挂记录）——这些在这里都不存在。
+- **部署在东京**：huice 11-18 实测，机器人在阿姆斯特丹（`europe-west4`），到 Cloudflare 入口只要 7–31 ms，读一次盘口却要 233–311 ms：入口很近、Predict 的服务器很远。东京到它近得多，部署后用 `rt.sh latency` 量真实数字。
+- **路上的每一步都更短**（见下面“提速”）：本机测，推送帧到达 → 下单请求交出 **0.3 ms**（预先签好）/ 0.8 ms（当场签名）。
+
+> 先说清楚：这里只有“规则吃单”。原策略、预挂、提醒、复盘页仍然在 Railway 上的 huice 里跑。两边怎么配合见“和 Railway 上的 huice 一起用”，**一定先看**。
+
+---
+
+## 目录
+
+1. [和 Railway 上的 huice 一起用（必看）](#和-railway-上的-huice-一起用必看)
+2. [部署到 Google Cloud 东京（一步一步）](#部署到-google-cloud-东京一步一步)
+3. [日常操作](#日常操作)
+4. [提速：具体改了什么](#提速具体改了什么)
+5. [为什么是东京、怎么确认](#为什么是东京怎么确认)
+6. [规则（和 huice 相同）](#规则和-huice-相同)
+7. [设置一览](#设置一览)
+8. [记录、恢复与安全](#记录恢复与安全)
+9. [和 huice 相比没搬过来的](#和-huice-相比没搬过来的)
+10. [本地运行与测试](#本地运行与测试)
+
+---
+
+## 和 Railway 上的 huice 一起用（必看）
+
+1. **Railway 上把 `RULE_TAKER` 改成 `off`**，再把这边改成 `on`。两边都开 `on` 时会在同一场一起抢、一起下单（同一个账户就是买双份，也会互相把对方的单当成卖单吃掉）。顺序：这边先用 `paper` 跑起来 → Railway 改 `off` 并重新部署 → 这边改 `on`。
+2. **API Key 用一把专用的**（`RULE_API_KEY`）。Predict 按 Key 限流（每把每分钟 240 次），两个进程用同一把 Key 会一起撞 429、一起停 20 秒。
+   - 最好在 developers.predict.fun 再申请一把新的给这里用。
+   - 如果把 Railway 上的 `RULE_API_KEY` 拿过来用，**要把 Railway 上的 `RULE_API_KEY` 删掉**：Railway 上规则吃单关掉以后，那把 Key 会被一直借给盘口和预挂（`RULE_KEY_LEND`），这边再用就会撞限流。
+3. **账户：用同一个 Predict 账户，还是单独开一个？**
+   - **同一个账户**（最省事，私钥和充值地址照抄）：
+     - 赢的份额由 Railway 上的自动领取（`LIVE_AUTO_REDEEM=on`）一起领掉——这边不做领取。
+     - Railway 的日亏损停机线（`LIVE_MAX_DAILY_LOSS_USD`）不再包含规则吃单的盈亏；这边用自己的 `RULE_MAX_DAILY_LOSS_USD` 管。
+     - Railway 的持仓核对会看到“账户里有、记录里没有”的份额（规则吃单的成交）。黄金休市 4 档、黄金开盘第一档、原油开盘第一档这几场原策略和预挂本来就不做，没有影响；**黄金纽约 05:15**（以及默认关闭的 05:00、16:45、原油 00:45）原策略可能在开场后做同一场，Railway 有可能把这边的成交当成原策略某张订单的“📌 补记成交”记账——钱不会少，只是账记到了原策略名下。介意的话用单独账户，或者这边把 `RULE_GOLD_0515_CENTS` 设成 0。
+     - 05:00、16:45、原油 00:45 这三条（默认关）如果在这边打开，Railway 上的预挂可能在同一场挂着另一边的买单，这边吃单时可能吃到自己的挂单（白付手续费）。
+   - **单独账户**（在网站上另开一个账户、充 USDT、在网站上交易一次让授权生效）：两边互不干扰；但这边**不做自动领取**，赢的份额要定期到 predict.fun 网站上领取，否则 USDT 会越来越少。
+4. **Telegram**：只发通知的话，可以直接用 Railway 那个机器人的 Token（发消息不冲突）。想在 Telegram 里用 `/status`、`/pause` 等命令，必须给这边**单独建一个机器人**（同一个 Token 只能有一个进程收消息）。
+
+---
+
+## 部署到 Google Cloud 东京（一步一步）
+
+全程在浏览器里完成，不需要在自己电脑上装任何东西。
+
+### 0. 准备
+
+- 一个 Google 账号，打开 <https://console.cloud.google.com>。
+- 第一次用要**开通结算**（绑定付款方式）：左上角菜单 → “结算”。
+- 新建一个项目：顶部项目选择器 → “新建项目”，名字随意（例如 `ruletaker`），建好后选中它。
+
+### 1. 打开 Cloud Shell
+
+控制台右上角点 **“激活 Cloud Shell”**（`>_` 图标），底部会出现一个终端。它自带 `gcloud`，已经登录你的账号。确认项目：
+
+```bash
+gcloud config set project 你的项目ID
+```
+
+### 2. 取代码
+
+```bash
+git clone https://github.com/7CCCCC21X/Donglan.git
+cd Donglan
+git checkout claude/serene-shannon-ri6od9   # 合并到主分支之后可以省掉这一行
+```
+
+仓库是私有的：用户名填 GitHub 用户名，密码处粘贴一个 GitHub **Personal access token**（GitHub → Settings → Developer settings → Fine-grained tokens，给这个仓库 Contents 只读权限）。
+
+### 3. 填设置
+
+```bash
+cp ruletaker.env.example ruletaker.env
+nano ruletaker.env
+```
+
+至少填：`RULE_API_KEY`（或 `PREDICT_API_KEY`）、`PREDICT_PRIVATE_KEY`、`PREDICT_ACCOUNT`（用普通钱包就留空）。**先保持 `RULE_TAKER=paper`**。规则价格、份数可以照 Railway 上的值抄。`Ctrl+O` 回车保存，`Ctrl+X` 退出。
+
+### 4. 一条命令部署
+
+```bash
+bash deploy/gcp/rt.sh deploy
+```
+
+它会：在 **asia-northeast1-b（东京）** 建一台虚拟机 `ruletaker`（`e2-standard-2`，Ubuntu 24.04，20 GB 盘）→ 上传代码 → 装 Python 依赖 → 跑全部离线测试（有一个失败就不启动）→ 把设置文件放到虚拟机的 `/etc/ruletaker/ruletaker.env`（权限 640）→ 用 systemd 启动并设成开机自启、崩溃自动重启。第一次大约 3～5 分钟。第一次运行 `gcloud compute ssh` 会问是否生成 SSH 密钥，直接回车。
+
+想换机器或区域：`MACHINE=n2-standard-2 ZONE=asia-northeast1-a bash deploy/gcp/rt.sh deploy`。
+
+### 5. 自检
+
+```bash
+bash deploy/gcp/rt.sh check     # 登录、账户、余额、授权、这个区域能不能下单（只读）
+bash deploy/gcp/rt.sh latency   # 到 Predict 的延迟（只读）
+bash deploy/gcp/rt.sh status    # 状态，就是 huice 的 /rules
+```
+
+`check` 最后会向下单接口发一个**空订单**（内容为空，Predict 只会拒为“无效”，不可能成交）来看这个区域能不能交易：返回 400 是正常的，返回 403 说明这个区域不能下单，要换区域。**请自己确认 Predict.fun 的服务条款允许你在这个地区使用。**
+
+### 6. 切到真实吃单
+
+1. `paper` 跑一两天，`rt.sh status` 看“抢单记录”和每场的结果。
+2. Railway 上 `RULE_TAKER=off`，重新部署。
+3. 这边：`nano ruletaker.env` 把 `RULE_TAKER=on`，然后
+
+```bash
+bash deploy/gcp/rt.sh env
+```
+
+4. 部署完可以把 Cloud Shell 里的 `ruletaker.env` 删掉（里面有私钥）：`shred -u ruletaker.env`。以后改设置用 `bash deploy/gcp/rt.sh ssh` 登录虚拟机，`sudo nano /etc/ruletaker/ruletaker.env`，再 `sudo systemctl restart ruletaker`。
+
+### 费用
+
+`e2-standard-2` 东京按需价格大约每月 60 多美元（以控制台显示为准），加上 20 GB 磁盘一两美元。想省钱可以 `MACHINE=e2-medium`（共享核心，约一半价格，偶尔会有几毫秒的 CPU 抖动）。不用了就 `bash deploy/gcp/rt.sh delete`。
+
+---
+
+## 日常操作
+
+都在 Cloud Shell 的仓库目录下运行：
+
+| 命令 | 作用 |
+|---|---|
+| `bash deploy/gcp/rt.sh status` | 状态：模式、推送、账户余额、每秒检查时段、下一个抢单时刻、每条规则的下一场、抢单记录、今天的成交和盈亏 |
+| `bash deploy/gcp/rt.sh logs` | 实时日志（`Ctrl+C` 退出） |
+| `bash deploy/gcp/rt.sh pause` / `resume` | 暂停（不开新单，挂着的单当场撤）/ 恢复；暂停在重启后仍然有效。今日亏损停机后 `resume` 会从现在的盈亏起再给一个 `RULE_MAX_DAILY_LOSS_USD` |
+| `bash deploy/gcp/rt.sh mode paper` | 运行中切换模式（off / paper / on），**不会高于**设置文件里的 `RULE_TAKER` |
+| `bash deploy/gcp/rt.sh update` | 代码更新后：`git pull` 再运行它，重新上传、跑测试、重启（设置不动） |
+| `bash deploy/gcp/rt.sh env` | 上传改好的 `ruletaker.env` 并重启 |
+| `bash deploy/gcp/rt.sh restart` / `stop` / `start` | 重启 / 停止 / 启动服务 |
+| `bash deploy/gcp/rt.sh ssh` | 登录虚拟机 |
+| `bash deploy/gcp/rt.sh probe asia-east2-a` | 在别的区域临时开一台小机器量延迟，量完自动删除 |
+
+停止或重启时，服务会先等在途订单的应答（最多 15 秒）、撤掉还挂着的单，再退出。
+
+**Telegram**：设了 `TELEGRAM_BOT_TOKEN` 就会推送启动、每次成交、每场结算和告警。`TELEGRAM_COMMANDS=on`（并且用单独的机器人、设了 `ADMIN_USER_ID`）时，管理员可以发 `/status`、`/pause`、`/resume`、`/mode off|paper|on`；任何人可以发 `/id` 查自己的用户 ID。
+
+---
+
+## 提速：具体改了什么
+
+规则吃单拼的是“对手在整刻钟后几秒挂出一排卖单，谁先吃到算谁的”。huice 11-18 的记录：卖单出现后 0.35–0.42 秒被别人吃光；我们的单在出现后 289 ms 发出（推送 178 ms + 机器人自己 111 ms），再加半个往返约 150 ms 才到 Predict。这里每一段都缩短了：
+
+| 环节 | huice（Railway 阿姆斯特丹，共用一个进程） | 本服务（东京，独立进程） |
+|---|---|---|
+| 盘口变化 → 推送到达 | 中位 178–246 ms | 东京就近接收；部署后 `status` 的“推送延迟中位”就是它 |
+| 推送到达 → 请求发出 | 最快 1 ms，但常被主循环占住（111 ms、2098 ms、2540 ms） | 本机测 0.3 ms（预先签好）/ 0.8 ms（当场签名）；没有别的任务和它抢 |
+| 请求 → Predict（半个往返） | 约 150–180 ms（读一次 233–311 ms） | `rt.sh latency` 量；`status` 的“网络”一行持续显示 |
+
+具体做法：
+
+1. **只做规则吃单的独立进程**：没有原策略的整步、预挂的几万条记录和账户快照、复盘页重算、σ 校准，主循环延迟只剩零点几毫秒（`status` 的“速度”一行实时显示）。
+2. **推送一到，当场看这一场**：每一场有自己的“正在看”标记，推送带来的变化在同一个事件循环回合里判断、定份数、签名、交给发单线程（Python 3.12 的 eager task）。另一场在等 REST 读取，不再挡住这一场（huice 同一时刻只能跑一轮）。
+3. **预先签好单**：每秒检查时段和对手挂单时刻（`RULE_LEAD_MINUTES`）前后，每场“这一场还能买的全部份数、按规则价”的那张单提前签好。salt 由场次和第几张单决定，所以预先签的和当场签的是**同一张单**，用上时 `status` 的抢单记录写“预先签好”。
+4. **不等上一张的应答**：一张单发出后马上可以看下一次推送；盘口上新出现、超出在途订单份数的卖单立刻另下一张（每场最多 3 张同时在途，份数上限照算在途的）。
+5. **连接保温**：忙的时段（开场前 15 分钟、对手挂单时刻、每秒检查时段、盘中）保证 2 秒内用过一条到 Predict 的连接——下单请求只复用 3 秒内用过的连接（否则怕连接已被服务器关掉、订单结果不明），这样下单永远不用重新 TCP+TLS 握手。
+6. **下单路上不读链**：交易所授权额度是无限额度时不再在下单前读链（后台每小时核对），登录 token 在后台提前续期，余额在后台读（忙的时段每 20 秒、平时每 2 分钟、每次成交后马上读一次）。
+7. **订单走自己的线程**：下单、撤单和读取用不同的线程池，读取慢的时候订单不排队。
+8. **更快的编码和签名**：推送帧用 orjson 解析，订单请求体提前编码成字节；EIP-712 哈希按字段直接拼（不走 eth-account 的通用编码器，测试里逐字节核对一致），签名用 coincurve 原生 secp256k1。
+9. **抢单那几秒不做垃圾回收**：启动后把已有对象冻结（`gc.freeze`），对手挂单时刻前 6 秒到后 15 秒、盘中开头、等撮合开启时关掉自动垃圾回收。
+10. **部署在东京**，systemd 里给进程 `Nice=-5`。
+
+没有改的：规则本身、价格、份数、每天上限、开场前 15 秒停止下单、签名在开场前 5 秒到期、1.5 秒后撤掉没成交的部分、60 秒确认没有晚到的成交、409 / 应答丢失按哈希核对绝不重发、手续费按份数扣——全部和 huice 一样。
+
+---
+
+## 为什么是东京、怎么确认
+
+huice 11-18 的网络一行：阿姆斯特丹到 Predict 的入口（Cloudflare）新建连接 7–31 ms，读一次盘口 233–311 ms。入口近、请求慢，说明 Predict 的服务器离欧洲很远，这个数和到东亚的往返吻合。
+
+部署前后都可以量：
+
+```bash
+bash deploy/gcp/rt.sh latency                 # 量正在跑的这台（东京）
+bash deploy/gcp/rt.sh probe asia-east2-a      # 香港，临时开一台小机器量完删掉
+bash deploy/gcp/rt.sh probe asia-northeast3-a # 首尔
+bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
+```
+
+比较输出里“读盘口 … 中位”那个数：最小的区域离 Predict 最近（下单的往返和它差不多）。如果别的区域明显更小，`ZONE=那个区域 bash deploy/gcp/rt.sh deploy` 换过去（先 `delete` 旧的，或者用 `VM=ruletaker2` 另起一台再删旧的，注意不要两台同时 `on`）。
+
+---
+
+## 规则（和 huice 相同）
+
+黄金、原油 15 分钟涨跌的几个固定时段，结果不是盘口给的五五开：开场前盘口出现规则价格以下的指定方向，就直接吃单。时段按纽约时间和 CME 的日历算，跟着夏令时走。
+
+| 规则（价格变量） | 场次（纽约时间） | 北京时间（冬令时 / 夏令时） | 买 | 默认 |
+|---|---|---|---|---|
+| 黄金休市 4 档（`RULE_GOLD_SHUT_CENTS`） | 17:00–17:45，周一至周四 | 周二至周五 06:00–06:45 / 05:00–05:45 | 涨 | 58¢ |
+| 黄金开盘第一档（`RULE_GOLD_OPEN_CENTS`） | 18:00，周一至周四 | 周二至周五 07:00 / 06:00 | 跌 | 50¢ |
+| 黄金纽约 05:15（`RULE_GOLD_0515_CENTS`） | 05:15，周一至周五 | 18:15 / 17:15 | 跌 | 58¢ |
+| 原油休市 4 档（`RULE_OIL_SHUT_CENTS`） | 17:00–17:45，周一至周四 | 同黄金 | 跌 | 0 = 不做 |
+| 原油开盘第一档（`RULE_OIL_OPEN_CENTS`） | 18:00，周一至周四 | 同黄金 | 跌 | 50¢ |
+| 黄金纽约 05:00（`RULE_GOLD_0500_CENTS`） | 05:00，周一至周五 | 18:00 / 17:00 | 涨 | 0 = 不做 |
+| 黄金休市前一档（`RULE_GOLD_1645_CENTS`） | 16:45，周一至周五 | 05:45 / 04:45 | 涨 | 0 = 不做 |
+| 原油纽约 00:45（`RULE_OIL_0045_CENTS`） | 00:45，周一至周五 | 13:45 / 12:45 | 跌 | 0 = 不做 |
+
+- **怎么吃**：每场在 Predict 发布前后找到市场（发布约在开场前 24 小时），订阅它的盘口推送；盘口上规则方向有价格不高于规则价的卖单，就下一张限价单：价格 = 规则价；卖单 ≥20 份且不少于这一场还能买的 1/4（对手挂单时刻前后只要 ≥20 份）时，份数 = 这一场还能买的全部份数（它吃到的是到达那一刻盘口上的全部），否则按看到的份数；每场最多 `RULE_*_SHARES` 份，每天最多 `RULE_MAX_DAY_USD`，不超过账户 USDT。不是 post-only，1.5 秒后撤掉没成交的部分，60 秒后确认最终成交。开场前 15 秒起不再下单，签名在开场前 5 秒到期。撮合还没开启时（只收 post-only 挂单）每 0.3 秒左右读一次状态，开启那一刻就买。被拒后这一场 30 秒后再试，拒满 5 次不再下。
+- **每秒检查时段**（`RULE_FAST_HOURS`，默认北京 01:00–07:00）和**对手挂单时刻**（`RULE_LEAD_MINUTES`，默认开场前 300 分钟）：每秒看一次、每秒最多 3 次 REST 核对推送有没有漏、提前 1 分钟准备好登录和授权、预先签好单。
+- **盘中吃单**（`RULE_GOLD_SHUT_LIVE_CENTS`、`RULE_GOLD_OPEN_LIVE_CENTS`，默认 0 = 不做）：黄金休市 4 档和开盘第一档在开场后接着买，条件是币安 XAUUSDT 合约指数已经站在规则方向（休市 4 档比起点高 0.005% 以上、开盘第一档低 0.02% 以上，起点取起点那根 1 分钟指数 K 的收盘和 Predict 页面的起点价里对规则方向更不利的那个）；开场 3 秒后开始、结束前 15 秒停止，第 1 分钟最高按盘前价格，指数一推到就当场看。需要这台机器能连币安合约行情（`fapi.binance.com`、`fstream.binance.com`），连不上时状态页会写，盘中就不买。
+- 回测和每条规则的来历见 huice 的 README“规则吃单”一节。
+
+---
+
+## 设置一览
+
+完整的带说明的模板见 [`ruletaker.env.example`](ruletaker.env.example)。规则相关的变量名、默认值、取值范围和 huice 完全一样。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `RULE_TAKER` | `off` | off / paper（只记录）/ on（真实吃单） |
+| `LIVE_TRADING_ALLOWED` | 不设 = 允许 | 硬开关：只有不设或写 `on` / `1` / `true` / `yes` 才允许真实下单 |
+| `RULE_API_KEY` / `PREDICT_API_KEY` | | Predict API Key（专用的那把填 `RULE_API_KEY`） |
+| `PREDICT_PRIVATE_KEY` / `PREDICT_ACCOUNT` | | 签名私钥 / 网站账户的充值地址（普通钱包留空） |
+| `PREDICT_CHAIN_ID` / `BSC_RPC_URL` | 56 / 公共节点 | 链和节点 |
+| `RULE_*_CENTS`、`RULE_*_LIVE_CENTS` | 见上表 | 每条规则的盘前 / 盘中最高价，0 = 不做 |
+| `RULE_GOLD` / `RULE_OIL` | on | 两个市场各自的总开关 |
+| `RULE_GOLD_SHARES` / `RULE_OIL_SHARES` | 50 | 每场最多买多少份 |
+| `RULE_MAX_DAY_USD` | 0 | 每天（北京时间）最多花多少，0 = 不限 |
+| `RULE_MAX_DAILY_LOSS_USD` | 0 | 本服务今天已结算亏到这个数就停开新单，0 = 不限 |
+| `RULE_FAST_HOURS` | `01:00-07:00` | 每秒检查时段（北京时间），可多段，`off` 关 |
+| `RULE_LEAD_MINUTES` | 300 | 对手提前多少分钟挂单，0 = 不按这个时刻 |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `ADMIN_USER_ID` | | 通知（话题写 `群ID:话题ID`） |
+| `TELEGRAM_COMMANDS` | off | on = 收管理员命令（要单独的机器人） |
+| `RULE_NOTIFY` | on | 成交、结算通知；off 只发告警 |
+| `STATUS_HOST` / `STATUS_PORT` / `STATUS_KEY` | 127.0.0.1 / 8080 / 空 | 状态页；不在本机监听时必须设口令 |
+| `RULE_WS_CONNECTIONS` | 1 | 推送连接条数 1～3，谁先送到用谁的 |
+| `PREDICT_RATE_PER_MIN` | 220 | 这把 Key 每分钟最多请求数（Predict 上限 240） |
+| `CME_EARLY_DAYS` / `CME_CLOSED_DAYS` | 内置到 2027 年底 | CME 节假日（提前收市 / 全天休市），格式 `2026-12-24,2026-12-31` |
+| `STATE_DB` | 虚拟机上 `/var/lib/ruletaker/ruletaker.sqlite3` | 记录数据库 |
+
+---
+
+## 记录、恢复与安全
+
+- **记录**：每场每个模式一条（真实 `rule:<场次链接>`，只记录 `rule:paper:<场次链接>`），存在虚拟机的 SQLite（`/var/lib/ruletaker/`）。格式和 huice 一样：订单哈希、成交份数、均价、手续费、结算结果、盈亏，以及每场的“盘口观察”（卖单什么时候出现、什么时候开始被吃、什么时候被吃光，按 Predict 盘口自己的时间戳）。
+- **发单前先落盘**：每张真实订单在请求发出前，先把哈希写进数据库旁边的订单日志（`ruletaker.sqlite3.rule-orders`）。进程在发单途中崩溃或重启，启动时按哈希去 Predict 核对，**绝不重发**。应答丢失、超时、裸 409 都按“结果未知”处理，按哈希找回。
+- **风控**：每场份数、每天上限、日亏损停机、`LIVE_TRADING_ALLOWED` 硬开关、暂停（会保存，重启后仍然暂停）；运行中切换模式不能高于设置文件。发单前最后一刻再核一次：设置是不是刚改过、是否暂停、是否就绪、离开场是否不足 5 秒、盘中指数是否还在规则方向。
+- **私钥**只放在虚拟机的 `/etc/ruletaker/ruletaker.env`（root 所有、服务用户组可读、640），不进代码仓库（`.gitignore` 已排除 `ruletaker.env`），日志只写“有没有设置”，不写值。状态页默认只在虚拟机本机监听，通过 `gcloud compute ssh` 访问。
+- **地区和条款**：Predict 不向受限地区开放交易（受限地区读取正常、下单 403）。部署后先跑 `rt.sh check`；是否允许在当地使用请以 Predict.fun 的服务条款为准。
+
+---
+
+## 和 huice 相比没搬过来的
+
+- **自动领取**（链上领取赢的份额）：不在这里做。同一个账户时由 Railway 上的 huice 领；单独账户请到网站上领取。
+- **避开预挂自己的挂单**（huice 的 `own_asks`）：预挂不在这个进程里，看不到它的账本。默认开着的几条规则所在的场次，预挂本来就不挂（1.150.1 / 1.151.1 / 1.154.19），所以没有影响；见上面“同一个账户”里关于 05:00、16:45、原油 00:45 的说明。
+- **网页控制台、复盘页**：换成了 `rt.sh status`（文字，和 `/rules` 一样）和 `status.json`。设置改在设置文件里。
+- **把 Key 借给盘口和预挂**、**让原策略和预挂让路**：这里只有规则吃单，不需要。
+
+---
+
+## 本地运行与测试
+
+```bash
+python3 -m venv venv && venv/bin/pip install -r requirements.txt
+venv/bin/python -m unittest discover -s tests      # 全部离线测试（不联网、不要 Key）
+venv/bin/python tests/bench_hotpath.py              # 推送帧 → 下单请求交出 的耗时
+venv/bin/python -m ruletaker plan                   # 接下来两天每条规则的场次（北京 / 纽约时间）
+venv/bin/python -m ruletaker run --env ruletaker.env
+```
+
+测试覆盖：时段和 CME 日历（夏令时、周末、节假日）、盘口换算、签名（快路径和 eth-account 通用路径逐字节一致、能还原签名人）、一张单从推送到结算的全过程（整场一张单、在途订单旁边再下一张、读成交、撤单、晚到成交、结算盈亏）、每天上限和余额、暂停和亏损停机、被拒、应答丢失按哈希找回、409、发单途中设置变了、撮合没开启时等待、预先签名、订单日志崩溃恢复、只记录模式、开场前 15 秒、盘中吃单（指数领先、第 1 分钟价格上限）、推送连接、HTTP 连接复用（POST 绝不重发）。有 huice 仓库在旁边时（`../huice` 或 `HUICE_PATH`），`tests/test_parity.py` 会直接调用 huice 的原函数逐项对照：一年里每条规则的场次、CME 日历、盘口换算、订单金额、签名、结果解析、设置解析都一致。
+
+代码结构：
+
+| 文件 | 内容 |
+|---|---|
+| `ruletaker/taker.py` | 规则吃单本体（找市场、看盘、下单、跟单、结算、状态） |
+| `ruletaker/rules.py` | 规则和场次、盘口换算、记录的统计 |
+| `ruletaker/stream.py` | Predict 盘口推送 |
+| `ruletaker/predict.py` | Predict REST 接口、限流节拍、链上读余额和授权 |
+| `ruletaker/wallet.py` | 订单签名（EIP-712，Predict 账户的 Kernel 包装） |
+| `ruletaker/index.py` | 币安合约指数（盘中吃单用） |
+| `ruletaker/http.py` | 长连接 HTTP |
+| `ruletaker/store.py` | SQLite 记录 |
+| `ruletaker/notify.py`、`status.py` | Telegram、状态页 |
+| `ruletaker/config.py`、`clock.py`、`cards.py` | 设置、纽约时间和 CME 日历、15 分钟市场 |
+| `deploy/gcp/` | Google Cloud 部署脚本（`rt.sh`）、systemd 服务、虚拟机安装脚本 |
