@@ -75,10 +75,19 @@ async def run_service(config: Config) -> int:
     with contextlib.suppress(Exception):
         await status.start()
     tg = asyncio.create_task(telegram.run(), name="telegram")
-    telegram.send(f"🚀 规则吃单 {VERSION} 已启动（{region or '未知区域'}）：{taker.mode_text()}")
+    running = asyncio.create_task(taker.run(), name="taker")
+
+    async def announce() -> None:  # once signed in (real orders) or after 20 s: what the operator sees first is the state it settled in
+        for _ in range(40):
+            if taker.settings.mode != "on" or taker.ready or running.done():
+                break
+            await asyncio.sleep(0.5)
+        telegram.send(f"🚀 规则吃单 {VERSION} 已启动（{region or '未知区域'}）：{taker.mode_text()}")
+    told = asyncio.create_task(announce(), name="announce")
     try:
-        await taker.run()
+        await running
     finally:
+        told.cancel()
         telegram.send("🛑 规则吃单服务停止")
         telegram.stop()
         with contextlib.suppress(Exception):

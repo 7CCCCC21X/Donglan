@@ -1326,6 +1326,9 @@ class RuleTaker:
         # -- from here to the request handed to its thread nothing is waited for: the day's cap, the balance and the window's
         # shares are counted again on the records as they stand now (another window's order may have gone out meanwhile)
         now = self.now()
+        if self.phase(w, now) != ("live" if course else "before") or self.track.get(slug) is not w:
+            w["word"] = "开场前 15 秒（盘中：结束前 15 秒）已到，这张单不下了"  # (the look's reads took it past the line)
+            return
         rec = (self.record(slug, "on") or (rec if rec is not None and rec.get("mode") == "on" else None)
                or self.new_record(slug, w, rule, int(outcome.get("index_set") or 0), mode="on"))
         rec["index_set"] = int(rec.get("index_set") or 0) or int(outcome.get("index_set") or 0)

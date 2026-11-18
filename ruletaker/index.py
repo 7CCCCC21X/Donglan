@@ -109,7 +109,7 @@ class IndexFeed:
                     self.candles.pop(old, None)
             if self.on_change is not None:
                 with contextlib.suppress(Exception):
-                    self.on_change(key[0], int(self.index_ms.get(key[0]) or 0))  # (the first look of a course waits for it)
+                    self.on_change(key[0], 0)  # (the first look of a course waits for it: looked at now, whatever the index's age)
             return self.candles[key]
         except asyncio.CancelledError:
             raise
