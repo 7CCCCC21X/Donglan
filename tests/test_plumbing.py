@@ -249,3 +249,47 @@ class StatusTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IndexWantedTest(unittest.TestCase):
+    def test_connected_only_while_an_in_play_price_is_set(self) -> None:
+        async def go() -> None:
+            opened: list = []
+
+            class Ws:
+                def __init__(self) -> None:
+                    self.closed = False
+
+                async def recv(self) -> str:
+                    await asyncio.sleep(0.01)
+                    return json.dumps({"data": {"e": "markPriceUpdate", "E": int(time.time() * 1000), "s": "XAUUSDT", "i": "4000.5"}})
+
+                async def close(self) -> None:
+                    self.closed = True
+
+            async def connect(url: str, headers: dict) -> Ws:
+                opened.append(Ws())
+                return opened[-1]
+            feed = IndexFeed(["XAUUSDT"], connect=connect)
+            want = {"on": False}
+            feed.wanted = lambda: want["on"]
+            feed.needed = lambda: False
+            task = asyncio.create_task(feed.run())
+            await asyncio.sleep(0.1)
+            self.assertEqual(opened, [])  # no price set: no connection made
+            want["on"] = True              # set on the control page while running...
+            for _ in range(400):
+                await asyncio.sleep(0.01)
+                if feed.price("XAUUSDT") is not None:
+                    break
+            self.assertEqual(feed.price("XAUUSDT"), D("4000.5"))  # ...connected, the index in hand
+            want["on"] = False
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if opened[0].closed:
+                    break
+            self.assertTrue(opened[0].closed)  # the price taken away again: the connection let go
+            self.assertIsNone(feed.ws)
+            feed.stop()
+            await asyncio.wait_for(task, 5)
+        asyncio.run(go())

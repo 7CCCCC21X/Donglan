@@ -315,3 +315,27 @@ class TelegramBindingTest(unittest.TestCase):
         # nothing set: no Telegram at all
         none = make_telegram(make_config(), handler)
         self.assertFalse(none.enabled)
+
+
+class InPlayFromThePageTest(unittest.TestCase):
+    def test_an_in_play_price_set_on_the_page_works_without_a_restart(self) -> None:
+        from decimal import Decimal as D
+        from ruletaker.index import IndexFeed
+        from ruletaker.rules import RULE_OF
+        from test_taker import SLUG, found
+
+        async def go() -> None:
+            taker, api, chain, stream, clock = make_taker(START - 60_000)
+            taker.index = feed = IndexFeed(["XAUUSDT"])   # (the service makes the feed at its start, whatever the prices are then)
+            feed.wanted, feed.needed = taker.index_wanted, taker.index_needed
+            self.assertFalse(taker.index_wanted())        # no in-play price yet: the feed keeps no connection
+            self.assertIsNone(taker.state()["index"])
+            await taker.save_settings({"RULE_GOLD_SHUT_LIVE_CENTS": "80"})
+            self.assertTrue(taker.index_wanted())
+            self.assertIsNotNone(taker.state()["index"])
+            await found(taker, api)
+            clock.ms = START + 90_000
+            feed.candles[("XAUUSDT", START - 60_000)] = D("4000")
+            feed.push_index("XAUUSDT", D("4000.4"), clock.ms - 50, clock.ms)
+            self.assertEqual(taker.live_guard(SLUG, RULE_OF["gold_shut"], clock.ms), "")  # judged on the feed: ahead by 0.01%
+        run(go())

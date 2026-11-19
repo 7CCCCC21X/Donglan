@@ -213,6 +213,7 @@ class RuleTaker:
         if self.index is not None:
             self.index.on_change = self.on_index
             self.index.needed = self.index_needed
+            self.index.wanted = self.index_wanted
 
     # -- plumbing --
     def now(self) -> int:
@@ -448,6 +449,7 @@ class RuleTaker:
         if self.index is not None:
             self.index.on_change = self.on_index
             self.index.needed = self.index_needed
+            self.index.wanted = self.index_wanted
         side = [asyncio.create_task(self.stream.run(), name="rules-stream"), asyncio.create_task(self.lag_loop(), name="rules-lag"),
                 asyncio.create_task(self.ready_loop(), name="rules-ready")]
         if self.index is not None:
@@ -557,6 +559,11 @@ class RuleTaker:
                     break
         finally:
             w["busy"] = False
+
+    def index_wanted(self) -> bool:
+        """Whether any rule buys in its windows' course by the settings in force (a RULE_*_LIVE_CENTS set, its market on, the
+        mode not off): the index feed keeps its connection only then."""
+        return self.settings.mode != "off" and any(self.live_cents(r) > 0 for r in RULES)
 
     def index_needed(self) -> bool:
         """Whether a window in (or about to begin) its course needs the index now: the REST read's pace (IndexFeed.rest_loop)."""
@@ -2130,7 +2137,7 @@ class RuleTaker:
                 "stream": {"connected": self.stream.connected, "alive": self.stream.alive(), "error": self.stream.error,
                            "connects": self.stream.connects, "lag_ms": mid(list(self.stream.lags))},
                 "index": ({"connected": self.index.ws is not None, "error": self.index.error, "pushes": self.index.pushes}
-                          if self.index is not None else None),
+                          if self.index is not None and self.index_wanted() else None),
                 "fast": {"hours": day_spans_text(s.fast), "active": self.fast, "next_ms": now + wait if wait else None,
                          "looks": self.fast_looks, "verifies": self.verifies, "diffs": self.verify_diffs},
                 "lead_minutes": s.lead_minutes, "plan": self.first_plan(now),

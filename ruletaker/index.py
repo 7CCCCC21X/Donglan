@@ -39,6 +39,7 @@ class IndexFeed:
         self.candle_error: dict[tuple[str, int], str] = {}
         self.on_change: Callable[[str, int], None] | None = None  # (symbol, the index's own time) — the in-play looks
         self.needed: Callable[[], bool] = lambda: True  # whether an in-play window needs the index now (the REST read's pace)
+        self.wanted: Callable[[], bool] = lambda: True  # whether any rule buys in its windows' course at all (a price set): connected only then
         self.ws: Any = None
         self.error = ""
         self.pushes = 0
@@ -158,6 +159,10 @@ class IndexFeed:
         backoff = 2.0
         url = f"{self.ws_base}/stream?streams=" + "/".join(f"{s.lower()}@markPrice@1s" for s in self.symbols)
         while not self.stopping.is_set():
+            if not self.wanted():  # no in-play price set (it may be set on the control page any time): no connection kept meanwhile
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.stopping.wait(), 3.0)
+                continue
             try:
                 ws = await connect(url, {})
             except asyncio.CancelledError:
@@ -168,9 +173,9 @@ class IndexFeed:
                     await asyncio.wait_for(self.stopping.wait(), backoff)
                 backoff = min(backoff * 2, 120.0)
                 continue
-            self.ws, began = ws, time.monotonic()
+            self.ws, began, self.error = ws, time.monotonic(), ""
             try:
-                while not self.stopping.is_set():
+                while not self.stopping.is_set() and self.wanted():
                     raw = await asyncio.wait_for(ws.recv(), timeout=30)
                     self.take(raw)
             except asyncio.CancelledError:

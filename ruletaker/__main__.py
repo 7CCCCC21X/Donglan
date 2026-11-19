@@ -65,7 +65,7 @@ def make_telegram(config: Config, handler: Any) -> Any:
 
 async def run_service(config: Config, env: dict | None = None) -> int:
     from .index import IndexFeed
-    from .rules import RULES, live_price_of
+    from .rules import RULES
     from .status import StatusServer
     from .store import Store
     from .taker import RuleTaker
@@ -73,8 +73,9 @@ async def run_service(config: Config, env: dict | None = None) -> int:
     LOG.info("规则吃单 %s 启动｜%s", VERSION, config.secrets_line())
     store = Store(config.state_db)
     region = config.region or await asyncio.to_thread(gce_zone) or os.environ.get("RAILWAY_REPLICA_REGION", "")
-    in_play = [r for r in RULES if live_price_of(config.rules, r) > 0]
-    index = IndexFeed(sorted({r.spec.symbol for r in in_play}), config.binance_fapi, config.binance_ws) if in_play else None
+    # the index feed of every rule that can buy in its windows' course (gold): made always — an in-play price may be set on the
+    # control page while the service runs — and connected only while one is set (RuleTaker.index_wanted)
+    index = IndexFeed(sorted({r.spec.symbol for r in RULES if r.lead > 0}), config.binance_fapi, config.binance_ws)
     taker = RuleTaker(config, store, index=index, base_env={k: v for k, v in (env or {}).items() if k.startswith("RULE_")} if env is not None else None)
     taker.region = region
     telegram = make_telegram(config, taker.command)

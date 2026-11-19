@@ -18,7 +18,8 @@ from .util import LOG, RemoteError, clean_error
 
 API = "https://api.telegram.org/bot{token}/{method}"
 LIMIT = 3900  # characters a message (Telegram allows 4096)
-COMMANDS = [("status", "状态（模式、下一场、抢单记录、今天的盈亏）"), ("check", "自检：登录、账户、余额、授权、下单接口、推送"),
+COMMANDS = [("status", "状态（模式、下一场、抢单记录、今天的盈亏）"), ("rules", "同 /status（和 Railway 机器人的 /rules 一样的内容）"),
+            ("check", "自检：登录、账户、余额、授权、下单接口、推送"),
             ("test", "挂单测试：挂一张约 $1 的低价单、查到、撤掉"), ("pause", "暂停开新单（挂着的单当场撤）"),
             ("resume", "恢复"), ("mode", "切换模式：/mode off | paper | on"), ("id", "查你的用户 ID 和这个聊天的 ID")]
 
