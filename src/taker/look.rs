@@ -805,9 +805,13 @@ pub async fn send_order(
         order.map(|o| t.journal_write(&key, &o)).unwrap_or(false)
     };
     if !journalled {
+        // no journal line (none open, or the disk refused it): the record itself must be on disk before the request leaves —
+        // queued now, and the flush waits for it (a waiter counts what was queued when it was made)
         let (persistent, waiter) = {
-            let t = me.borrow();
-            (t.store.persistent(), t.store.flush_waiter(10.0))
+            let mut t = me.borrow_mut();
+            t.save_key(&key);
+            let wait = t.flush_wait_s;
+            (t.store.persistent(), t.store.flush_waiter(wait))
         };
         if persistent && !crate::store::flush_async(waiter).await {
             let mut t = me.borrow_mut();

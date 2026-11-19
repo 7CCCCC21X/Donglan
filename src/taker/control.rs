@@ -616,7 +616,7 @@ pub async fn order_test(me: &Me) -> String {
 /// nothing), saved — in force now and after a restart — and the windows planned again with it at the next tick.
 pub async fn save_settings(me: &Me, values: &serde_json::Map<String, Value>) -> Result<String, String> {
     let values = console::clean(values)?;
-    let (waiter, names) = {
+    let waiter = {
         let mut t = me.borrow_mut();
         let mut saved = t.saved_settings.clone();
         for (k, v) in &values {
@@ -627,19 +627,20 @@ pub async fn save_settings(me: &Me, values: &serde_json::Map<String, Value>) -> 
         t.saved_settings = saved;
         t.loss_cap = cap;
         t.store.put(console::SAVED, &Value::Object(as_json));
-        t.configure(settings);
         let names: Vec<String> =
             values.iter().map(|(k, v)| format!("{}＝{}", console::label(k), if v.is_empty() { "（空）" } else { v })).collect();
-        (t.store.flush_waiter(10.0), names.join("、"))
+        (t.store.flush_waiter(10.0), names.join("、"), settings)
     };
+    let (waiter, names, settings) = waiter;
     crate::store::flush_async(waiter).await;
+    me.borrow_mut().configure(settings);
     me.borrow().notify(&format!("⚙️ 规则吃单设置已改（控制台）：{names}"));
     Ok(format!("已保存：{names}"))
 }
 
 /// Back to the settings file's value for these fields (all of them when ``keys`` is empty).
 pub async fn reset_settings(me: &Me, keys: &[String]) -> Result<String, String> {
-    let (waiter, names) = {
+    let waiter = {
         let mut t = me.borrow_mut();
         let keys: Vec<String> = if keys.is_empty() { t.saved_settings.keys().cloned().collect() } else { keys.to_vec() };
         let keys: Vec<String> = keys.into_iter().filter(|k| t.saved_settings.contains_key(k)).collect();
@@ -650,11 +651,12 @@ pub async fn reset_settings(me: &Me, keys: &[String]) -> Result<String, String> 
         t.saved_settings = saved;
         t.loss_cap = cap;
         t.store.put(console::SAVED, &Value::Object(as_json));
-        t.configure(settings);
         let names: Vec<String> = keys.iter().filter(|k| console::field(k).is_some()).map(|k| console::label(k)).collect();
-        (t.store.flush_waiter(10.0), names.join("、"))
+        (t.store.flush_waiter(10.0), names.join("、"), settings)
     };
+    let (waiter, names, settings) = waiter;
     crate::store::flush_async(waiter).await;
+    me.borrow_mut().configure(settings);
     Ok(format!("已恢复部署设置：{}", if names.is_empty() { "（没有网页保存的值）".to_string() } else { names }))
 }
 

@@ -95,6 +95,8 @@ pub const SPRINT_MS: i64 = 15 * 60_000;
 pub const HOT_BEFORE_MS: i64 = 10_000;
 pub const HOT_AFTER_MS: i64 = 120_000;
 pub const ALLOWANCE_MS: i64 = 60_000;
+/// (the Python version's 10**40 is past u128: an allowance read on-chain saturates at u128::MAX, so 10**37 tells the same apart —
+/// the "approve max" allowance from any finite one an order could spend)
 pub const ALLOWANCE_UNLIMITED: u128 = 10_000_000_000_000_000_000_000_000_000_000_000_000;
 pub const ALLOWANCE_LONG_MS: i64 = 3_600_000;
 pub const RECHECKED: [&str; 2] = ["规则吃单的设置刚改过", "盘中："];
@@ -258,6 +260,8 @@ pub struct Taker {
     pub pnl_epoch: u64,
     pub pnl_held: RefCell<Option<((String, u64, usize), f64)>>,
     pub next_win: u64,
+    /// how long an order with no journal line waits for its record to reach the disk (s)
+    pub flush_wait_s: f64,
 }
 
 pub struct Parts {
@@ -412,6 +416,7 @@ impl Taker {
             pnl_epoch: 0,
             pnl_held: RefCell::new(None),
             next_win: 0,
+            flush_wait_s: 10.0,
         };
         t.recover();
         let now = t.now();

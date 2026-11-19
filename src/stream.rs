@@ -409,14 +409,18 @@ impl BookStream {
                 frame = source.next() => {
                     let Some(frame) = frame else { break "连接结束".to_string() };
                     let frame = match frame { Ok(f) => f, Err(e) => break clean_error(e.to_string()) };
-                    c.frames.set(c.frames.get() + 1);
-                    c.last_frame.set(mono());
                     match frame {
                         Message::Text(text) => {
+                            // (a data frame alone vouches for the books in hand: a pong says the line is up, not that the
+                            // server still pushes — Python's recv() sees data frames only)
+                            c.frames.set(c.frames.get() + 1);
+                            c.last_frame.set(mono());
                             last_message = mono();
                             if let Err(e) = self.handle(n, &mut sink, text.as_str()).await { break e; }
                         }
                         Message::Binary(bytes) => {
+                            c.frames.set(c.frames.get() + 1);
+                            c.last_frame.set(mono());
                             last_message = mono();
                             if let Ok(text) = std::str::from_utf8(&bytes) {
                                 if let Err(e) = self.handle(n, &mut sink, text).await { break e; }

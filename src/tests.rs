@@ -1079,3 +1079,30 @@ fn bench_hot_path_parts() {
         }
     });
 }
+
+#[test]
+fn with_no_journal_an_order_waits_for_its_own_record() {
+    run(async {
+        // no journal (it did not open, or the disk refused its line) and a database that takes no write: the order's own record
+        // must reach the disk before its request leaves — it never does here, so nothing is sent
+        let dir = std::env::temp_dir().join(format!("ruletaker-nojournal-{}-{}", std::process::id(), crate::util::now_ms()));
+        let path = dir.join("t.sqlite3").to_string_lossy().to_string();
+        let r = rig_with(start() - 3_600_000, Store::open(&path).unwrap(), FakePredict::new(), &[]);
+        r.found().await;
+        assert!(r.me.borrow().store.flush(10.0));
+        {
+            let mut t = r.me.borrow_mut();
+            t.journal = None;
+            t.flush_wait_s = 0.3;
+        }
+        let lock = rusqlite::Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        assert!(r.created().is_empty(), "sent with its record not on disk");
+        let o = r.order(0);
+        assert_eq!(o.state(), "not_sent");
+        assert!(o.s("error").contains("数据库写入未完成"), "{}", o.s("error"));
+        drop(lock);
+    });
+}
