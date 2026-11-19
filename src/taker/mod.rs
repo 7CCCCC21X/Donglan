@@ -262,6 +262,8 @@ pub struct Taker {
     pub next_win: u64,
     /// how long an order with no journal line waits for its record to reach the disk (s)
     pub flush_wait_s: f64,
+    /// the pause between the order test's looks for an order whose answer was lost (s)
+    pub lookup_s: f64,
 }
 
 pub struct Parts {
@@ -417,6 +419,7 @@ impl Taker {
             pnl_held: RefCell::new(None),
             next_win: 0,
             flush_wait_s: 10.0,
+            lookup_s: control::TEST_LOOKUP_S,
         };
         t.recover();
         let now = t.now();

@@ -172,18 +172,18 @@ pub async fn route(
     let Some(data) = data.as_object() else {
         return json_reply(400, json!({"ok": false, "message": "请求不是 JSON 对象"}));
     };
-    let result: Result<String, String> = match path {
+    let result: control::SaveResult = match path {
         "/api/control" => {
             let action = data.get("action").map(crate::util::py_str).filter(|s| s != "None").unwrap_or_default();
             let arg = data.get("arg").filter(|v| crate::util::truthy(v)).map(crate::util::py_str).unwrap_or_default();
             match action.as_str() {
                 "withdraw" => {
                     let line = crate::taker::orders::withdraw_all(me, "控制台撤单").await;
-                    Ok(if line.is_empty() { "没有挂着的规则吃单订单".into() } else { line })
+                    control::SaveResult::Done(if line.is_empty() { "没有挂着的规则吃单订单".into() } else { line })
                 }
                 "pause" | "resume" | "mode" | "check" | "test" => {
                     let arg = if arg.is_empty() && action == "pause" { "控制台".to_string() } else { arg };
-                    Ok(control::control(me, &action, &arg).await)
+                    control::SaveResult::Done(control::control(me, &action, &arg).await)
                 }
                 _ => return json_reply(400, json!({"ok": false, "message": format!("不认识的操作：{action}")})),
             }
@@ -206,8 +206,10 @@ pub async fn route(
         _ => return json_reply(404, json!({"ok": false, "message": "not found"})),
     };
     match result {
-        Ok(message) => json_reply(200, json!({"ok": true, "message": message})),
-        Err(message) => json_reply(200, json!({"ok": false, "message": message})),
+        control::SaveResult::Done(message) => json_reply(200, json!({"ok": true, "message": message})),
+        // (in force, not on disk: never told as saved — "applied" lets the page show the values in force)
+        control::SaveResult::NotOnDisk(message) => json_reply(200, json!({"ok": false, "applied": true, "message": message})),
+        control::SaveResult::Refused(message) => json_reply(200, json!({"ok": false, "message": message})),
     }
 }
 

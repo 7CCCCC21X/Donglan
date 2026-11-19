@@ -83,7 +83,8 @@ fn signatures_match_python() {
 fn settings_match_python() {
     use crate::config::{Config, Env, RuleSettings};
     let v = vectors("settings.json");
-    let env_of = |e: &Value| -> Env { e.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect() };
+    let env_of =
+        |e: &Value| -> Env { e.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect() };
     for case in v["rules"].as_array().unwrap() {
         let got = RuleSettings::parse(&env_of(&case["env"]), None);
         match (got, case.get("error")) {
@@ -100,14 +101,20 @@ fn settings_match_python() {
                     assert_eq!(s.price(k), c.as_i64().unwrap(), "{} {k}", case["env"]);
                 }
                 let markets: Vec<String> = s.markets.iter().cloned().collect();
-                let want: Vec<String> = ok["markets"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect();
+                let want: Vec<String> =
+                    ok["markets"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect();
                 assert_eq!(markets, want, "{}", case["env"]);
                 for (k, n) in ok["shares"].as_object().unwrap() {
                     assert_eq!(s.shares_of(k), n.as_i64().unwrap(), "{}", case["env"]);
                 }
                 assert_eq!(s.max_day_usd, ok["max_day"].as_f64().unwrap());
                 let fast: Vec<Vec<i64>> = s.fast.iter().map(|(a, b)| vec![*a as i64, *b as i64]).collect();
-                let want: Vec<Vec<i64>> = ok["fast"].as_array().unwrap().iter().map(|p| p.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect()).collect();
+                let want: Vec<Vec<i64>> = ok["fast"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect())
+                    .collect();
                 assert_eq!(fast, want, "{}", case["env"]);
                 for (k, c) in ok["live"].as_object().unwrap() {
                     assert_eq!(s.live_price(k), c.as_i64().unwrap(), "{}", case["env"]);
@@ -137,11 +144,14 @@ fn settings_match_python() {
     let mine: Env = crate::console::current(&RuleSettings::parse(&Env::new(), None).unwrap(), 0.0).into_iter().collect();
     assert_eq!(mine, base);
     for case in v["settle"].as_array().unwrap() {
-        let saved: crate::console::Saved = case["saved"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
+        let saved: crate::console::Saved =
+            case["saved"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
         let (s, _, keep, dropped) = crate::console::settle_saved(&base, &saved, "paper").unwrap();
-        let want_keep: crate::console::Saved = case["keep"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
+        let want_keep: crate::console::Saved =
+            case["keep"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
         assert_eq!(keep, want_keep);
-        let want_dropped: Vec<String> = case["dropped"].as_array().unwrap().iter().map(|d| d.as_str().unwrap().to_string()).collect();
+        let want_dropped: Vec<String> =
+            case["dropped"].as_array().unwrap().iter().map(|d| d.as_str().unwrap().to_string()).collect();
         assert_eq!(dropped, want_dropped);
         assert_eq!(s.price("gold_shut"), case["gold_shut"].as_i64().unwrap());
         assert_eq!(s.shares_of("gold"), case["gold_shares"].as_i64().unwrap());
@@ -187,7 +197,8 @@ fn review_matches_python() {
     use crate::config::{Env, RuleSettings};
     let v = vectors("review.json");
     let now = v["now"].as_i64().unwrap();
-    let recs: crate::rules::Recs = v["recs"].as_object().unwrap().iter().map(|(k, r)| (k.clone(), r.as_object().unwrap().clone())).collect();
+    let recs: crate::rules::Recs =
+        v["recs"].as_object().unwrap().iter().map(|(k, r)| (k.clone(), r.as_object().unwrap().clone())).collect();
     let env: Env = [("RULE_TAKER", "on"), ("RULE_GOLD_SHUT_LIVE_CENTS", "80"), ("RULE_MAX_DAY_USD", "300")]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))

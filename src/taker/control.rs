@@ -2,6 +2,7 @@
 //! the review page's numbers, the control page's view of now.
 use super::*;
 use crate::clock::day_spans_text;
+use crate::predict::Gate;
 use crate::predict::{order_fill, outcome_for_side, parse_market};
 use crate::rules::{RULES, live_rule, open_cost, speed_stats, spent_on};
 use crate::util::{Res, bj, comma, fmt_amount, g, median, round_to};
@@ -10,6 +11,9 @@ use crate::wallet::{build_order, limit_amounts, order_body, to_wei};
 pub const TEST_MAX_PRICE: &str = "0.02";
 pub const TEST_USD: f64 = 1.0;
 pub const TEST_SECONDS: i64 = 600;
+/// an order test whose answer was lost: looked for by its hash this many times, this far apart
+pub const TEST_LOOKUPS: usize = 4;
+pub const TEST_LOOKUP_S: f64 = 1.5;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -27,48 +31,20 @@ pub async fn control(me: &Me, what: &str, arg: &str) -> String {
                 t.store.put("control:paused", &json!(paused));
             }
             let line = super::orders::withdraw_all(me, "暂停").await;
-            format!(
-                "⏸ 规则吃单已暂停：不再开新单（{paused}）{}",
-                if line.is_empty() { String::new() } else { format!("\n{line}") }
-            )
+            let late = on_disk(me, "暂停", "恢复成没暂停（接着开新单）").await;
+            joined(format!("⏸ 规则吃单已暂停：不再开新单（{paused}）"), &[line, late])
         }
         "resume" => {
-            let mut t = me.borrow_mut();
-            let mut parts = vec![];
-            if !t.paused.is_empty() {
-                t.paused.clear();
-                t.store.put("control:paused", &json!(""));
-                parts.push("暂停已解除".to_string());
-            }
-            let floor = t.loss_floor();
-            let today = day_of(t.now());
-            let pnl = day_pnl(&t.recs, &today);
-            if let Some(floor) = floor {
-                if pnl <= floor {
-                    let new_floor = pnl - t.loss_cap;
-                    t.loss_floor_at = crate::obj! {"day" => today, "floor" => jf(new_floor)};
-                    let saved = Value::Object(t.loss_floor_at.clone());
-                    t.store.put("control:loss_floor", &saved);
-                    parts.push(format!(
-                        "今日停机线移到 {}（从现在的 {} 起再亏 ${} 再停）",
-                        money(new_floor),
-                        money(pnl),
-                        g(t.loss_cap)
-                    ));
-                }
-            }
-            format!(
-                "▶️ {}｜现在：{}",
-                if parts.is_empty() { "本来就没有暂停".to_string() } else { parts.join("；") },
-                t.mode_text()
-            )
+            let reply = resume(me);
+            let late = on_disk(me, "恢复", "仍是暂停").await;
+            joined(reply, &[late])
         }
         "mode" => {
             let want = arg.trim().to_lowercase();
             if !["off", "paper", "on"].contains(&want.as_str()) {
                 return "用法：/mode off | paper | on（不会高于部署变量 RULE_TAKER）".into();
             }
-            {
+            let before = {
                 let mut t = me.borrow_mut();
                 if mode_rank(&want) > mode_rank(&t.env_mode) {
                     return format!(
@@ -76,19 +52,61 @@ pub async fn control(me: &Me, what: &str, arg: &str) -> String {
                         t.env_mode, t.env_mode
                     );
                 }
+                let before = t.settings.mode.clone();
                 let settings = t.settings.with_mode(&want);
                 t.configure(settings);
                 let saved = if want != t.env_mode { want.clone() } else { String::new() };
                 t.store.put("control:mode", &json!(saved));
-            }
+                before
+            };
             let line = if want != "on" {
                 super::orders::withdraw_all(me, &format!("改成{}", mode_name(&want))).await
             } else {
                 String::new()
             };
-            format!("规则吃单改成：{}{}", mode_name(&want), if line.is_empty() { String::new() } else { format!("\n{line}") })
+            let late = on_disk(me, "模式", &format!("回到“{}”", mode_name(&before))).await;
+            joined(format!("规则吃单改成：{}", mode_name(&want)), &[line, late])
         }
         _ => "？".into(),
+    }
+}
+
+/// A reply and the lines after it (the empty ones left out).
+fn joined(head: String, extra: &[String]) -> String {
+    let mut out = head;
+    for line in extra.iter().filter(|l| !l.is_empty()) {
+        out += &format!("\n{line}");
+    }
+    out
+}
+
+fn resume(me: &Me) -> String {
+    {
+        let mut t = me.borrow_mut();
+        let mut parts = vec![];
+        if !t.paused.is_empty() {
+            t.paused.clear();
+            t.store.put("control:paused", &json!(""));
+            parts.push("暂停已解除".to_string());
+        }
+        let floor = t.loss_floor();
+        let today = day_of(t.now());
+        let pnl = day_pnl(&t.recs, &today);
+        if let Some(floor) = floor {
+            if pnl <= floor {
+                let new_floor = pnl - t.loss_cap;
+                t.loss_floor_at = crate::obj! {"day" => today, "floor" => jf(new_floor)};
+                let saved = Value::Object(t.loss_floor_at.clone());
+                t.store.put("control:loss_floor", &saved);
+                parts.push(format!(
+                    "今日停机线移到 {}（从现在的 {} 起再亏 ${} 再停）",
+                    money(new_floor),
+                    money(pnl),
+                    g(t.loss_cap)
+                ));
+            }
+        }
+        format!("▶️ {}｜现在：{}", if parts.is_empty() { "本来就没有暂停".to_string() } else { parts.join("；") }, t.mode_text())
     }
 }
 
@@ -262,7 +280,7 @@ pub async fn self_check(me: &Me) -> String {
             }
             if api.fresh() {
                 let body = Rc::new(br#"{"data":{}}"#.to_vec());
-                match api.authed("POST", "/orders", Some(body), crate::predict::API_TIMEOUT, true, "").await {
+                match api.authed("POST", "/orders", Some(body), crate::predict::API_TIMEOUT, true, None).await {
                     Ok(_) => r.warn("下单接口对空订单没有报错（意外），请用 /test 挂单测试确认"),
                     Err(e) => {
                         let status = e.status();
@@ -427,6 +445,11 @@ pub async fn order_test(me: &Me) -> String {
     if stop.is_set() {
         return "服务正在停止".into();
     }
+    // the test is a real order: the deploy's hard switch and the pause hold it as they hold every order
+    let why = me.borrow().test_gate();
+    if !why.is_empty() {
+        return format!("❌ 挂单测试没做：{why}");
+    }
     if let Err(e) = api.ensure_auth().await {
         return format!("❌ Predict 登录失败：{}", clean(&e));
     }
@@ -531,9 +554,20 @@ pub async fn order_test(me: &Me) -> String {
         };
         me.borrow_mut().store.put(&test_key, &Value::Object(record.clone()));
         let began = mono();
-        let created = match api.create_order(body, &digest, false).await {
-            Ok(c) => c,
-            Err(e) => {
+        // (judged again right before its bytes leave, as a rule order is: the switch, the pause, the stop)
+        let gate: Gate = {
+            let weak = Rc::downgrade(me);
+            Rc::new(move || match weak.upgrade() {
+                Some(me) => me.try_borrow().map(|t| t.test_gate()).unwrap_or_else(|_| "内部状态正忙，测试单不发了".into()),
+                None => "服务正在停止，不再发单".into(),
+            })
+        };
+        let oid = match api.create_order(body, Some(gate)).await {
+            Ok(created) => {
+                lines.push(format!("1/4 下单成功：订单 #{}（往返 {:.0} ms）", created.order_id, (mono() - began) * 1000.0));
+                created.order_id
+            }
+            Err(e) if super::look::sent_or_not(&e) != super::look::Placed::Maybe => {
                 lines.push(format!("1/4 下单失败（{:.0} ms）：{}", (mono() - began) * 1000.0, clean(&e)));
                 record.insert("steps".into(), json!(lines.clone()));
                 me.borrow_mut().store.put(&test_key, &Value::Object(record));
@@ -543,9 +577,41 @@ pub async fn order_test(me: &Me) -> String {
                 ));
                 return lines.join("\n");
             }
+            Err(e) => {
+                // the answer lost on the way (a timeout, a 5xx, a 409): Predict may hold the order — looked for by its hash,
+                // and withdrawn by the id it shows, as a rule order is
+                lines.push(format!(
+                    "1/4 下单的应答没收到（{:.0} ms）：{}——Predict 可能已经收下了，按哈希核对",
+                    (mono() - began) * 1000.0,
+                    clean(&e)
+                ));
+                let mut found = String::new();
+                for attempt in 0..TEST_LOOKUPS {
+                    if attempt > 0 {
+                        let pause = me.borrow().lookup_s;
+                        crate::sync::sleep(pause).await;
+                    }
+                    if let Ok(Some(row)) = api.order("", &digest).await {
+                        found = row.get("id").filter(|v| crate::util::truthy(v)).map(crate::util::py_str).unwrap_or_default();
+                        if !found.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                if found.is_empty() {
+                    lines.push(format!(
+                        "结论：⚠️ 下单结果未知：按哈希查了 {TEST_LOOKUPS} 次都没有这张单（多半没下成）；它签的是 {} 分钟后过期，万一挂上了也会自己失效——到 Predict 网站的订单里核对一下",
+                        TEST_SECONDS / 60
+                    ));
+                    record.insert("steps".into(), json!(lines.clone()));
+                    record.insert("unknown".into(), json!(true));
+                    me.borrow_mut().store.put(&test_key, &Value::Object(record));
+                    return lines.join("\n");
+                }
+                lines.push(format!("1/4 按哈希找到了：订单 #{found}（Predict 收下了，只是应答没送到）"));
+                found
+            }
         };
-        let oid = created.order_id;
-        lines.push(format!("1/4 下单成功：订单 #{oid}（往返 {:.0} ms）", (mono() - began) * 1000.0));
         let began = mono();
         match api.order(&oid, &digest).await {
             Ok(Some(row)) => {
@@ -612,55 +678,120 @@ pub async fn order_test(me: &Me) -> String {
     format!("❌ 没找到能做挂单测试的市场（需要撮合已开启、最低卖价高于 1¢）：\n{}", shown.join("\n"))
 }
 
-/// The control page's save: checked whole against the settings file with the other saved values (a wrong one changes
-/// nothing), saved — in force now and after a restart — and the windows planned again with it at the next tick.
-pub async fn save_settings(me: &Me, values: &serde_json::Map<String, Value>) -> Result<String, String> {
-    let values = console::clean(values)?;
+/// What a save of the control page's settings came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveResult {
+    /// in force and on disk
+    Done(String),
+    /// in force now, but not yet on disk (the database took no write within its wait): a restart before the write lands
+    /// brings the values before it back — said so, never reported as saved
+    NotOnDisk(String),
+    /// nothing changed (a value that does not parse, a field the page may not change)
+    Refused(String),
+}
+
+/// The wait for a change of the operator's to reach the disk; the line to add when it did not.
+async fn on_disk(me: &Me, what: &str, back: &str) -> String {
     let waiter = {
-        let mut t = me.borrow_mut();
+        let t = me.borrow();
+        t.store.flush_waiter(t.flush_wait_s)
+    };
+    if crate::store::flush_async(waiter).await {
+        return String::new();
+    }
+    let error = me.borrow().store.error();
+    format!(
+        "⚠️ {what}已经生效，但还没写进数据库（{}）：写完之前服务重启的话会{back}；数据库恢复后会自动补写",
+        if error.is_empty() { "数据库忙，等了也没写完".to_string() } else { error }
+    )
+}
+
+/// The control page's save: checked whole against the settings file with the other saved values (a wrong one changes
+/// nothing), in force at once — in the same step as the check, so nothing (a mode switched meanwhile, another save) can come
+/// between them — and saved; the windows planned again with it at the next tick. The reply waits for the disk and says so
+/// when the write did not get there.
+pub async fn save_settings(me: &Me, values: &serde_json::Map<String, Value>) -> SaveResult {
+    let values = match console::clean(values) {
+        Ok(v) => v,
+        Err(e) => return SaveResult::Refused(e),
+    };
+    let names = {
+        let mut held = me.borrow_mut();
+        let t = &mut *held;
         let mut saved = t.saved_settings.clone();
         for (k, v) in &values {
             saved.insert(k.clone(), v.clone());
         }
-        let (settings, cap) = console::build(&t.base_env, &saved, &t.settings.mode)?;
+        let (settings, cap) = match console::build(&t.base_env, &saved, &t.settings.mode) {
+            Ok(x) => x,
+            Err(e) => return SaveResult::Refused(e),
+        };
         let as_json: serde_json::Map<String, Value> = saved.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
         t.saved_settings = saved;
         t.loss_cap = cap;
         t.store.put(console::SAVED, &Value::Object(as_json));
-        let names: Vec<String> =
-            values.iter().map(|(k, v)| format!("{}＝{}", console::label(k), if v.is_empty() { "（空）" } else { v })).collect();
-        (t.store.flush_waiter(10.0), names.join("、"), settings)
+        t.configure(settings);
+        values
+            .iter()
+            .map(|(k, v)| format!("{}＝{}", console::label(k), if v.is_empty() { "（空）" } else { v }))
+            .collect::<Vec<_>>()
+            .join("、")
     };
-    let (waiter, names, settings) = waiter;
-    crate::store::flush_async(waiter).await;
-    me.borrow_mut().configure(settings);
+    let late = on_disk(me, "设置", "回到改之前的值").await;
+    if !late.is_empty() {
+        me.borrow().alarm(&format!("⚙️ 规则吃单设置已改（控制台）：{names}\n{late}"));
+        return SaveResult::NotOnDisk(format!("{names}：{late}"));
+    }
     me.borrow().notify(&format!("⚙️ 规则吃单设置已改（控制台）：{names}"));
-    Ok(format!("已保存：{names}"))
+    SaveResult::Done(format!("已保存：{names}"))
 }
 
-/// Back to the settings file's value for these fields (all of them when ``keys`` is empty).
-pub async fn reset_settings(me: &Me, keys: &[String]) -> Result<String, String> {
-    let waiter = {
-        let mut t = me.borrow_mut();
+/// Back to the settings file's value for these fields (all of them when ``keys`` is empty) — in force at once, as a save is.
+pub async fn reset_settings(me: &Me, keys: &[String]) -> SaveResult {
+    let names = {
+        let mut held = me.borrow_mut();
+        let t = &mut *held;
         let keys: Vec<String> = if keys.is_empty() { t.saved_settings.keys().cloned().collect() } else { keys.to_vec() };
         let keys: Vec<String> = keys.into_iter().filter(|k| t.saved_settings.contains_key(k)).collect();
         let saved: Saved =
             t.saved_settings.iter().filter(|(k, _)| !keys.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
-        let (settings, cap) = console::build(&t.base_env, &saved, &t.settings.mode)?;
+        let (settings, cap) = match console::build(&t.base_env, &saved, &t.settings.mode) {
+            Ok(x) => x,
+            Err(e) => return SaveResult::Refused(e),
+        };
         let as_json: serde_json::Map<String, Value> = saved.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
         t.saved_settings = saved;
         t.loss_cap = cap;
         t.store.put(console::SAVED, &Value::Object(as_json));
-        let names: Vec<String> = keys.iter().filter(|k| console::field(k).is_some()).map(|k| console::label(k)).collect();
-        (t.store.flush_waiter(10.0), names.join("、"), settings)
+        t.configure(settings);
+        keys.iter().filter(|k| console::field(k).is_some()).map(|k| console::label(k)).collect::<Vec<_>>().join("、")
     };
-    let (waiter, names, settings) = waiter;
-    crate::store::flush_async(waiter).await;
-    me.borrow_mut().configure(settings);
-    Ok(format!("已恢复部署设置：{}", if names.is_empty() { "（没有网页保存的值）".to_string() } else { names }))
+    let names = if names.is_empty() { "（没有网页保存的值）".to_string() } else { names };
+    let late = on_disk(me, "恢复部署设置", "回到网页保存的值").await;
+    if !late.is_empty() {
+        return SaveResult::NotOnDisk(format!("已恢复部署设置：{names}\n{late}"));
+    }
+    SaveResult::Done(format!("已恢复部署设置：{names}"))
 }
 
 impl Taker {
+    /// Why the operator's order test may not go out now ("" when it may): the deploy's hard switch, the pause, the stop.
+    pub fn test_gate(&self) -> String {
+        if self.stop.is_set() {
+            return "服务正在停止，不再发单".into();
+        }
+        if !self.config.trading_allowed {
+            return "部署变量 LIVE_TRADING_ALLOWED 不是 on——这个硬开关关着时一张真实的单都不发，挂单测试也是真实的单".into();
+        }
+        if !self.paused.is_empty() {
+            return format!(
+                "已暂停（{}）：暂停时一张新单都不开，挂单测试也不做。要测：先 /mode paper（只记录，不会自动下单），再 /resume，再 /test",
+                self.paused
+            );
+        }
+        String::new()
+    }
+
     pub fn settings_view(&self) -> Value {
         console::view(&self.settings, self.loss_cap, &self.saved_settings)
     }

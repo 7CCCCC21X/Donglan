@@ -509,6 +509,20 @@ impl Http {
 
     /// GET (or POST ``payload``: JSON bytes already encoded) and return the body; HTTP and network failures become RemoteError.
     pub async fn request(&self, url: &str, payload: Option<&[u8]>, timeout: f64, headers: &[(&str, &str)]) -> Res<Vec<u8>> {
+        self.request_gated(url, payload, timeout, headers, None).await
+    }
+
+    /// ``request`` with an order's last check: the caller judged it just before this call; whenever this call then waits
+    /// before the bytes are written (a new connection's TCP + TLS handshake, a stale pooled one found closed and replaced), it
+    /// is judged again right before the write — a reason refuses the request (NotSent) and nothing of it leaves.
+    pub async fn request_gated(
+        &self,
+        url: &str,
+        payload: Option<&[u8]>,
+        timeout: f64,
+        headers: &[(&str, &str)],
+        gate: Option<&dyn Fn() -> String>,
+    ) -> Res<Vec<u8>> {
         let timeout_d = Duration::from_secs_f64(timeout.max(0.1));
         let mut url = Url::parse(url)?;
         let mut hdrs: Vec<(String, String)> = vec![
@@ -543,11 +557,23 @@ impl Http {
             } else {
                 wire.extend_from_slice(b"\r\n");
             }
+            // (an await since the caller's check: the order is judged again before its bytes go out)
+            let mut waited = false;
             let (mut conn, head) = loop {
                 let (mut conn, reused) = match self.take(&key, max_idle) {
                     Some(c) => (c, true),
-                    None => (self.open(&url, timeout_d).await.map_err(|e| net_error(&e))?, false),
+                    None => {
+                        waited = true;
+                        (self.open(&url, timeout_d).await.map_err(|e| net_error(&e))?, false)
+                    }
                 };
+                if let (true, Some(check)) = (waited, gate) {
+                    let why = check();
+                    if !why.is_empty() {
+                        self.put(key.clone(), conn); // (nothing went out on it: it serves the next request)
+                        return Err(RemoteError::not_sent(why));
+                    }
+                }
                 let sent = tokio::time::timeout(timeout_d, async {
                     conn.stream.write_all(&wire).await?;
                     conn.stream.flush().await
@@ -557,6 +583,7 @@ impl Http {
                 if let Err(e) = sent {
                     if reused {
                         self.stats.borrow_mut().retried += 1; // the server had closed it; nothing of this request was taken
+                        waited = true;
                         continue;
                     }
                     return Err(net_error(&e));
@@ -788,6 +815,25 @@ pub mod tests {
             // so the POST goes out once, on a fresh connection
             assert_eq!(h.request(&format!("{base}/echo"), Some(b"1"), 5.0, &[]).await.unwrap(), b"POST1");
             assert_eq!(log.borrow().iter().filter(|l| l.ends_with("POST /echo")).count(), 1);
+        });
+    }
+
+    #[test]
+    fn an_order_is_judged_again_after_a_new_connection() {
+        run(async {
+            let (port, log) = serve(answers, 0).await;
+            let h = Http::new();
+            let url = format!("http://127.0.0.1:{port}/echo");
+            let refuse = || "已暂停".to_string();
+            // no pooled connection: one is made (a wait), then the order is judged again — and held, nothing written
+            let e = h.request_gated(&url, Some(b"1"), 5.0, &[], Some(&refuse)).await.unwrap_err();
+            assert_eq!((e.kind, e.msg.as_str()), (crate::util::Kind::NotSent, "已暂停"));
+            assert!(log.borrow().iter().all(|l| !l.ends_with("POST /echo")), "{:?}", log.borrow());
+            // the new connection was kept for the next request; one taken from the pool at once needs no second look (no
+            // wait since the caller's own check)
+            let pass = || String::new();
+            assert_eq!(h.request_gated(&url, Some(b"2"), 5.0, &[], Some(&pass)).await.unwrap(), b"POST2");
+            assert_eq!(h.stats.borrow().new, 1);
         });
     }
 

@@ -771,6 +771,33 @@ pub async fn place(
     Ok(())
 }
 
+/// What a failed order request tells about the order: nothing went out (a local gate, the key's cooldown, a 429), Predict
+/// refused it outright (a 4xx that is no conflict nor a duplicate), or it may be there (a timeout, a lost answer, a 5xx, a
+/// 409) — then it is looked for by its hash and never sent again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placed {
+    NotSent,
+    Refused,
+    Maybe,
+}
+
+pub fn sent_or_not(error: &crate::util::RemoteError) -> Placed {
+    if error.kind == Kind::NotSent {
+        return Placed::NotSent;
+    }
+    let text = clean(error);
+    let status = error.status();
+    if status == 429 || text.contains("限流冷却中") {
+        return Placed::NotSent;
+    }
+    let definite = error.kind == Kind::Rejected || (400..500).contains(&status);
+    let lower = text.to_lowercase();
+    if definite && status != 409 && !DUPLICATE_WORDS.iter().any(|w| lower.contains(w)) {
+        return Placed::Refused;
+    }
+    Placed::Maybe
+}
+
 struct Sending(Me, String);
 
 impl Drop for Sending {
@@ -834,7 +861,8 @@ pub async fn send_order(
         }
         t.api.clone()
     };
-    let result = api.create_order(body, &hash, true).await;
+    let gate = api.order_gate(&hash);
+    let result = api.create_order(body, gate).await;
     let (withdraw, state) = {
         let mut t = me.borrow_mut();
         let now = t.now();
@@ -855,21 +883,23 @@ pub async fn send_order(
             Err(error) => {
                 let text = clean(&error);
                 let status = error.status();
-                let definite = error.kind == Kind::Rejected || (400..500).contains(&status);
-                let lower = text.to_lowercase();
-                if status == 429 || text.contains("限流冷却中") {
-                    o.insert("state".into(), json!("not_sent"));
-                    o.insert("error".into(), json!(text));
-                } else if definite && status != 409 && !DUPLICATE_WORDS.iter().any(|w| lower.contains(w)) {
-                    o.insert("state".into(), json!("rejected"));
-                    o.insert("error".into(), json!(text));
-                } else {
-                    // a timeout, a lost answer, a bare 409: it may exist — looked for by its hash, never sent again
-                    o.insert("state".into(), json!("unknown"));
-                    o.insert("error".into(), json!(text));
-                    o.insert("next_ms".into(), json!(now + if status == 409 { FILL_READ_MS } else { UNKNOWN_EVERY_MS }));
-                    if status == 409 {
-                        o.insert("conflict".into(), json!(true));
+                match sent_or_not(&error) {
+                    Placed::NotSent => {
+                        o.insert("state".into(), json!("not_sent"));
+                        o.insert("error".into(), json!(text));
+                    }
+                    Placed::Refused => {
+                        o.insert("state".into(), json!("rejected"));
+                        o.insert("error".into(), json!(text));
+                    }
+                    Placed::Maybe => {
+                        // a timeout, a lost answer, a bare 409: it may exist — looked for by its hash, never sent again
+                        o.insert("state".into(), json!("unknown"));
+                        o.insert("error".into(), json!(text));
+                        o.insert("next_ms".into(), json!(now + if status == 409 { FILL_READ_MS } else { UNKNOWN_EVERY_MS }));
+                        if status == 409 {
+                            o.insert("conflict".into(), json!(true));
+                        }
                     }
                 }
             }

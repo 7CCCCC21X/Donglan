@@ -40,11 +40,17 @@ pub fn rpc_url(chain_id: i64) -> &'static str {
 }
 
 // --- the transport (the real one is http(); the tests put a fake here) ------------------------------------------------------
+/// Judged right before an order's bytes go out ("" sends it; a reason refuses it — nothing leaves).
+pub type Gate = Rc<dyn Fn() -> String>;
+
 pub struct Req {
     pub url: String,
     pub payload: Option<Rc<Vec<u8>>>,
     pub timeout: f64,
     pub headers: Vec<(String, String)>,
+    /// an order's last check: judged again once a new connection is up (its TCP + TLS handshake is a wait the pause, the
+    /// mode or the start's line may have come during), right before its bytes are written
+    pub gate: Option<Gate>,
 }
 
 pub trait Transport {
@@ -57,7 +63,9 @@ impl Transport for Live {
     fn request(&self, req: Req) -> LocalBoxFuture<'_, Res<Vec<u8>>> {
         Box::pin(async move {
             let headers: Vec<(&str, &str)> = req.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            crate::http::http().request(&req.url, req.payload.as_deref().map(Vec::as_slice), req.timeout, &headers).await
+            crate::http::http()
+                .request_gated(&req.url, req.payload.as_deref().map(Vec::as_slice), req.timeout, &headers, req.gate.as_deref())
+                .await
         })
     }
 }
@@ -302,8 +310,9 @@ impl PredictApi {
         RemoteError::retry(format!("Predict 接口限流冷却中（{n} 秒后重试）"), n)
     }
 
-    /// One request: the key's token, a slot (a read takes one of the reads' slots first), then the request. ``check``: the
-    /// order hash before_send judges inside the slot, right before the bytes go out. An explicit success=false is a refusal.
+    /// One request: the key's token, a slot (a read takes one of the reads' slots first), then the request. ``gate``: an
+    /// order's check, judged inside the slot right before the bytes go out (and again once a new connection is up). An
+    /// explicit success=false is a refusal.
     pub async fn call(
         &self,
         method: &str,
@@ -311,7 +320,7 @@ impl PredictApi {
         payload: Option<Rc<Vec<u8>>>,
         timeout: f64,
         priority: bool,
-        check: &str,
+        gate: Option<Gate>,
     ) -> Res<Value> {
         let left = self.cooling();
         if left > 0.0 {
@@ -324,7 +333,7 @@ impl PredictApi {
             self.writes_inflight.set(self.writes_inflight.get() + 1);
             let result = async {
                 let _slot = self.gate.acquire().await.map_err(|_| RemoteError::new("closed"))?;
-                self.send(path, payload, timeout, check).await
+                self.send(path, payload, timeout, gate).await
             }
             .await;
             self.writes_inflight.set(self.writes_inflight.get() - 1);
@@ -332,7 +341,7 @@ impl PredictApi {
         } else {
             let _read = self.read_gate.acquire().await.map_err(|_| RemoteError::new("closed"))?;
             let _slot = self.gate.acquire().await.map_err(|_| RemoteError::new("closed"))?;
-            self.send(path, payload, timeout, check).await?
+            self.send(path, payload, timeout, gate).await?
         };
         push_cap(&mut self.trips.borrow_mut(), (method.to_string(), (mono() - began) * 1000.0), 300);
         self.last_ok.set(mono());
@@ -355,26 +364,23 @@ impl PredictApi {
         Ok(answer)
     }
 
-    async fn send(&self, path: &str, payload: Option<Rc<Vec<u8>>>, timeout: f64, check: &str) -> Res<(Vec<u8>, f64)> {
+    async fn send(&self, path: &str, payload: Option<Rc<Vec<u8>>>, timeout: f64, gate: Option<Gate>) -> Res<(Vec<u8>, f64)> {
         let left = self.cooling();
         if left > 0.0 {
             return Err(Self::cooling_error(left));
         }
-        if !check.is_empty() {
+        if let Some(g) = &gate {
             let hook = self.pre_send.borrow().clone();
             if let Some(hook) = hook {
                 hook();
             }
-            let gate = self.before_send.borrow().clone();
-            if let Some(f) = gate {
-                let why = f(check);
-                if !why.is_empty() {
-                    return Err(RemoteError::not_sent(why));
-                }
+            let why = g();
+            if !why.is_empty() {
+                return Err(RemoteError::not_sent(why));
             }
         }
         let began = mono();
-        let req = Req { url: format!("{}{path}", self.base), payload, timeout, headers: self.headers() };
+        let req = Req { url: format!("{}{path}", self.base), payload, timeout, headers: self.headers(), gate };
         match self.transport.request(req).await {
             Ok(raw) => Ok((raw, began)),
             Err(error) => {
@@ -398,17 +404,17 @@ impl PredictApi {
         payload: Option<Rc<Vec<u8>>>,
         timeout: f64,
         priority: bool,
-        check: &str,
+        gate: Option<Gate>,
     ) -> Res<Value> {
         self.ensure_auth().await?;
         let used = self.jwt.borrow().clone();
-        match self.call(method, path, payload.clone(), timeout, priority, check).await {
+        match self.call(method, path, payload.clone(), timeout, priority, gate.clone()).await {
             Err(error) if error.status() == 401 && self.wallet.is_some() => {
                 if *self.jwt.borrow() == used {
                     self.jwt.borrow_mut().clear(); // only the token that was refused is dropped
                 }
                 self.ensure_auth().await?;
-                self.call(method, path, payload, timeout, priority, check).await
+                self.call(method, path, payload, timeout, priority, gate).await
             }
             other => other,
         }
@@ -433,14 +439,14 @@ impl PredictApi {
     async fn sign_in(&self) -> Res<String> {
         let Some(wallet) = self.wallet.clone() else { return Err(RemoteError::new("没有签名钱包，无法登录 Predict")) };
         let result: Res<String> = async {
-            let data = self.call("GET", "/auth/message", None, API_TIMEOUT, false, "").await?;
+            let data = self.call("GET", "/auth/message", None, API_TIMEOUT, false, None).await?;
             let message = data.val("data").map(|d| d.s("message")).unwrap_or_default();
             if message.is_empty() {
                 return Err(RemoteError::new(format!("登录消息格式异常（应答字段：{}）", answer_shape(&data))));
             }
             let body = json!({"signer": wallet.maker, "signature": wallet.sign_text(&message), "message": message});
             let answer = self
-                .call("POST", "/auth", Some(Rc::new(serde_json::to_vec(&body).unwrap_or_default())), API_TIMEOUT, false, "")
+                .call("POST", "/auth", Some(Rc::new(serde_json::to_vec(&body).unwrap_or_default())), API_TIMEOUT, false, None)
                 .await?;
             let token = answer.val("data").map(|d| d.s("token")).unwrap_or_default();
             if token.is_empty() {
@@ -466,7 +472,7 @@ impl PredictApi {
 
     // -- the endpoints --
     pub async fn market(&self, market_id: &str, priority: bool) -> Res<Obj> {
-        let data = self.call("GET", &format!("/markets/{}", quote(market_id)), None, API_TIMEOUT, priority, "").await?;
+        let data = self.call("GET", &format!("/markets/{}", quote(market_id)), None, API_TIMEOUT, priority, None).await?;
         let market = data.get("data").cloned().unwrap_or(data);
         match market {
             Value::Object(m) if !m.is_empty() => Ok(m),
@@ -475,7 +481,8 @@ impl PredictApi {
     }
 
     pub async fn orderbook(&self, market_id: &str) -> Res<(Vec<Level>, Vec<Level>)> {
-        let answer = self.call("GET", &format!("/markets/{}/orderbook", quote(market_id)), None, API_TIMEOUT, false, "").await?;
+        let answer =
+            self.call("GET", &format!("/markets/{}/orderbook", quote(market_id)), None, API_TIMEOUT, false, None).await?;
         let data = answer.get("data").cloned().unwrap_or(answer);
         let Some(d) = data.as_object().filter(|d| d.contains_key("bids") || d.contains_key("asks")) else {
             return Err(RemoteError::new("订单簿格式异常"));
@@ -486,11 +493,17 @@ impl PredictApi {
         ))
     }
 
-    /// POST /orders -> the order's id and hash; ``body`` the request's bytes made beforehand, ``digest`` the order's hash
-    /// (before_send's check — ``checked`` false for the operator's order test alone). A 2xx answer without an order id is no
-    /// refusal: the order may be there.
-    pub async fn create_order(&self, body: Rc<Vec<u8>>, digest: &str, checked: bool) -> Res<Created> {
-        let answer = self.authed("POST", "/orders", Some(body), ORDER_TIMEOUT, true, if checked { digest } else { "" }).await?;
+    /// A rule order's last check: before_send of its hash (None while no taker has put its before_send here).
+    pub fn order_gate(&self, digest: &str) -> Option<Gate> {
+        let hook = self.before_send.borrow().clone()?;
+        let digest = digest.to_string();
+        Some(Rc::new(move || hook(&digest)))
+    }
+
+    /// POST /orders -> the order's id and hash; ``body`` the request's bytes made beforehand, ``gate`` its last check (a rule
+    /// order's before_send, the order test's own). A 2xx answer without an order id is no refusal: the order may be there.
+    pub async fn create_order(&self, body: Rc<Vec<u8>>, gate: Option<Gate>) -> Res<Created> {
+        let answer = self.authed("POST", "/orders", Some(body), ORDER_TIMEOUT, true, gate).await?;
         let shown = || brief_error(&serde_json::to_string(&answer).unwrap_or_default(), 120);
         let Some(data) = answer.get("data").and_then(Value::as_object) else {
             return Err(RemoteError::new(format!("下单应答没有可读的内容（订单可能已被接受，按哈希核对）：{}", shown())));
@@ -512,7 +525,14 @@ impl PredictApi {
     pub async fn remove_orders(&self, ids: &[String]) -> Res<(Vec<String>, Vec<String>)> {
         let body = json!({"data": {"ids": ids}});
         let answer = self
-            .authed("POST", "/orders/remove", Some(Rc::new(serde_json::to_vec(&body).unwrap_or_default())), API_TIMEOUT, true, "")
+            .authed(
+                "POST",
+                "/orders/remove",
+                Some(Rc::new(serde_json::to_vec(&body).unwrap_or_default())),
+                API_TIMEOUT,
+                true,
+                None,
+            )
             .await?;
         let data = answer.get("data").filter(|d| d.is_object()).cloned().unwrap_or(answer);
         let list = |k: &str| data.arr(k).iter().map(py_str).collect::<Vec<_>>();
@@ -524,7 +544,7 @@ impl PredictApi {
         if hash.is_empty() {
             return Ok(None);
         }
-        let data = match self.authed("GET", &format!("/orders/{}", quote(hash)), None, API_TIMEOUT, false, "").await {
+        let data = match self.authed("GET", &format!("/orders/{}", quote(hash)), None, API_TIMEOUT, false, None).await {
             Ok(d) => d,
             Err(e) if e.status() == 404 => return Ok(None),
             Err(e) => return Err(e),
@@ -551,7 +571,7 @@ impl PredictApi {
     /// A window's market by its category (GET /categories/<slug>), then its details unless the category's own market object
     /// carries every field an order needs; the slug put on it; None when the category is not listed (404).
     pub async fn category_market(&self, slug: &str) -> Res<Option<Obj>> {
-        let answer = match self.call("GET", &format!("/categories/{}", quote(slug)), None, API_TIMEOUT, false, "").await {
+        let answer = match self.call("GET", &format!("/categories/{}", quote(slug)), None, API_TIMEOUT, false, None).await {
             Ok(a) => a,
             Err(e) if e.msg.contains("HTTP 404") => return Ok(None),
             Err(e) => return Err(e),
@@ -1046,6 +1066,7 @@ impl Chain {
             payload: Some(Rc::new(serde_json::to_vec(&body).unwrap_or_default())),
             timeout: RPC_TIMEOUT,
             headers: vec![],
+            gate: None,
         };
         let raw = match self.transport.request(req).await {
             Ok(r) => r,

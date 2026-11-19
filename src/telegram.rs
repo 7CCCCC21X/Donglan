@@ -125,6 +125,7 @@ impl Telegram {
             payload: Some(Rc::new(serde_json::to_vec(&payload).unwrap_or_default())),
             timeout,
             headers: vec![],
+            gate: None,
         };
         let raw = self.transport.request(req).await?;
         let answer: Value = serde_json::from_slice(&raw).map_err(|_| RemoteError::new("接口未返回有效 JSON"))?;

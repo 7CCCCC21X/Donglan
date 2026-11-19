@@ -54,6 +54,11 @@ pub struct FakePredict {
     pub stream: RefCell<Option<Rc<BookStream>>>,
     pub chain_usdt: Cell<u128>,
     pub chain_allowed: Cell<u128>,
+    /// a new connection's TCP + TLS handshake before an order's bytes can go out (s): the order's gate judged after it, as the
+    /// real client does
+    pub connect_delay: Cell<f64>,
+    /// the order taken (it is on the book) and its answer lost on the way back
+    pub lose_answer: Cell<bool>,
 }
 
 impl FakePredict {
@@ -178,9 +183,22 @@ impl Transport for FakePredict {
             if method == "POST" && path == "/orders" {
                 let raw = req.payload.as_deref().map(Vec::as_slice).unwrap_or(b"{}");
                 if raw != br#"{"data":{}}"# {
+                    if self.connect_delay.get() > 0.0 {
+                        crate::sync::sleep(self.connect_delay.get()).await;
+                        if let Some(gate) = &req.gate {
+                            let why = gate();
+                            if !why.is_empty() {
+                                return Err(RemoteError::not_sent(why)); // (nothing of it written)
+                            }
+                        }
+                    }
                     self.created.borrow_mut().push(req.payload.as_deref().cloned().unwrap_or_default()); // (as the request lands)
                     if self.create_delay.get() > 0.0 {
                         crate::sync::sleep(self.create_delay.get()).await;
+                    }
+                    if self.lose_answer.get() {
+                        let _ = self.answer(method, &path, Some(raw));
+                        return Err(RemoteError::new("网络错误 (TimeoutError: timed out)"));
                     }
                 }
             }
@@ -218,7 +236,13 @@ pub fn rig_with(clock_ms: i64, store: Store, api: Rc<FakePredict>, pairs: &[(&st
     rig_full(clock_ms, store, api, pairs, None)
 }
 
-pub fn rig_full(clock_ms: i64, store: Store, api: Rc<FakePredict>, pairs: &[(&str, &str)], index: Option<Rc<crate::index::IndexFeed>>) -> Rig {
+pub fn rig_full(
+    clock_ms: i64,
+    store: Store,
+    api: Rc<FakePredict>,
+    pairs: &[(&str, &str)],
+    index: Option<Rc<crate::index::IndexFeed>>,
+) -> Rig {
     let config = Config::from_env(&env_of(pairs)).unwrap();
     let wallet = Rc::new(Wallet::new(KEY, 56, "").unwrap());
     let transport: Rc<dyn Transport> = api.clone();
@@ -802,12 +826,14 @@ fn settings_save_check_reset_and_mode() {
         let r = rig(start() - 3_600_000, &[("RULE_TAKER", "paper")]);
         let mut values = serde_json::Map::new();
         values.insert("RULE_GOLD_SHUT_CENTS".into(), json!("61"));
-        assert!(control::save_settings(&r.me, &values).await.unwrap().contains("已保存"));
+        assert!(matches!(control::save_settings(&r.me, &values).await, control::SaveResult::Done(m) if m.contains("已保存")));
         assert_eq!(r.me.borrow().settings.price("gold_shut"), 61);
         values.insert("RULE_GOLD_SHUT_CENTS".into(), json!("99"));
-        assert!(control::save_settings(&r.me, &values).await.is_err());
+        assert!(matches!(control::save_settings(&r.me, &values).await, control::SaveResult::Refused(_)));
         assert_eq!(r.me.borrow().settings.price("gold_shut"), 61);
-        assert!(control::reset_settings(&r.me, &[]).await.unwrap().contains("已恢复部署设置"));
+        assert!(
+            matches!(control::reset_settings(&r.me, &[]).await, control::SaveResult::Done(m) if m.contains("已恢复部署设置"))
+        );
         assert_eq!(r.me.borrow().settings.price("gold_shut"), 58);
         // the mode never above the settings file's RULE_TAKER
         let reply = control::control(&r.me, "mode", "on").await;
@@ -911,7 +937,8 @@ fn dec(s: &str) -> rust_decimal::Decimal {
 }
 
 fn live_rig(clock_ms: i64) -> (Rig, Rc<crate::index::IndexFeed>) {
-    let feed = Rc::new(crate::index::IndexFeed::new(&["XAUUSDT"], "https://fapi.binance.test", "wss://fstream.binance.test/market"));
+    let feed =
+        Rc::new(crate::index::IndexFeed::new(&["XAUUSDT"], "https://fapi.binance.test", "wss://fstream.binance.test/market"));
     let r = rig_full(clock_ms, Store::memory(), FakePredict::new(), &[("RULE_GOLD_SHUT_LIVE_CENTS", "80")], Some(feed.clone()));
     (r, feed)
 }
@@ -1104,5 +1131,134 @@ fn with_no_journal_an_order_waits_for_its_own_record() {
         assert_eq!(o.state(), "not_sent");
         assert!(o.s("error").contains("数据库写入未完成"), "{}", o.s("error"));
         drop(lock);
+    });
+}
+
+fn store_at(name: &str) -> (std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("ruletaker-{name}-{}-{}", std::process::id(), crate::util::now_ms()));
+    let path = dir.join("t.sqlite3").to_string_lossy().to_string();
+    (dir, path)
+}
+
+#[test]
+fn a_mode_switched_while_a_save_waits_for_the_disk_stays() {
+    run(async {
+        // a save of the control page's settings waits for the database; the mode switched off meanwhile must stay off
+        let (_dir, path) = store_at("save-race");
+        let r = rig_with(start() - 3_600_000, Store::open(&path).unwrap(), FakePredict::new(), &[]);
+        assert!(r.me.borrow().store.flush(10.0));
+        r.me.borrow_mut().flush_wait_s = 5.0;
+        let lock = rusqlite::Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let me = r.me.clone();
+        let save = tokio::task::spawn_local(async move {
+            let mut values = serde_json::Map::new();
+            values.insert("RULE_GOLD_SHUT_CENTS".into(), json!("61"));
+            control::save_settings(&me, &values).await
+        });
+        crate::sync::sleep(0.05).await;
+        let me = r.me.clone();
+        let stop = tokio::task::spawn_local(async move { control::control(&me, "mode", "off").await });
+        crate::sync::sleep(0.05).await;
+        assert_eq!(r.me.borrow().settings.mode, "off");
+        drop(lock); // (the database takes the writes again)
+        let saved = save.await.unwrap();
+        assert!(matches!(&saved, control::SaveResult::Done(m) if m.contains("已保存")), "{saved:?}");
+        assert!(stop.await.unwrap().contains("规则吃单改成：关"));
+        let t = r.me.borrow();
+        assert_eq!(t.settings.mode, "off", "the save put the mode back");
+        assert_eq!(t.settings.price("gold_shut"), 61);
+        assert!(!t.block(0.0, None).is_empty());
+    });
+}
+
+#[test]
+fn a_save_the_disk_did_not_take_is_never_told_as_saved() {
+    run(async {
+        let (_dir, path) = store_at("save-late");
+        let r = rig_with(start() - 3_600_000, Store::open(&path).unwrap(), FakePredict::new(), &[]);
+        assert!(r.me.borrow().store.flush(10.0));
+        r.me.borrow_mut().flush_wait_s = 0.3;
+        let lock = rusqlite::Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let q = HashMap::new();
+        let mut h = HashMap::new();
+        h.insert("x-rt".to_string(), "1".to_string());
+        let reply =
+            crate::server::route(&r.me, "", "POST", "/api/settings", &q, &h, br#"{"values":{"RULE_GOLD_SHUT_CENTS":"62"}}"#)
+                .await;
+        let v: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(v["ok"], false, "{v}");
+        assert_eq!(v["applied"], true, "{v}");
+        assert!(v["message"].as_str().unwrap().contains("还没写进数据库"), "{v}");
+        assert_eq!(r.me.borrow().settings.price("gold_shut"), 62); // (in force now, said so)
+        // the pause the same: in force, and said when it is not on disk yet
+        let reply = control::control(&r.me, "pause", "test").await;
+        assert!(reply.contains("已暂停") && reply.contains("还没写进数据库"), "{reply}");
+        drop(lock);
+    });
+}
+
+#[test]
+fn the_order_test_holds_to_the_hard_switch_and_the_pause() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[("LIVE_TRADING_ALLOWED", "off")]);
+        // (a market ready for the test, as it would be: the switch alone holds it)
+        r.api.list(MID, &format!("btc-updown-15m-{}", (r.clock.get() - r.clock.get() % 900_000) / 1000), "OPEN");
+        r.api.books.borrow_mut().insert(MID.into(), json!({"bids": [["0.40", "10"]], "asks": [["0.60", "10"]]}));
+        let text = control::order_test(&r.me).await;
+        assert!(text.contains("LIVE_TRADING_ALLOWED"), "{text}");
+        assert!(r.created().is_empty());
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.books.borrow_mut().insert(MID.into(), json!({"bids": [["0.40", "10"]], "asks": [["0.60", "10"]]}));
+        control::control(&r.me, "pause", "test").await;
+        let text = control::order_test(&r.me).await;
+        assert!(text.contains("已暂停"), "{text}");
+        assert!(r.created().is_empty());
+    });
+}
+
+#[test]
+fn a_pause_during_a_new_connection_holds_the_order() {
+    run(async {
+        // the order passed its checks, then waits for a new connection's handshake: the pause that comes meanwhile holds it
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.connect_delay.set(0.05);
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        let me = r.me.clone();
+        tokio::task::spawn_local(async move {
+            control::control(&me, "pause", "test").await;
+        });
+        r.sends().await;
+        assert!(r.created().is_empty(), "the order went out after the pause");
+        let o = r.order(0);
+        assert_eq!(o.state(), "not_sent");
+        assert!(o.s("error").contains("已暂停"), "{}", o.s("error"));
+    });
+}
+
+#[test]
+fn an_order_test_whose_answer_is_lost_is_found_by_its_hash_and_withdrawn() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.books.borrow_mut().insert(MID.into(), json!({"bids": [["0.40", "10"]], "asks": [["0.60", "10"]]}));
+        r.api.lose_answer.set(true);
+        let text = control::order_test(&r.me).await;
+        assert!(text.contains("应答没收到"), "{text}");
+        assert!(text.contains("按哈希找到了：订单 #id1"), "{text}");
+        assert!(text.contains("3/4 撤单成功"), "{text}");
+        assert_eq!(*r.api.removed.borrow(), vec!["id1".to_string()]);
+        // and when Predict has no such order: said as unknown, never as not placed
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.books.borrow_mut().insert(MID.into(), json!({"bids": [["0.40", "10"]], "asks": [["0.60", "10"]]}));
+        r.me.borrow_mut().lookup_s = 0.01;
+        *r.api.create_error.borrow_mut() = Some(RemoteError::new("网络错误 (TimeoutError: timed out)"));
+        let text = control::order_test(&r.me).await;
+        assert!(text.contains("下单结果未知"), "{text}");
+        assert!(!text.contains("结论：❌") && !text.contains("这张测试单没下成"), "{text}");
     });
 }
