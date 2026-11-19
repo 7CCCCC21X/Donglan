@@ -16,7 +16,7 @@ from ruletaker.index import IndexFeed
 from ruletaker.notify import chunks
 from ruletaker.store import Store
 from ruletaker.stream import TOPIC, BookStream
-from ruletaker.util import RemoteError
+from ruletaker.util import NotSent, RemoteError
 
 
 class FakeWs:
@@ -152,6 +152,31 @@ class HttpTest(unittest.TestCase):
         FakeConn.made[0].mode = "answer-fail"
         self.assertEqual(nethttp.request("https://api.predict.fun/v1/x"), b'{"ok": 1}')  # again, on a fresh one
         self.assertEqual(len(FakeConn.made), 2)
+
+    def test_an_order_is_judged_again_after_a_new_connection(self) -> None:
+        # no warm connection: the handshake, then the order's gate once more — a pause meanwhile holds it, nothing written
+        with self.assertRaises(NotSent) as caught:
+            nethttp.request("https://api.predict.fun/v1/orders", b"{}", gate=lambda: "已暂停（握手时按的）")
+        self.assertIn("已暂停", str(caught.exception))
+        self.assertEqual((len(FakeConn.made), FakeConn.made[0].requests), (1, []))
+        # the connection, untouched, kept: a warm one is written at once (no wait, so no second judgment)
+        judged: list = []
+        self.assertEqual(nethttp.request("https://api.predict.fun/v1/orders", b"{}", gate=lambda: judged.append(1) or ""), b'{"ok": 1}')
+        self.assertEqual((len(FakeConn.made), judged), (1, []))
+        # a dead connection replaced by a fresh one: judged again before the fresh one is written
+        FakeConn.made[0].mode = "send-fail"
+        with self.assertRaises(NotSent):
+            nethttp.request("https://api.predict.fun/v1/orders", b"{}", gate=lambda: "服务正在停止，不再发单")
+        self.assertEqual((len(FakeConn.made), FakeConn.made[1].requests), (2, []))
+        # a dead pooled connection over a warm one: the warm one is written only after the order is judged again
+        warm, dead = FakeConn("api.predict.fun", 443), FakeConn("api.predict.fun", 443)
+        dead.mode = "send-fail"
+        nethttp._POOL[("api.predict.fun", 443)] = [(warm, time.monotonic()), (dead, time.monotonic())]
+        with self.assertRaises(NotSent):
+            nethttp.request("https://api.predict.fun/v1/orders", b"{}", gate=lambda: "已暂停（换连接时按的）")
+        self.assertEqual((len(dead.requests), warm.requests), (1, []))
+        # a GET has no gate: as before
+        self.assertEqual(nethttp.request("https://api.predict.fun/v1/x"), b'{"ok": 1}')
 
     def test_post_on_a_stale_connection_gets_a_fresh_one(self) -> None:
         nethttp.request("https://api.predict.fun/v1/x")

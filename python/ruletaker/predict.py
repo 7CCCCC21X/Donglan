@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import concurrent.futures
 import contextlib
 import dataclasses
 import decimal
+import functools
 import json
 import re
 import time
@@ -23,7 +25,7 @@ from decimal import Decimal as D
 from typing import Any, Callable
 
 from . import http
-from .util import RemoteError, brief_error, clean_error, http_error_text, loads
+from .util import NotSent, RemoteError, brief_error, clean_error, http_error_text, loads
 
 PREDICT_REST = "https://api.predict.fun/v1"
 API_BASES = {56: PREDICT_REST, 97: "https://api-testnet.predict.fun/v1"}  # the testnet API needs no API key
@@ -41,14 +43,11 @@ PRICE_FIELDS = ("startPrice", "priceToBeat", "targetPrice", "strikePrice", "refe
 
 READ_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="predict-read")
 WRITE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="predict-write")  # orders and cancels: never behind a read
+GATE_WAIT_S = 2.0  # an order judged again on its request's thread (after a new connection): the loop's answer awaited this long
 
 
 class OrderRejected(RemoteError):
     """Predict refused the order outright: nothing was placed."""
-
-
-class NotSent(RemoteError):
-    """A local gate refused the request before its bytes were dispatched: nothing went out."""
 
 
 def http_status(error: BaseException) -> int:
@@ -214,10 +213,11 @@ class PredictApi:
         if check and self.before_send is not None and (why := self.before_send(check)):
             raise NotSent(why)
         loop = asyncio.get_running_loop()
+        gate = self.thread_gate(loop, check) if check and self.before_send is not None else None
         began = time.perf_counter()
         try:
-            raw = await loop.run_in_executor(WRITE_POOL if write else READ_POOL, http.request, self.base + path, payload, timeout,
-                                             self.headers())
+            raw = await loop.run_in_executor(WRITE_POOL if write else READ_POOL, functools.partial(
+                http.request, self.base + path, payload, timeout, self.headers(), **({"gate": gate} if gate else {})))
         except RemoteError as error:
             if error.retry_after or http_status(error) == 429:
                 self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS))
@@ -226,6 +226,30 @@ class PredictApi:
                     self.pacer.note_429()
             raise
         return raw, began
+
+    def thread_gate(self, loop: asyncio.AbstractEventLoop, check: str) -> Callable[[], str]:
+        """before_send for the request's own thread: judged again when the request had to wait there — a new connection's TCP +
+        TLS handshake, a dead one replaced — right before the bytes go out (a pause, a stop, a time line crossed meanwhile holds
+        it). Judged on the loop (the taker's state is the loop's), the thread waiting for the answer: no answer, no send."""
+        judge = self.before_send
+
+        def gate() -> str:
+            answer: concurrent.futures.Future = concurrent.futures.Future()
+
+            def run() -> None:
+                try:
+                    answer.set_result(judge(check))
+                except BaseException as error:  # noqa: BLE001 — whatever it was, the order is not sent on it
+                    answer.set_exception(error)
+            try:
+                loop.call_soon_threadsafe(run)
+            except RuntimeError:  # the loop is closed: the service stops
+                return "服务正在停止，不再发单"
+            try:
+                return str(answer.result(timeout=GATE_WAIT_S) or "")
+            except BaseException as error:  # noqa: BLE001
+                return f"发单前的复核没有答复（{type(error).__name__}），这张单不发"
+        return gate
 
     async def authed(self, method: str, path: str, payload: Any = None, timeout: float = API_TIMEOUT, priority: bool = False,
                      check: str = "") -> Any:
@@ -293,11 +317,12 @@ class PredictApi:
             raise RemoteError("订单簿格式异常")
         return predict_levels(data.get("bids"), True), predict_levels(data.get("asks"), False)
 
-    async def create_order(self, body: Any, digest: str, checked: bool = True) -> dict:
+    async def create_order(self, body: Any, digest: str, checked: bool = True, check: str = "") -> dict:
         """POST /orders -> {"order_id", "hash"}; ``body`` the request (a dict, or its JSON bytes made beforehand), ``digest`` the
-        order's hash (before_send's check — ``checked`` False for the operator's order test alone). A 2xx answer without an order
-        id is no refusal: the order may be there."""
-        answer = await self.authed("POST", "/orders", body, timeout=ORDER_TIMEOUT, priority=True, check=digest if checked else "")
+        order's hash (before_send's check; ``check`` another one for it — the operator's order test's "test:…"; ``checked``
+        False: none). A 2xx answer without an order id is no refusal: the order may be there."""
+        answer = await self.authed("POST", "/orders", body, timeout=ORDER_TIMEOUT, priority=True,
+                                   check=check or (digest if checked else ""))
         data = answer.get("data") if isinstance(answer, dict) else None
         if not isinstance(data, dict):
             raise RemoteError("下单应答没有可读的内容（订单可能已被接受，按哈希核对）：" + brief_error(json.dumps(answer, ensure_ascii=False), 120))

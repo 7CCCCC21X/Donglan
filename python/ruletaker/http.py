@@ -18,10 +18,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-from typing import Any
+from typing import Any, Callable
 
 from . import VERSION
-from .util import RemoteError, clean_error, http_error_text
+from .util import NotSent, RemoteError, clean_error, http_error_text
 
 USER_AGENT = f"RuleTaker/{VERSION}"
 MAX_BODY = 8_000_000
@@ -146,9 +146,12 @@ def _read_body(response: Any, timeout: float) -> bytes:
             raise RemoteError(f"网络错误 (响应过慢：{int(2 * timeout + 1)} 秒内没有读完)")
 
 
-def request(url: str, payload: Any = None, timeout: float = 15, headers: dict[str, str] | None = None) -> bytes:
+def request(url: str, payload: Any = None, timeout: float = 15, headers: dict[str, str] | None = None,
+            gate: Callable[[], str] | None = None) -> bytes:
     """GET (or POST ``payload`` — a dict sent as JSON, or bytes already encoded) and return the body; HTTP and network failures
-    become RemoteError. Over https without a proxy the connection is kept alive and reused."""
+    become RemoteError. Over https without a proxy the connection is kept alive and reused. ``gate`` (an order's): judged again
+    when the request waited before its bytes could go — a new connection's handshake, a dead one replaced: a reason refuses it
+    (NotSent), nothing sent. (Through a proxy urllib opens and writes in one step: the caller judged it right before.)"""
     data = None if payload is None else payload if isinstance(payload, (bytes, bytearray)) else json.dumps(payload).encode("utf-8")
     hdrs = {"User-Agent": USER_AGENT, "Accept": "application/json", "Accept-Encoding": "gzip",
             **({"Content-Type": "application/json"} if data is not None else {}), **(headers or {})}
@@ -156,7 +159,7 @@ def request(url: str, payload: Any = None, timeout: float = 15, headers: dict[st
     host = split.hostname or ""
     if split.scheme != "https" or not host or _proxied(host):
         return _request_urllib(url, data, hdrs, timeout, host)
-    return _request_keepalive(url, split, data, hdrs, timeout)
+    return _request_keepalive(url, split, data, hdrs, timeout, gate)
 
 
 def _request_urllib(url: str, data: bytes | None, hdrs: dict[str, str], timeout: float, host: str) -> bytes:
@@ -181,10 +184,12 @@ def _request_urllib(url: str, data: bytes | None, hdrs: dict[str, str], timeout:
         raise _net_error(error) from None
 
 
-def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str, str], timeout: float) -> bytes:
+def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str, str], timeout: float,
+                       gate: Callable[[], str] | None = None) -> bytes:
     host, port = split.hostname, split.port or 443
     path = (split.path or "/") + (f"?{split.query}" if split.query else "")
     method = "POST" if data is not None else "GET"
+    waited = False  # (a dead connection replaced: time passed since the caller judged the request)
     for _hop in range(4):
         max_idle = KEEPALIVE_POST_IDLE_SECONDS if data is not None else KEEPALIVE_IDLE_SECONDS
         while True:
@@ -194,11 +199,15 @@ def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str,
                     began = time.perf_counter()
                     conn.connect()
                     http_net(host)["connect"].append((time.perf_counter() - began) * 1000)
+                if gate is not None and (waited or not reused) and (why := gate()):
+                    _pool_put(host, port, conn)  # (untouched by this request: kept for the next one)
+                    raise NotSent(why)
                 conn.request(method, path, body=data, headers=hdrs)
             except (OSError, http.client.HTTPException) as error:
                 conn.close()
                 if reused:  # the server had closed it; nothing of this request was taken: once more, on a fresh one
                     HTTP_STATS["retried"] += 1
+                    waited = True
                     continue
                 raise _net_error(error) from None
             try:

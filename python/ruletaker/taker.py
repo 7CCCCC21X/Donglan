@@ -47,7 +47,7 @@ from .rules import (FINAL_STATES, MARKET_NAMES, MODES, NEVER_PLACED, PREFIX, RAC
                     claims, cost, course_part, course_speed, course_stats, filled, held, in_flight, lead_note, live_price_of,
                     live_rule, net, offered, open_cost, open_orders, race_summary, race_text, races, rid, speed_stats, spent_on,
                     walk, watch_stats, windows, without, day_pnl)
-from .util import DAY_MS, DUST, LOG, bj, clean_error, day_of, dumps_bytes, fmt, money
+from .util import DAY_MS, DUST, LOG, NotOnDisk, bj, clean_error, day_of, dumps_bytes, fmt, money
 from .wallet import MAX_SALT, Wallet, build_order, exchange_key, from_wei, limit_amounts, native_signing, to_wei
 
 TICK_S = 1.0                  # the loop's pace
@@ -123,6 +123,25 @@ def start_now(coro: Any, name: str) -> "asyncio.Task":
 
 
 MODE_RANK = {"off": 0, "paper": 1, "on": 2}
+TEST_LOOKUPS, TEST_LOOKUP_S = 4, 1.5   # an order test whose answer was lost: looked for by its hash this often, this far apart
+
+
+def placed_or_not(error: BaseException) -> str:
+    """What a failed order request tells about the order: "not_sent" (a local gate, the key's cooldown, a 429), "rejected"
+    (Predict refused it outright: a 4xx that is no conflict nor a duplicate), "unknown" (a timeout, a lost answer, a 5xx, a
+    409 — it may be there: looked for by its hash, never sent again)."""
+    if isinstance(error, NotSent):
+        return "not_sent"
+    text = clean_error(error) or type(error).__name__
+    status = http_status(error)
+    if isinstance(error, RuntimeError) and "shutdown" in str(error):
+        return "not_sent"
+    if status == 429 or "限流冷却中" in text:
+        return "not_sent"
+    definite = isinstance(error, OrderRejected) or 400 <= status < 500
+    if definite and status != 409 and not any(word in text.lower() for word in DUPLICATE_WORDS):
+        return "rejected"
+    return "unknown"
 
 
 class RuleTaker:
@@ -144,6 +163,8 @@ class RuleTaker:
             store.put(console.SAVED, self.saved_settings)
         self.settings: RuleSettings = settings
         self.review_held: dict = {}
+        self.flush_wait_s = 10.0    # how long an operator's change (or an order with no journal line) waits for the disk
+        self.lookup_s = TEST_LOOKUP_S
         self.wallet = wallet if wallet is not None else (Wallet(config.private_key, config.chain_id, config.account) if config.private_key else None)
         base = API_BASES.get(config.chain_id, PREDICT_REST)
         self.api = api if api is not None else PredictApi(base, config.api_key, self.wallet, config.rate_per_min)
@@ -352,6 +373,8 @@ class RuleTaker:
         """Judged right before an order's bytes go out: the gates again, the settings the look decided under, the window's start
         not passed, in a window's course the index still on the rule's side."""
         digest = str(digest or "").lower()
+        if digest.startswith("test:"):  # the operator's order test: the hard switch, the pause, the stop
+            return self.test_gate()
         slug = self.sending.get(digest)
         if slug is None:
             return "不是规则吃单这一刻要发的订单"
@@ -1468,7 +1491,7 @@ class RuleTaker:
             self.decided.pop(order["hash"], None)
 
     async def send_inner(self, slug: str, w: dict, rule: Rule, rec: dict, order: dict, body: bytes, take: D, limit: D) -> None:
-        if not self.journal(rec, order) and not (self.store.writer is None or await asyncio.to_thread(self.store.flush)):
+        if not self.journal(rec, order) and not (self.store.writer is None or await asyncio.to_thread(self.store.flush, self.flush_wait_s)):
             order.update(state="not_sent", error="数据库写入未完成，没有发单")
             self.save(rec)
             w["word"] = f"没下成：{order['error']}"
@@ -1485,12 +1508,12 @@ class RuleTaker:
         except Exception as error:
             text = clean_error(error) or type(error).__name__
             status = http_status(error)
-            definite = isinstance(error, OrderRejected) or 400 <= status < 500
+            placed = placed_or_not(error)
             if isinstance(error, RuntimeError) and "shutdown" in str(error):
                 order.update(state="not_sent", error="进程正在停止，请求没有发出")
-            elif status == 429 or "限流冷却中" in text:
+            elif placed == "not_sent":
                 order.update(state="not_sent", error=text)
-            elif definite and status != 409 and not any(word in text.lower() for word in DUPLICATE_WORDS):
+            elif placed == "rejected":
                 order.update(state="rejected", error=text)
             else:  # a timeout, a lost answer, a bare 409: it may exist — looked for by its hash, never sent again
                 order.update(state="unknown", error=text, next_ms=self.now() + (FILL_READ_MS if status == 409 else UNKNOWN_EVERY_MS),
@@ -1782,7 +1805,8 @@ class RuleTaker:
             self.paused = arg or "手动暂停"
             self.store.put("control:paused", self.paused)
             line = await self.withdraw_all("暂停")
-            return f"⏸ 规则吃单已暂停：不再开新单（{self.paused}）" + (f"\n{line}" if line else "")
+            late = await self.on_disk("暂停", "恢复成没暂停（接着开新单）")
+            return f"⏸ 规则吃单已暂停：不再开新单（{self.paused}）" + "".join(f"\n{x}" for x in (line, late) if x)
         if what == "resume":
             parts = []
             if self.paused:
@@ -1795,17 +1819,21 @@ class RuleTaker:
                 self.loss_floor_at = {"day": day_of(self.now()), "floor": pnl - self.loss_cap}
                 self.store.put("control:loss_floor", self.loss_floor_at)
                 parts.append(f"今日停机线移到 {money(self.loss_floor_at['floor'])}（从现在的 {money(pnl)} 起再亏 ${self.loss_cap:g} 再停）")
-            return "▶️ " + ("；".join(parts) if parts else "本来就没有暂停") + f"｜现在：{self.mode_text()}"
+            reply = "▶️ " + ("；".join(parts) if parts else "本来就没有暂停") + f"｜现在：{self.mode_text()}"
+            late = await self.on_disk("恢复", "仍是暂停")
+            return reply + (f"\n{late}" if late else "")
         if what == "mode":
             want = arg.strip().lower()
             if want not in MODE_RANK:
                 return "用法：/mode off | paper | on（不会高于部署变量 RULE_TAKER）"
             if MODE_RANK[want] > MODE_RANK[self.env_mode]:
                 return f"部署变量 RULE_TAKER={self.env_mode}，这里最多调到 {self.env_mode}（要真实吃单先改部署变量再重启）"
+            before = self.settings.mode
             self.configure(self.settings.with_mode(want))
             self.store.put("control:mode", want if want != self.env_mode else "")
             line = await self.withdraw_all("改成" + MODES[want]) if want != "on" else ""
-            return f"规则吃单改成：{MODES[want]}" + (f"\n{line}" if line else "")
+            late = await self.on_disk("模式", f"回到“{MODES.get(before, before)}”")
+            return f"规则吃单改成：{MODES[want]}" + "".join(f"\n{x}" for x in (line, late) if x)
         return "？"
 
     async def command(self, command: str, args: str) -> str:
@@ -1979,6 +2007,8 @@ class RuleTaker:
             return "❌ 没有设置 PREDICT_PRIVATE_KEY，做不了挂单测试"
         if self.stop.is_set():
             return "服务正在停止"
+        if why := self.test_gate():  # the test is a real order: the hard switch and the pause hold it as they hold every order
+            return f"❌ 挂单测试没做：{why}"
         try:
             await self.api.ensure_auth()
         except Exception as error:
@@ -2025,15 +2055,35 @@ class RuleTaker:
             record = {"at": now, "slug": slug, "market_id": info.market_id, "price": float(price), "shares": float(shares), "hash": digest.lower(), "steps": lines}
             self.store.put(f"test:{digest.lower()}", record)
             began = time.perf_counter()
-            try:
-                result = await self.api.create_order(body, digest, checked=False)
+            try:  # (judged again right before its bytes leave, as a rule order is: the switch, the pause, the stop)
+                result = await self.api.create_order(body, digest, checked=False, check="test:" + digest.lower())
+                oid = str(result.get("order_id") or "")
+                lines.append(f"1/4 下单成功：订单 #{oid}（往返 {(time.perf_counter() - began) * 1000:.0f} ms）")
             except Exception as error:
-                lines.append(f"1/4 下单失败（{(time.perf_counter() - began) * 1000:.0f} ms）：{clean_error(error) or type(error).__name__}")
-                self.store.put(f"test:{digest.lower()}", {**record, "steps": lines})
-                lines.append("结论：❌ 这张测试单没下成：看上面 Predict 的说法" + ("（403 = 这个区域不能交易）" if http_status(error) == 403 else ""))
-                return "\n".join(lines)
-            oid = str(result.get("order_id") or "")
-            lines.append(f"1/4 下单成功：订单 #{oid}（往返 {(time.perf_counter() - began) * 1000:.0f} ms）")
+                if placed_or_not(error) != "unknown":
+                    lines.append(f"1/4 下单失败（{(time.perf_counter() - began) * 1000:.0f} ms）：{clean_error(error) or type(error).__name__}")
+                    self.store.put(f"test:{digest.lower()}", {**record, "steps": lines})
+                    lines.append("结论：❌ 这张测试单没下成：看上面 Predict 的说法" + ("（403 = 这个区域不能交易）" if http_status(error) == 403 else ""))
+                    return "\n".join(lines)
+                # the answer lost on the way (a timeout, a 5xx, a 409): Predict may hold the order — looked for by its hash, and
+                # withdrawn by the id it shows, as a rule order is
+                lines.append(f"1/4 下单的应答没收到（{(time.perf_counter() - began) * 1000:.0f} ms）：{clean_error(error) or type(error).__name__}"
+                             "——Predict 可能已经收下了，按哈希核对")
+                oid = ""
+                for attempt in range(TEST_LOOKUPS):
+                    if attempt:
+                        await asyncio.sleep(self.lookup_s)
+                    with contextlib.suppress(Exception):
+                        row = await self.api.order("", digest)
+                        if row and row.get("id") not in (None, ""):
+                            oid = str(row["id"])
+                            break
+                if not oid:
+                    lines.append(f"结论：⚠️ 下单结果未知：按哈希查了 {TEST_LOOKUPS} 次都没有这张单（多半没下成）；它签的是 {self.TEST_SECONDS // 60} 分钟后过期，"
+                                 "万一挂上了也会自己失效——到 Predict 网站的订单里核对一下")
+                    self.store.put(f"test:{digest.lower()}", {**record, "steps": lines, "unknown": True})
+                    return "\n".join(lines)
+                lines.append(f"1/4 按哈希找到了：订单 #{oid}（Predict 收下了，只是应答没送到）")
             began = time.perf_counter()
             try:
                 row = await self.api.order(oid, digest)
@@ -2064,17 +2114,29 @@ class RuleTaker:
         return "❌ 没找到能做挂单测试的市场（需要撮合已开启、最低卖价高于 1¢）：\n" + "\n".join(tried[:6])
 
     # -- the control page and the review page --
+    async def on_disk(self, what: str, back: str) -> str:
+        """The wait for an operator's change to reach the disk; the line to add when it did not."""
+        if self.store.writer is None or await asyncio.to_thread(self.store.flush, self.flush_wait_s):
+            return ""
+        error = str(getattr(self.store, "error", "") or "") or "数据库忙，等了也没写完"
+        return f"⚠️ {what}已经生效，但还没写进数据库（{error}）：写完之前服务重启的话会{back}；数据库恢复后会自动补写"
+
     async def save_settings(self, values: dict) -> str:
         """The control page's save: checked whole against the settings file with the other saved values (a wrong one changes
-        nothing), saved — in force now and after a restart — and the windows planned again with it at the next tick."""
+        nothing), in force at once — in the same step as the check, so nothing (a mode switched meanwhile, another save) can
+        come between them — and saved; the windows planned again with it at the next tick. The reply waits for the disk:
+        NotOnDisk when the write did not get there."""
         values = console.clean(values)
         saved = {**self.saved_settings, **values}
         settings, cap = console.build(self.base_env, saved, self.settings.mode)
         self.saved_settings, self.loss_cap = saved, cap
         self.store.put(console.SAVED, saved)
-        await asyncio.to_thread(self.store.flush, 10.0)
         self.configure(settings)
         names = "、".join(console.FIELDS[k][1] + "＝" + (v or "（空）") for k, v in values.items())
+        late = await self.on_disk("设置", "回到改之前的值")
+        if late:
+            self.alarm(f"⚙️ 规则吃单设置已改（控制台）：{names}\n{late}")
+            raise NotOnDisk(f"{names}：{late}")
         self.notify(f"⚙️ 规则吃单设置已改（控制台）：{names}")
         return f"已保存：{names}"
 
@@ -2085,9 +2147,23 @@ class RuleTaker:
         settings, cap = console.build(self.base_env, saved, self.settings.mode)
         self.saved_settings, self.loss_cap = saved, cap
         self.store.put(console.SAVED, saved)
-        await asyncio.to_thread(self.store.flush, 10.0)
-        self.configure(settings)
-        return "已恢复部署设置：" + ("、".join(console.FIELDS[k][1] for k in keys if k in console.FIELDS) or "（没有网页保存的值）")
+        self.configure(settings)  # (in force at once, as a save is)
+        reply = "已恢复部署设置：" + ("、".join(console.FIELDS[k][1] for k in keys if k in console.FIELDS) or "（没有网页保存的值）")
+        late = await self.on_disk("恢复部署设置", "回到网页保存的值")
+        if late:
+            raise NotOnDisk(f"{reply}\n{late}")
+        return reply
+
+    def test_gate(self) -> str:
+        """Why the operator's order test may not go out now ("" when it may): the deploy's hard switch, the pause, the stop."""
+        if self.stop.is_set():
+            return "服务正在停止，不再发单"
+        if not self.config.trading_allowed:
+            return "部署变量 LIVE_TRADING_ALLOWED 不是 on——这个硬开关关着时一张真实的单都不发，挂单测试也是真实的单"
+        if self.paused:
+            return (f"已暂停（{self.paused}）：暂停时一张新单都不开，挂单测试也不做。"
+                    "要测：先 /mode paper（只记录，不会自动下单），再 /resume，再 /test")
+        return ""
 
     def settings_view(self) -> list:
         return console.view(self.settings, self.loss_cap, self.saved_settings)

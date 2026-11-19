@@ -44,6 +44,15 @@ class RemoteError(Exception):
         self.retry_after = max(0, int(retry_after or 0))
 
 
+class NotSent(RemoteError):
+    """A local gate refused the request before its bytes were dispatched: nothing went out."""
+
+
+class NotOnDisk(Exception):
+    """An operator's change in force, but not yet on disk (the database took no write within the wait): never told as saved —
+    the page shows the values in force (``applied``) and says what a restart before the write would bring back."""
+
+
 def clean_error(error: BaseException | str) -> str:
     """An error's text for logs and messages: Telegram tokens and URLs taken out (a URL may carry a key), cut to 280."""
     text = str(error)

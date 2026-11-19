@@ -196,7 +196,7 @@ async function report(action,busy){const box=$("report");box.classList.remove("h
 $("check").onclick=()=>report("check","🔎 自检中，几秒后出结果…");
 $("test").onclick=()=>{if(confirm("挂单测试：在一个撮合已开启的市场挂一张约 $1、远低于市价的买单（不会成交），查到后马上撤掉。继续？"))report("test","🧪 挂单测试中…")};
 function fmtv(f,v){if(f.kind==="choice")return(f.presets.find(o=>o[0]===v)||[v,v])[1];if(v==="0"&&f.zero)return"0（"+f.zero+"）";if(f.unit==="$")return"$"+v;return v+(f.unit?" "+f.unit:"")}
-async function saveField(body){try{const r=await post("api/settings",body);toast(r.message,!r.ok);if(r.ok)await refreshSettings()}catch(e){toast(e.message,true)}}
+async function saveField(body){try{const r=await post("api/settings",body);toast(r.message,!r.ok);if(r.ok||r.applied)await refreshSettings()}catch(e){toast(e.message,true)}}
 function renderSettings(groups,dropped){
   const box=$("settings");box.replaceChildren();
   if(dropped.length)box.append(h("p",{class:"warn"},"启动时这些网页保存的值和设置文件冲突，已删掉："+dropped.join("、")));

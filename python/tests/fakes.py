@@ -44,6 +44,8 @@ class FakeApi:
         self.create_error: BaseException | None = None  # raised by the next create_order (then cleared)
         self.fill_on_create = 0.0                       # shares the order fills as it lands (a taker)
         self.create_delay = 0.0
+        self.connect_delay = 0.0   # a new connection's handshake before the bytes go (the order judged again after it)
+        self.lose_answer = False   # the order lands, its answer is lost on the way (a timeout)
         self.jwt_ok = True
         self.stream: Any = None
         self.pre_send: Any = None
@@ -82,12 +84,17 @@ class FakeApi:
             return self.stream.last[mid]  # (Predict's book is the one it last pushed)
         return self.books.get(mid, ((), ()))
 
-    async def create_order(self, body: dict, digest: str, checked: bool = True) -> dict:
+    async def create_order(self, body: dict, digest: str, checked: bool = True, check: str = "") -> dict:
         self.calls.append(("create", digest))
+        check = check or (digest if checked else "")
         if self.pre_send is not None:
             await self.pre_send()  # (whatever the request waited for before its bytes left: a token, a slot, a sign-in)
-        if checked and self.before_send is not None and (why := self.before_send(digest)):
+        if check and self.before_send is not None and (why := self.before_send(check)):
             raise NotSent(why)
+        if self.connect_delay:  # (no warm connection: the handshake, then the gate once more — as http.request does)
+            await asyncio.sleep(self.connect_delay)
+            if check and self.before_send is not None and (why := self.before_send(check)):
+                raise NotSent(why)
         if isinstance(body, (bytes, bytearray)):
             import json
             body = json.loads(body)
@@ -103,6 +110,8 @@ class FakeApi:
         oid = f"id{len(self.created)}"
         self.orders[digest.lower()] = {"id": oid, "status": "FILLED" if filled >= shares else "OPEN", "amount": str(shares),
                                        "amountFilled": str(filled), "order": {"hash": digest}}
+        if self.lose_answer:
+            raise RemoteError("网络错误 (TimeoutError: timed out)")
         return {"order_id": oid, "hash": digest}
 
     async def remove_orders(self, ids: list[str]) -> dict:

@@ -25,7 +25,7 @@ import os
 import urllib.parse
 from typing import Any
 
-from .util import LOG, clean_error
+from .util import LOG, NotOnDisk, clean_error
 
 PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "console.html")
 MAX_BODY = 65_536
@@ -145,6 +145,8 @@ class StatusServer:
                     message = await self.taker.save_settings(values)
             else:
                 return 404, js, json.dumps({"ok": False, "message": "not found"}, ensure_ascii=False)
+        except NotOnDisk as late:  # (in force, not on disk: never told as saved — "applied" lets the page show the values in force)
+            return 200, js, json.dumps({"ok": False, "applied": True, "message": str(late)}, ensure_ascii=False)
         except ValueError as error:  # (a setting that does not parse: nothing changed, and why)
             return 200, js, json.dumps({"ok": False, "message": str(error)}, ensure_ascii=False)
         except Exception as error:
