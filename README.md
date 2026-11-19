@@ -23,9 +23,10 @@
 6. [为什么是东京、怎么确认](#为什么是东京怎么确认)
 7. [规则（和 huice 相同）](#规则和-huice-相同)
 8. [设置一览](#设置一览)
-9. [记录、恢复与安全](#记录恢复与安全)
-10. [和 huice 相比没搬过来的](#和-huice-相比没搬过来的)
-11. [本地运行与测试](#本地运行与测试)
+9. [安全](#安全)
+10. [记录、恢复与风控](#记录恢复与风控)
+11. [和 huice 相比没搬过来的](#和-huice-相比没搬过来的)
+12. [本地运行与测试](#本地运行与测试)
 
 ---
 
@@ -115,7 +116,8 @@ bash deploy/gcp/rt.sh status    # 状态，就是 huice 的 /rules
 bash deploy/gcp/rt.sh env
 ```
 
-4. 部署完可以把 Cloud Shell 里的 `ruletaker.env` 删掉（里面有私钥）：`shred -u ruletaker.env`。以后改设置用 `bash deploy/gcp/rt.sh ssh` 登录虚拟机，`sudo nano /etc/ruletaker/ruletaker.env`，再 `sudo systemctl restart ruletaker`。
+4. 部署完把 Cloud Shell 里的 `ruletaker.env` 删掉（里面有私钥，脚本也会提醒）：`shred -u ruletaker.env`。以后改设置用 `bash deploy/gcp/rt.sh ssh` 登录虚拟机，`sudo nano /etc/ruletaker/ruletaker.env`，再 `sudo systemctl restart ruletaker`；规则价格、份数这些直接在网页控制台里改更方便。
+5. 运行一次安全加固：`bash deploy/gcp/rt.sh lockdown`（见“[安全](#安全)”）。
 
 ### 费用
 
@@ -129,6 +131,7 @@ bash deploy/gcp/rt.sh env
 
 | 命令 | 作用 |
 |---|---|
+| `bash deploy/gcp/rt.sh lockdown` | **安全加固**（部署后运行一次）：封掉这台机器所有入站连接，SSH 只走 Google 的 IAP 通道；`unlock` 解除。见“[安全](#安全)” |
 | `bash deploy/gcp/rt.sh console` | 打开网页控制台和复盘页（见下一节） |
 | `bash deploy/gcp/rt.sh status` | 状态（文字版）：模式、推送、账户余额、每秒检查时段、下一个抢单时刻、每条规则的下一场、抢单记录、今天的成交和盈亏 |
 | `bash deploy/gcp/rt.sh check` | **自检**：登录、账户、余额、授权、下单接口在这个区域能不能用、读一次多快、推送、记录、场次，最后一句结论（和 Telegram `/check`、控制台“自检”按钮一样） |
@@ -144,15 +147,28 @@ bash deploy/gcp/rt.sh env
 
 停止或重启时，服务会先等在途订单的应答（最多 25 秒）、撤掉还挂着的单，再退出。
 
-### Telegram：通知和命令（自检）
+### Telegram：怎么绑定（通知、命令、自检）
 
-设了 `TELEGRAM_BOT_TOKEN` 就会推送启动、每次成交、每场结算和告警；只发通知可以直接用 Railway 那个机器人的 Token。
+**最简单的绑法：给这个服务单独建一个机器人，通知和命令都走它。**
 
-要在 Telegram 里**发命令自检**，给这个服务单独建一个机器人（同一个 Token 只能有一个进程收消息，和 Railway 共用会让两边都收不到命令）：
+1. 在 Telegram 里找 **@BotFather**，发 `/newbot`，起个名字（例如“规则吃单东京”）和用户名（必须以 `bot` 结尾），它会回一串 Token（`123456:ABC…` 这样的）。
+2. 点开新机器人的对话，按 **Start**（机器人不能主动给没和它说过话的人发消息）。
+3. 设置文件里填三行：
 
-1. 在 Telegram 找 **@BotFather**，`/newbot` 建一个机器人（名字随意，例如“规则吃单东京”），拿到 Token。
-2. 设置文件里加：`TELEGRAM_COMMANDS=on`、`TELEGRAM_COMMAND_TOKEN=新机器人的 Token`、`ADMIN_USER_ID=你的用户 ID`（不知道的话：先留 0 部署，给新机器人发 `/id` 拿到数字再填回去；或者用 Railway 那个机器人的 `/id`）。通知想继续走 Railway 那个机器人，就保留原来的 `TELEGRAM_BOT_TOKEN`；想都走新机器人，就把两个都填成新 Token。
-3. `bash deploy/gcp/rt.sh env` 上传并重启。新机器人输入框左下角的“菜单”里会出现这些命令：
+   ```
+   TELEGRAM_COMMAND_TOKEN=新机器人的 Token
+   TELEGRAM_COMMANDS=on
+   ADMIN_USER_ID=你的数字用户 ID
+   ```
+
+   用户 ID 就是 Railway 变量里那个 `ADMIN_USER_ID`，照抄；不记得就给 Railway 的机器人发 `/id`。
+4. `bash deploy/gcp/rt.sh env` 上传并重启。几秒后新机器人会发来“🚀 规则吃单已启动”，输入框旁边的“菜单”里有全部命令。发 `/check` 试一下。
+
+这样启动、成交、结算、告警都发到你和新机器人的私聊里，和 Railway 机器人的消息分开。
+
+**想让通知继续发到原来的群话题**（和 huice 的通知放一起）：再加两行——`TELEGRAM_BOT_TOKEN=Railway 那个机器人的 Token`（只用来发消息，和 Railway 不冲突）和 `TELEGRAM_CHAT_ID=群ID:话题ID`。群和话题的 ID 这样查：把新机器人拉进群，在那个话题里发 `/id@新机器人的用户名`，它回“这个聊天：-100…:话题ID”，照抄。命令仍然发给新机器人。
+
+**不要这样填**：把 Railway 机器人的 Token 填进 `TELEGRAM_COMMAND_TOKEN`，或者在 `TELEGRAM_COMMANDS=on` 时只填 Railway 的 `TELEGRAM_BOT_TOKEN`——同一个 Token 只能有一个程序收消息，两边会互相抢，命令都收不全。
 
 | 命令 | 作用 |
 |---|---|
@@ -241,7 +257,9 @@ bash deploy/gcp/rt.sh probe asia-northeast3-a # 首尔
 bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 ```
 
-比较输出里“读盘口 … 中位”那个数：最小的区域离 Predict 最近（下单的往返和它差不多）。如果别的区域明显更小，`ZONE=那个区域 bash deploy/gcp/rt.sh deploy` 换过去（先 `delete` 旧的，或者用 `VM=ruletaker2` 另起一台再删旧的，注意不要两台同时 `on`）。
+比较输出里“读盘口 … 中位”那个数：最小的区域离 Predict 最近（下单的往返和它差不多）。
+
+**AWS 还是 Google Cloud？** 对速度起作用的是机器在哪个城市，不是哪家云：两家在东京都有机房，请求都是先到 Cloudflare 的东京入口、再到 Predict。估计两家只差一两毫秒（没有实测过），而从阿姆斯特丹搬到东京省的是几百毫秒。这个仓库的部署脚本是给 Google Cloud 写的（Cloud Shell 一条命令部署、用网页预览看控制台，自己电脑上什么都不用装）；代码本身不挑云，`deploy/gcp/vm-setup.sh` 在任何 Ubuntu 24.04 机器上都能装。建议先在 Google Cloud 东京跑起来看实测；想和 AWS 东京（`ap-northeast-1`）比，在那边开一台小机器跑同一个 `python -m ruletaker latency`，比“读盘口”的中位数。如果别的区域明显更小，`ZONE=那个区域 bash deploy/gcp/rt.sh deploy` 换过去（先 `delete` 旧的，或者用 `VM=ruletaker2` 另起一台再删旧的，注意不要两台同时 `on`）。
 
 ---
 
@@ -287,7 +305,7 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 | `RULE_LEAD_MINUTES` | 300 | 对手提前多少分钟挂单，0 = 不按这个时刻 |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `ADMIN_USER_ID` | | 通知（话题写 `群ID:话题ID`） |
 | `TELEGRAM_COMMANDS` | off | on = 收管理员命令（`/check` 自检、`/test` 挂单测试等） |
-| `TELEGRAM_COMMAND_TOKEN` | 空 | 收命令的机器人（本服务专用）；空 = 用 `TELEGRAM_BOT_TOKEN` 收 |
+| `TELEGRAM_COMMAND_TOKEN` | 空 | 收命令的机器人（本服务专用）；空 = 用 `TELEGRAM_BOT_TOKEN` 收。只填它、不填 `TELEGRAM_BOT_TOKEN` 时通知也走它 |
 | `RULE_NOTIFY` | on | 成交、结算通知；off 只发告警 |
 | `STATUS_HOST` / `STATUS_PORT` / `STATUS_KEY` | 127.0.0.1 / 8080 / 空 | 状态页；不在本机监听时必须设口令 |
 | `RULE_WS_CONNECTIONS` | 1 | 推送连接条数 1～3，谁先送到用谁的 |
@@ -297,15 +315,55 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 
 ---
 
-## 记录、恢复与安全
+## 安全
+
+**先说实话**：服务要自动下单，就必须用得到私钥，所以私钥一定在那台机器上，“服务器上的私钥绝对安全”做不到。能做的是两件事：让能碰到它的路尽量少；万一被拿走，损失有上限。
+
+### 私钥放在哪、谁能拿到
+
+| 位置 | 保护 |
+|---|---|
+| Cloud Shell 里的 `ruletaker.env`（填设置时） | Cloud Shell 的个人磁盘，只有你的 Google 账号进得去；部署完删掉（脚本会提醒） |
+| 传到虚拟机的路上 | SSH 加密通道 |
+| 虚拟机上的 `/etc/ruletaker/ruletaker.env` | root 所有、权限 640，只有 root 和服务自己的用户读得到；磁盘由 Google 默认加密 |
+| 服务进程的内存 | 专用的、不能登录的用户运行；不写 core dump |
+
+**不会出现在**：GitHub（`.gitignore` 排除了 `ruletaker.env`）、日志（只写“有没有设置”）、网页控制台（看不到也改不了）、Telegram 消息、虚拟机的元数据、测延迟用的临时机器（`rt.sh probe` 只带 API Key 过去）。
+
+**谁能拿到**：能登录你 Google 账号的人（能 SSH 进机器、能读磁盘），和能往这个 GitHub 仓库推代码的人（`rt.sh update` 会把仓库里的代码装到机器上运行）。真正的锁是这两个账号。
+
+### 脚本已经替你做的
+
+- 机器**不带服务账号**：就算有人进了机器，也拿不到能操作你 Google Cloud 项目的令牌。
+- 服务只往外连（Predict、BNB 链节点、币安、Telegram），**不监听任何公网端口**；控制台只在本机 `127.0.0.1`，要看得走 SSH 通道。
+- **`bash deploy/gcp/rt.sh lockdown`**（部署后运行一次）：防火墙封掉这台机器的所有入站连接，SSH 只能走 Google 的 IAP 通道——连接先过 Google 登录和项目权限检查，公网上连不到它的 22 端口。脚本先验证通道能用才封；封完验证失败会自动撤回。之后 `rt.sh` 的所有命令自动走通道（慢一两秒）；`rt.sh unlock` 解除。
+- **依赖锁定并校验哈希**（`requirements.lock`）：机器上装的每个 Python 包都按 SHA-256 校验，只装和测试时完全相同的文件，被调包的、之后新发布的版本一律拒绝；只装现成的 wheel，不在机器上编译。
+- Shielded VM（安全启动、vTPM、完整性监控）；Ubuntu 默认自动装安全更新。
+- 网页控制台的所有修改操作要专用请求头（别的网站的页面发不出来）；私钥、Key 不能在网页或 Telegram 里改；Telegram 只认 `ADMIN_USER_ID`，而且改不了价格和份数。
+
+### 需要你自己做的（按重要程度）
+
+1. **Google 账号开两步验证**，最好用通行密钥或安全密钥（<https://myaccount.google.com/security>）。项目的 IAM 里只留你自己；不要创建、下载服务账号密钥。
+2. **这个钱包里只放够用的钱。** 私钥被拿走的最大损失就是账户里的余额：按 `RULE_MAX_DAY_USD` 留几天的量，利润定期提走。和 Railway 共用同一个账户时，同一把私钥存在两个平台上，哪边出事都一样。
+3. **GitHub 账号开两步验证**；仓库保持私有，不加不认识的协作者。
+4. 部署完运行 `bash deploy/gcp/rt.sh lockdown`，并删掉 Cloud Shell 里的 `ruletaker.env`。私钥不要贴到聊天、截图、工单里。
+5. **Telegram 账号开两步验证**（设置 → 隐私和安全）：管理员账号能暂停、恢复、切模式。
+6. Google Cloud **设预算提醒**（结算 → 预算和提醒）：云账号被盗最常见的后果是被拿去开一堆机器挖矿。
+7. **怀疑私钥泄露时**：马上在 Predict 网站把钱提到别的地址 → `bash deploy/gcp/rt.sh stop` → 换一个新账户。导出的私钥没法“改密码”，只能弃用。
+
+没有做的：把私钥放进硬件密钥（KMS / HSM）里签名——每签一张单要多一次网络往返，和抢单的目标冲突；Secret Manager 对一个人的项目和现在的做法保护程度相同（都取决于 Google 账号）。加固脚本（`lockdown`）和上面的流程用假的 gcloud 模拟验证过顺序和回滚，没有在真实的 Google Cloud 项目上跑过。
+
+---
+
+## 记录、恢复与风控
 
 - **记录**：每场每个模式一条（真实 `rule:<场次链接>`，只记录 `rule:paper:<场次链接>`），存在虚拟机的 SQLite（`/var/lib/ruletaker/`）。格式和 huice 一样：订单哈希、成交份数、均价、手续费、结算结果、盈亏，以及每场的“盘口观察”（卖单什么时候出现、什么时候开始被吃、什么时候被吃光，按 Predict 盘口自己的时间戳）。
 - **发单前先落盘**：每张真实订单在请求发出前，先把哈希写进数据库旁边的订单日志（`ruletaker.sqlite3.rule-orders`）。进程在发单途中崩溃或重启，启动时按哈希去 Predict 核对，**绝不重发**。应答丢失、超时、裸 409 都按“结果未知”处理，按哈希找回。
 - **风控**：每场份数、每天上限、日亏损停机、`LIVE_TRADING_ALLOWED` 硬开关、暂停（会保存，重启后仍然暂停）；运行中切换模式不能高于设置文件。发单前最后一刻（请求真正发出的那一刻）再核一次：设置是不是刚改过、是否暂停、是否就绪、**离开场是否已不足 15 秒**（盘中：离结束）、余额够不够（扣掉同时在途的其他单）、盘中指数是否还在规则方向。
 - **余额**：链上读到的 USDT 扣掉读余额前后下的单可能已经花掉的钱（成交上链要几秒），几场同时有卖单时第二张单按剩下的钱下，不会被 Predict 以余额不足拒绝。
 - **数据库写不进去时不开新单**（例如磁盘满）：记录写不进去，重启后就找不到这张单，所以宁可不下；写入会一直重试，恢复后自动继续。
-- **停止时**：在途订单最多等 25 秒应答，应答一到就撤掉没成交的部分；`TimeoutStopSec=40` 够用。
-- **私钥**只放在虚拟机的 `/etc/ruletaker/ruletaker.env`（root 所有、服务用户组可读、640），不进代码仓库（`.gitignore` 已排除 `ruletaker.env`），日志只写“有没有设置”，不写值。状态页默认只在虚拟机本机监听，通过 `gcloud compute ssh` 访问。
+- **停止时**：在途订单最多等 25 秒应答，应答一到就撤掉没成交的部分（systemd 给停止留了 75 秒，平时一秒就停）。
+- **私钥和账号**：见上一节“[安全](#安全)”。
 - **地区和条款**：Predict 不向受限地区开放交易（受限地区读取正常、下单 403）。部署后先跑 `rt.sh check`；是否允许在当地使用请以 Predict.fun 的服务条款为准。
 
 ---
@@ -321,7 +379,7 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 ## 本地运行与测试
 
 ```bash
-python3 -m venv venv && venv/bin/pip install -r requirements.txt   # 需要 Python 3.12 以上
+python3 -m venv venv && venv/bin/pip install --require-hashes --only-binary :all: -r requirements.lock   # 需要 Python 3.12 以上
 venv/bin/python -m unittest discover -s tests      # 全部离线测试（不联网、不要 Key）
 venv/bin/python tests/bench_hotpath.py              # 推送帧 → 下单请求交出 的耗时
 venv/bin/python -m ruletaker plan                   # 接下来两天每条规则的场次（北京 / 纽约时间）
@@ -345,4 +403,5 @@ venv/bin/python -m ruletaker run --env ruletaker.env
 | `ruletaker/notify.py`、`status.py` | Telegram、状态页和控制台的接口 |
 | `ruletaker/console.py`、`review.py`、`web/console.html` | 控制台的设置（网页保存、整体校验）、复盘的统计和 CSV、网页本身 |
 | `ruletaker/config.py`、`clock.py`、`cards.py` | 设置、纽约时间和 CME 日历、15 分钟市场 |
-| `deploy/gcp/` | Google Cloud 部署脚本（`rt.sh`）、systemd 服务、虚拟机安装脚本 |
+| `deploy/gcp/` | Google Cloud 部署脚本（`rt.sh`，含安全加固 `lockdown`）、systemd 服务、虚拟机安装脚本 |
+| `requirements.txt`、`requirements.lock` | 直接依赖；全部依赖的版本和哈希锁定（部署时逐个校验） |

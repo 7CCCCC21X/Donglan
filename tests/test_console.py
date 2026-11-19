@@ -296,3 +296,22 @@ class TelegramIdFirstTest(unittest.TestCase):
             self.assertIn("你的用户 ID：5", sent[0])
             self.assertEqual(taker.paused, "")
         run(go())
+
+
+class TelegramBindingTest(unittest.TestCase):
+    def test_one_bot_for_both_or_one_each(self) -> None:
+        from fakes import make_config
+        from ruletaker.__main__ import make_telegram
+
+        async def handler(command: str, args: str) -> str:
+            return ""
+        # one new bot, its token under TELEGRAM_COMMAND_TOKEN alone: the notifications go through it too, to the admin's chat
+        one = make_telegram(make_config(TELEGRAM_COMMAND_TOKEN="CMD", TELEGRAM_COMMANDS="on", ADMIN_USER_ID="42"), handler)
+        self.assertEqual((one.token, one.cmd_token, one.enabled, one.chats), ("CMD", "CMD", True, ((42, 0),)))
+        # Railway's bot keeps the notifications (to a group topic), the new bot takes the commands
+        two = make_telegram(make_config(TELEGRAM_BOT_TOKEN="NOTIFY", TELEGRAM_CHAT_ID="-1001:7", TELEGRAM_COMMAND_TOKEN="CMD",
+                                        TELEGRAM_COMMANDS="on", ADMIN_USER_ID="42"), handler)
+        self.assertEqual((two.token, two.cmd_token, two.enabled, two.chats), ("NOTIFY", "CMD", True, ((-1001, 7),)))
+        # nothing set: no Telegram at all
+        none = make_telegram(make_config(), handler)
+        self.assertFalse(none.enabled)

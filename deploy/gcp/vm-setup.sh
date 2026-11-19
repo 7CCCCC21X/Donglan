@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Runs ON the VM as root (rt.sh deploy / update call it): installs Python and the dependencies, runs the offline tests,
-# puts the settings file in place (when one was uploaded) and (re)starts the service.
+# Runs ON the VM as root (rt.sh deploy / update / env call it): puts the uploaded settings file in place, installs Python and
+# the dependencies (every package checked against the hashes in requirements.lock), runs the offline tests and (re)starts the
+# service.
 set -euo pipefail
 APP=/opt/ruletaker
 cd "$APP"
@@ -10,6 +11,13 @@ if ! id ruletaker >/dev/null 2>&1; then
 fi
 install -d -m 700 -o ruletaker -g ruletaker /var/lib/ruletaker
 install -d -m 750 -o root -g ruletaker /etc/ruletaker
+
+# The settings file first (it holds the private key): whatever fails further down, it is never left lying in /tmp.
+if [ -f /tmp/ruletaker.env ]; then
+  install -m 640 -o root -g ruletaker /tmp/ruletaker.env /etc/ruletaker/ruletaker.env
+  shred -u /tmp/ruletaker.env 2>/dev/null || rm -f /tmp/ruletaker.env
+  echo "== 设置文件已更新：/etc/ruletaker/ruletaker.env（root 所有，只有服务自己的用户组能读） =="
+fi
 
 if ! dpkg -s python3-venv >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
@@ -23,17 +31,13 @@ python3 -c 'import sys; assert sys.version_info >= (3, 12), "需要 Python 3.12 
 if [ ! -x "$APP/venv/bin/python" ]; then
   python3 -m venv "$APP/venv"
 fi
-"$APP/venv/bin/pip" install -q --upgrade pip >/dev/null
-"$APP/venv/bin/pip" install -q -r "$APP/requirements.txt"
+# Exactly the versions the tests ran with, each file checked against its hash (requirements.lock): a package swapped on the way,
+# or a release published since, is refused. Ready-made wheels only — nothing is built (no build tool fetched unchecked).
+"$APP/venv/bin/pip" install -q --require-hashes --only-binary :all: -r "$APP/requirements.lock"
 
 echo "== 离线测试 =="
 (cd "$APP" && "$APP/venv/bin/python" -m unittest discover -s tests -q)
 
-if [ -f /tmp/ruletaker.env ]; then
-  install -m 640 -o root -g ruletaker /tmp/ruletaker.env /etc/ruletaker/ruletaker.env
-  shred -u /tmp/ruletaker.env 2>/dev/null || rm -f /tmp/ruletaker.env
-  echo "== 设置文件已更新：/etc/ruletaker/ruletaker.env =="
-fi
 if [ ! -f /etc/ruletaker/ruletaker.env ]; then
   echo "!! 还没有设置文件 /etc/ruletaker/ruletaker.env：用 rt.sh env 上传后再启动" >&2
   exit 1

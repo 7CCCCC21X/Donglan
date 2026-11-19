@@ -17,6 +17,7 @@ import statistics
 import sys
 import time
 import urllib.parse
+from typing import Any
 
 from . import VERSION
 from .config import Config, load_env_file
@@ -53,9 +54,17 @@ def load_config(env_file: str | None) -> Config:
     return Config.from_env(load_env(env_file))
 
 
+def make_telegram(config: Config, handler: Any) -> Any:
+    """The notifications through TELEGRAM_BOT_TOKEN's bot — or, with none set, through the command bot (one bot for both);
+    the commands through TELEGRAM_COMMAND_TOKEN's bot, else the notifying one's."""
+    from .notify import Telegram
+    notify_token = config.telegram_token or config.telegram_command_token
+    return Telegram(notify_token, config.telegram_chats, config.admin_user_id, config.telegram_commands,
+                    handler=handler, enabled=bool(notify_token), command_token=config.telegram_command_token)
+
+
 async def run_service(config: Config, env: dict | None = None) -> int:
     from .index import IndexFeed
-    from .notify import Telegram
     from .rules import RULES, live_price_of
     from .status import StatusServer
     from .store import Store
@@ -68,8 +77,7 @@ async def run_service(config: Config, env: dict | None = None) -> int:
     index = IndexFeed(sorted({r.spec.symbol for r in in_play}), config.binance_fapi, config.binance_ws) if in_play else None
     taker = RuleTaker(config, store, index=index, base_env={k: v for k, v in (env or {}).items() if k.startswith("RULE_")} if env is not None else None)
     taker.region = region
-    telegram = Telegram(config.telegram_token, config.telegram_chats, config.admin_user_id, config.telegram_commands,
-                        handler=taker.command, enabled=bool(config.telegram_token), command_token=config.telegram_command_token)
+    telegram = make_telegram(config, taker.command)
     taker.telegram = telegram
     status = StatusServer(taker, config.status_host, config.status_port, config.status_key)
     loop = asyncio.get_running_loop()

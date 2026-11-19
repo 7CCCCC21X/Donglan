@@ -194,3 +194,24 @@ class WalletTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LockTest(unittest.TestCase):
+    """What the VM installs (requirements.lock, every file by its hash) is what requirements.txt asks for."""
+
+    def test_lock_pins_every_direct_dependency_with_hashes(self) -> None:
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "requirements.txt"), encoding="utf-8") as f:
+            wanted = dict(re.findall(r"^([A-Za-z0-9_.-]+)==([^\s#]+)", f.read(), re.M))
+        with open(os.path.join(root, "requirements.lock"), encoding="utf-8") as f:
+            lock = f.read()
+        locked = dict(re.findall(r"^([A-Za-z0-9_.-]+)==([^\s\\]+)", lock, re.M))
+        self.assertTrue(wanted)
+        for name, version in wanted.items():
+            self.assertEqual(locked.get(name), version, f"{name}: requirements.lock 没跟上 requirements.txt（按 requirements.txt 顶上的命令重新生成）")
+        # every pinned package carries at least one sha256, and nothing in the lock is unpinned
+        blocks = re.split(r"\n(?=[A-Za-z0-9_.-]+==)", lock.strip())
+        self.assertEqual(len(blocks), len(locked))
+        for block in blocks:
+            self.assertRegex(block, r"--hash=sha256:[0-9a-f]{64}", block.splitlines()[0])

@@ -1,3 +1,6 @@
+# 直接依赖（人读的）。真正安装用的是 requirements.lock：全部依赖（含间接依赖）锁定版本并带哈希，
+# 部署时 pip --require-hashes 逐个校验。改了这里以后重新生成锁定文件（日期填两周前，不收刚发布的版本）：
+#   uv pip compile requirements.txt --generate-hashes --universal --python-version 3.12 --exclude-newer 2026-11-05 --no-header -o requirements.lock
 # 签名 Predict 订单（EIP-712）和登录消息
 eth-account==0.14.0
 # Predict 的盘口推送、币安指数推送
