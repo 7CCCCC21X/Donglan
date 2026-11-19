@@ -215,6 +215,10 @@ pub fn env_of(pairs: &[(&str, &str)]) -> Env {
 }
 
 pub fn rig_with(clock_ms: i64, store: Store, api: Rc<FakePredict>, pairs: &[(&str, &str)]) -> Rig {
+    rig_full(clock_ms, store, api, pairs, None)
+}
+
+pub fn rig_full(clock_ms: i64, store: Store, api: Rc<FakePredict>, pairs: &[(&str, &str)], index: Option<Rc<crate::index::IndexFeed>>) -> Rig {
     let config = Config::from_env(&env_of(pairs)).unwrap();
     let wallet = Rc::new(Wallet::new(KEY, 56, "").unwrap());
     let transport: Rc<dyn Transport> = api.clone();
@@ -231,7 +235,7 @@ pub fn rig_with(clock_ms: i64, store: Store, api: Rc<FakePredict>, pairs: &[(&st
         wallet: Some(wallet),
         chain: Some(Some(chain)),
         stream: Some(stream.clone()),
-        index: None,
+        index,
         telegram: None,
         clock: Some(clock.clone()),
         base_env: None,
@@ -899,6 +903,60 @@ fn the_loop_runs_reads_fills_and_stops_cleanly() {
         r.me.borrow().stop.set();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await.expect("stops");
         assert!(!r.me.borrow().running);
+    });
+}
+
+fn dec(s: &str) -> rust_decimal::Decimal {
+    s.parse().unwrap()
+}
+
+fn live_rig(clock_ms: i64) -> (Rig, Rc<crate::index::IndexFeed>) {
+    let feed = Rc::new(crate::index::IndexFeed::new(&["XAUUSDT"], "https://fapi.binance.test", "wss://fstream.binance.test/market"));
+    let r = rig_full(clock_ms, Store::memory(), FakePredict::new(), &[("RULE_GOLD_SHUT_LIVE_CENTS", "80")], Some(feed.clone()));
+    (r, feed)
+}
+
+#[test]
+fn course_buys_only_with_the_index_ahead() {
+    run(async {
+        let (r, feed) = live_rig(start() - 60_000);
+        r.found().await;
+        r.clock.set(start() + 90_000); // a minute and a half into the window
+        r.me.borrow().track.get(&slug_of(start())).unwrap().borrow_mut().look_ms = 0;
+        feed.candles.borrow_mut().insert(("XAUUSDT".into(), start() - 60_000), dec("4000"));
+        let now = r.clock.get();
+        feed.push_index("XAUUSDT", dec("4000.1"), now - 100, now); // +0.0025%: not the 0.005% the rule asks
+        r.push(MID, book(&[("0.70", "100")], &[]));
+        assert!(r.created().is_empty());
+        assert!(r.word().contains("还没领先"), "{}", r.word());
+        feed.push_index("XAUUSDT", dec("4000.4"), now - 50, now); // +0.01%: ahead — the index's arrival is the look
+        assert_eq!(r.created().len(), 1, "{}", r.word());
+        let body = &r.created()[0]["data"];
+        assert_eq!(body["pricePerShare"], (80 * 10u128.pow(16)).to_string());
+        assert_eq!(body["order"]["expiration"], ((start() + 15 * 60_000) / 1000 - taker::EXPIRY_BEFORE_S).to_string());
+        r.sends().await;
+        let o = r.order(0);
+        assert!(o.is_true("live"));
+        assert!(o.t("index_wall"));
+    });
+}
+
+#[test]
+fn first_minute_no_dearer_than_before() {
+    run(async {
+        let (r, feed) = live_rig(start() - 60_000);
+        r.found().await;
+        r.clock.set(start() + 20_000);
+        r.me.borrow().track.get(&slug_of(start())).unwrap().borrow_mut().look_ms = 0;
+        feed.candles.borrow_mut().insert(("XAUUSDT".into(), start() - 60_000), dec("4000"));
+        let now = r.clock.get();
+        feed.push_index("XAUUSDT", dec("4001"), now - 100, now);
+        r.push(MID, book(&[("0.70", "100")], &[]));
+        assert!(r.created().is_empty()); // 70¢ is above the 58¢ before the window: not in the first minute
+        r.push(MID, book(&[("0.57", "10")], &[]));
+        assert_eq!(r.created().len(), 1, "{}", r.word());
+        assert_eq!(r.created()[0]["data"]["pricePerShare"], (58 * 10u128.pow(16)).to_string());
+        r.sends().await;
     });
 }
 

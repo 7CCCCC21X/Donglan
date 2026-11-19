@@ -158,7 +158,9 @@ pub fn log_line(level: u8, text: &str) {
     };
     let now = now_ms();
     let (d, h, mi, s, ms) = wall(now, BEIJING_MS);
-    eprintln!("{d} {h:02}:{mi:02}:{s:02}.{ms:03} {name} {}", clean_error_keep(text));
+    // (a log that cannot be written — journald restarting — is dropped, never a panic in the middle of an order)
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{d} {h:02}:{mi:02}:{s:02}.{ms:03} {name} {}", clean_error_keep(text));
 }
 
 #[macro_export]

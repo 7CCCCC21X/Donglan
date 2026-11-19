@@ -469,6 +469,9 @@ impl Http {
     }
 
     fn put(&self, key: (String, u16, bool), conn: Conn) {
+        if !conn.buf.is_empty() {
+            return; // (bytes past the answer nobody asked for: the connection is not trusted with another request)
+        }
         let mut pool = self.pool.borrow_mut();
         let rows = pool.entry(key).or_default();
         if rows.len() >= KEEPALIVE_PER_HOST {
