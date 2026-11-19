@@ -78,3 +78,72 @@ fn signatures_match_python() {
         assert_eq!(to_wei(row[0].as_f64().unwrap()).to_string(), row[1].as_str().unwrap(), "{row}");
     }
 }
+
+#[test]
+fn settings_match_python() {
+    use crate::config::{Config, Env, RuleSettings};
+    let v = vectors("settings.json");
+    let env_of = |e: &Value| -> Env { e.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect() };
+    for case in v["rules"].as_array().unwrap() {
+        let got = RuleSettings::parse(&env_of(&case["env"]), None);
+        match (got, case.get("error")) {
+            (Err(e), Some(want)) => {
+                // (Python's own wording for an int() that fails is its own; every message of the service's is the same)
+                if !want.as_str().unwrap().starts_with("invalid literal") {
+                    assert_eq!(e, want.as_str().unwrap(), "{}", case["env"]);
+                }
+            }
+            (Ok(s), None) => {
+                let ok = &case["ok"];
+                assert_eq!(s.mode, ok["mode"].as_str().unwrap(), "{}", case["env"]);
+                for (k, c) in ok["cents"].as_object().unwrap() {
+                    assert_eq!(s.price(k), c.as_i64().unwrap(), "{} {k}", case["env"]);
+                }
+                let markets: Vec<String> = s.markets.iter().cloned().collect();
+                let want: Vec<String> = ok["markets"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect();
+                assert_eq!(markets, want, "{}", case["env"]);
+                for (k, n) in ok["shares"].as_object().unwrap() {
+                    assert_eq!(s.shares_of(k), n.as_i64().unwrap(), "{}", case["env"]);
+                }
+                assert_eq!(s.max_day_usd, ok["max_day"].as_f64().unwrap());
+                let fast: Vec<Vec<i64>> = s.fast.iter().map(|(a, b)| vec![*a as i64, *b as i64]).collect();
+                let want: Vec<Vec<i64>> = ok["fast"].as_array().unwrap().iter().map(|p| p.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect()).collect();
+                assert_eq!(fast, want, "{}", case["env"]);
+                for (k, c) in ok["live"].as_object().unwrap() {
+                    assert_eq!(s.live_price(k), c.as_i64().unwrap(), "{}", case["env"]);
+                }
+                assert_eq!(s.lead_minutes, ok["lead"].as_i64().unwrap());
+            }
+            (got, want) => panic!("{}: {got:?} vs {want:?}", case["env"]),
+        }
+    }
+    for case in v["config"].as_array().unwrap() {
+        let got = Config::from_env(&env_of(&case["env"]));
+        match (got, case.get("error")) {
+            (Err(e), Some(want)) => {
+                let want = want.as_str().unwrap();
+                if !want.starts_with("invalid literal") && !want.contains("could not convert") {
+                    assert_eq!(e, want, "{}", case["env"]);
+                }
+            }
+            (Ok(c), None) => {
+                assert_eq!(c.own_key, case["ok"]["own_key"].as_bool().unwrap());
+                assert_eq!(c.api_key, case["ok"]["api_key"].as_str().unwrap());
+            }
+            (got, want) => panic!("{}: {:?} vs {want:?}", case["env"], got.map(|c| c.api_key)),
+        }
+    }
+    let base = env_of(&v["base"]);
+    let mine: Env = crate::console::current(&RuleSettings::parse(&Env::new(), None).unwrap(), 0.0).into_iter().collect();
+    assert_eq!(mine, base);
+    for case in v["settle"].as_array().unwrap() {
+        let saved: crate::console::Saved = case["saved"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
+        let (s, _, keep, dropped) = crate::console::settle_saved(&base, &saved, "paper").unwrap();
+        let want_keep: crate::console::Saved = case["keep"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
+        assert_eq!(keep, want_keep);
+        let want_dropped: Vec<String> = case["dropped"].as_array().unwrap().iter().map(|d| d.as_str().unwrap().to_string()).collect();
+        assert_eq!(dropped, want_dropped);
+        assert_eq!(s.price("gold_shut"), case["gold_shut"].as_i64().unwrap());
+        assert_eq!(s.shares_of("gold"), case["gold_shares"].as_i64().unwrap());
+    }
+}
