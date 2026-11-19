@@ -61,7 +61,7 @@ class DiskTest(unittest.TestCase):
             lock.execute("BEGIN EXCLUSIVE")
             await taker.control("mode", "on")
             try:
-                reset = asyncio.ensure_future(taker.reset_settings([]))
+                reset = asyncio.ensure_future(taker.reset_settings(None))
                 await asyncio.sleep(0.2)
                 self.assertEqual(taker.settings.price("gold_shut"), 58)
                 stop = asyncio.ensure_future(taker.control("mode", "paper"))
@@ -91,7 +91,7 @@ class DiskTest(unittest.TestCase):
                 self.assertEqual((answer["ok"], answer.get("applied")), (False, True))  # never "ok": the page shows what is in force
                 self.assertIn("还没写进数据库", answer["message"])
                 self.assertEqual(taker.settings.shares_of("oil"), 30)
-                _, _, body = await server.route("POST", "/api/settings", {}, {"x-rt": "1"}, b'{"reset":[]}')
+                _, _, body = await server.route("POST", "/api/settings", {}, {"x-rt": "1"}, b'{"reset":"all"}')
                 answer = json.loads(body)
                 self.assertEqual((answer["ok"], answer.get("applied")), (False, True))
                 self.assertIn("回到网页保存的值", answer["message"])

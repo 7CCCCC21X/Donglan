@@ -73,6 +73,7 @@ pub const FOLLOW_EVERY_MS: i64 = 1_000;
 pub const UNKNOWN_EVERY_MS: i64 = 10_000;
 pub const GIVE_UP_MS: i64 = 15 * 60_000;
 pub const REJECT_PAUSE_MS: i64 = 30_000;
+pub const CONNECT_RETRY_MS: i64 = 2_000; // an order that got no connection (nothing sent): the window looks again this soon
 pub const MAX_REJECTS: usize = 5;
 pub const SETTLE_AFTER_MS: i64 = 120_000;
 pub const SETTLE_EVERY_MS: i64 = 60_000;
@@ -204,6 +205,8 @@ pub struct Taker {
     pub telegram: Option<Rc<Telegram>>,
     pub paused: String,
     pub loss_floor_at: Obj,
+    /// The day the loss stop was reached on ({"day", "pnl", "floor", "at"}): it holds that whole day (control:loss_stop).
+    pub loss_stop: Obj,
     pub ready_error: String,
     pub account_checked: bool,
     pub account_error: String,
@@ -338,6 +341,7 @@ impl Taker {
         let stream = stream.unwrap_or_else(|| Rc::new(BookStream::new(&config.api_key, config.ws_connections)));
         let paused = store.get_str("control:paused");
         let loss_floor_at = store.get("control:loss_floor").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        let loss_stop = store.get("control:loss_stop").and_then(|v| v.as_object().cloned()).unwrap_or_default();
         let account_checked = !wallet.as_ref().map(|w| !w.predict_account.is_empty()).unwrap_or(false);
         let recs: Recs = store
             .take_prefix(PREFIX)
@@ -364,6 +368,7 @@ impl Taker {
             telegram,
             paused,
             loss_floor_at,
+            loss_stop,
             ready_error: "尚未登录 Predict".into(),
             account_checked,
             account_error: String::new(),
@@ -506,9 +511,10 @@ impl Taker {
         self.api.cooling()
     }
 
-    /// The USDT this taker may still spend: the balance last read on-chain, less what the real orders placed since just before
-    /// that read began may have spent (at their price for an order whose word is final, at their limit in full for one that is
-    /// not). None before a read. ``excluding``: the hash of an order not to count.
+    /// The USDT this taker may still spend: the balance last read on-chain, less what that read could not have seen — an
+    /// order placed, or filled, since just before the read began: its fills at their price once its word is final, its limit
+    /// in full while not; any other order not final yet: its unfilled rest at its limit (resting, or its answer lost: it may
+    /// still take the money, whatever its age). None before a read. ``excluding``: the hash of an order not to count.
     pub fn usd(&self, excluding: Option<&str>) -> Option<f64> {
         let usdt = self.usdt?;
         let since = self.balance_asked_ms - BALANCE_LAG_MS;
@@ -518,15 +524,16 @@ impl Taker {
                 continue;
             }
             for o in rec_orders(rec) {
-                if excluding.is_some_and(|h| !h.is_empty() && o.sv("hash") == h)
-                    || o.t("paper")
-                    || never_placed(o.state())
-                    || o.i("at") < since
-                {
+                if excluding.is_some_and(|h| !h.is_empty() && o.sv("hash") == h) || o.t("paper") || never_placed(o.state()) {
                     continue;
                 }
-                spent +=
-                    if is_final(o.state()) { o.f("filled") * crate::rules::order_avg(o) } else { o.f("shares") * o.f("limit") };
+                let unseen = o.i("at") >= since || o.i("filled_ms") >= since;
+                spent += match (is_final(o.state()), unseen) {
+                    (true, true) => o.f("filled") * crate::rules::order_avg(o),
+                    (true, false) => 0.0,
+                    (false, true) => o.f("shares") * o.f("limit"),
+                    (false, false) => (o.f("shares") - o.f("filled")).max(0.0) * o.f("limit"),
+                };
             }
         }
         Some(from_wei(usdt) - spent)
@@ -584,6 +591,45 @@ impl Taker {
         Some(-self.loss_cap)
     }
 
+    /// The day's loss stop, once reached, holds for the rest of the (Beijing) day: a profit settled afterwards does not lift
+    /// it — /resume does (another cap from the P&L then), and the next day. Latched and saved here: where the P&L or the
+    /// floor changes (a settlement, a saved setting) and at every turn.
+    pub fn hold_loss_stop(&mut self) {
+        let Some(floor) = self.loss_floor() else { return };
+        let today = day_of(self.now());
+        if self.loss_stop.s("day") == today {
+            return;
+        }
+        let pnl = self.today_pnl();
+        if pnl <= floor {
+            self.loss_stop = crate::obj! {"day" => today, "pnl" => jf(pnl), "floor" => jf(floor), "at" => self.now()};
+            let saved = Value::Object(self.loss_stop.clone());
+            self.store.put("control:loss_stop", &saved);
+        }
+    }
+
+    /// Why the day's loss stop holds now ("" when it does not): the P&L at the floor, or there earlier today.
+    pub fn loss_stop_why(&self) -> String {
+        let Some(floor) = self.loss_floor() else { return String::new() };
+        let pnl = self.today_pnl();
+        if pnl <= floor {
+            return format!(
+                "今日已结算 {} 已到 RULE_MAX_DAILY_LOSS_USD 的停机线（{}），今天不再开新单",
+                money(pnl),
+                money(floor)
+            );
+        }
+        if self.loss_stop.s("day") == day_of(self.now()) {
+            return format!(
+                "今日已结算到过 RULE_MAX_DAILY_LOSS_USD 的停机线（{}，当时 {}）：之后的盈利不解除，今天不再开新单（现在 {}；/resume 从现在的盈亏起再给一个额度）",
+                money(floor),
+                money(self.loss_stop.f("pnl")),
+                money(pnl)
+            );
+        }
+        String::new()
+    }
+
     /// Why no real order goes out now ("" to send): the mode, the deploy's switch, the pause, the day's loss stop, the
     /// readiness, the records' store, the API's cooldown, the balance (spendable beside ``excluding``).
     pub fn block(&self, usd: f64, excluding: Option<&str>) -> String {
@@ -596,15 +642,9 @@ impl Taker {
         if !self.paused.is_empty() {
             return format!("已暂停（{}）", self.paused);
         }
-        if let Some(floor) = self.loss_floor() {
-            let pnl = self.today_pnl();
-            if pnl <= floor {
-                return format!(
-                    "今日已结算 {} 已到 RULE_MAX_DAILY_LOSS_USD 的停机线（{}），今天不再开新单",
-                    money(pnl),
-                    money(floor)
-                );
-            }
+        let stop = self.loss_stop_why();
+        if !stop.is_empty() {
+            return stop;
         }
         if !self.ready() {
             return format!("真实交易未就绪：{}", self.not_ready_why());
@@ -630,7 +670,7 @@ impl Taker {
         if self.settings.mode != "on" || !self.config.trading_allowed || !self.paused.is_empty() || self.stop.is_set() {
             return true;
         }
-        self.loss_floor().is_some_and(|floor| self.today_pnl() <= floor)
+        !self.loss_stop_why().is_empty()
     }
 
     /// Judged right before an order's bytes go out: the gates again, the settings the look decided under, the window's start

@@ -46,6 +46,10 @@ class FakeApi:
         self.create_delay = 0.0
         self.connect_delay = 0.0   # a new connection's handshake before the bytes go (the order judged again after it)
         self.lose_answer = False   # the order lands, its answer is lost on the way (a timeout)
+        self.refuse_connect = False  # no connection to be had: an order's request never leaves (as http.request tells it)
+        self.clock: Any = None       # the taker's clock, moved on by book_ms while a REST book read is out
+        self.book_ms = 0
+        self.order_reads: list[str] = []  # GET /orders/{hash}, one answer each in turn: "" as it stands, "timeout" lost
         self.jwt_ok = True
         self.stream: Any = None
         self.pre_send: Any = None
@@ -80,6 +84,8 @@ class FakeApi:
 
     async def orderbook(self, mid: str) -> tuple:
         self.calls.append(("book", mid))
+        if self.clock is not None:
+            self.clock.ms += self.book_ms  # (the read took that long)
         if mid not in self.books and self.stream is not None and mid in self.stream.last:
             return self.stream.last[mid]  # (Predict's book is the one it last pushed)
         return self.books.get(mid, ((), ()))
@@ -91,6 +97,9 @@ class FakeApi:
             await self.pre_send()  # (whatever the request waited for before its bytes left: a token, a slot, a sign-in)
         if check and self.before_send is not None and (why := self.before_send(check)):
             raise NotSent(why)
+        if self.refuse_connect:
+            from ruletaker.http import NOT_CONNECTED
+            raise NotSent(f"{NOT_CONNECTED}（网络错误 (ConnectionRefusedError: refused)），请求没有发出")
         if self.connect_delay:  # (no warm connection: the handshake, then the gate once more — as http.request does)
             await asyncio.sleep(self.connect_delay)
             if check and self.before_send is not None and (why := self.before_send(check)):
@@ -124,6 +133,8 @@ class FakeApi:
 
     async def order(self, oid: str, hash_: str = "") -> dict | None:
         self.calls.append(("order", hash_))
+        if self.order_reads and self.order_reads.pop(0) == "timeout":
+            raise RemoteError("网络错误 (TimeoutError: timed out)")
         row = self.orders.get(hash_.lower())
         return dict(row) if row else None
 
@@ -196,7 +207,7 @@ def make_taker(clock_ms: int, store: Any = None, journal: bool = False, **env: s
         else:
             store = Store(":memory:")
     api, chain, stream, clock = FakeApi(), FakeChain(), QuietStream(), Clock(clock_ms)
-    api.stream = stream
+    api.stream, api.clock = stream, clock
     taker = RuleTaker(config, store, api=api, chain=chain, stream=stream, clock=clock)
     taker.ready_error = ""
     taker.usdt, taker.balance_asked_ms = chain.usdt, clock_ms - 60_000  # (the balance read a minute before the test begins)

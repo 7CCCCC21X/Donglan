@@ -34,6 +34,7 @@ SECRET_HEADERS = frozenset({"authorization", "x-api-key", "cookie", "proxy-autho
 HTTP_HINTS = {451: "部署所在地或接口访问受限；请核对官方地区规则", 403: "访问被拒绝；请核对权限与服务地区",
               418: "接口暂时封禁；停止高频请求并等待解除", 429: "接口限流，等待后重试"}
 
+NOT_CONNECTED = "连接没建立"  # how a request that never got a connection is told: nothing of it went out (an order may go again)
 _POOL: dict[tuple[str, int], list[tuple[Any, float]]] = {}
 _POOL_LOCK = threading.Lock()
 HTTP_STATS = {"new": 0, "reused": 0, "retried": 0}
@@ -194,11 +195,19 @@ def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str,
         max_idle = KEEPALIVE_POST_IDLE_SECONDS if data is not None else KEEPALIVE_IDLE_SECONDS
         while True:
             conn, reused = _pool_take(host, port, timeout, max_idle)
-            try:
-                if not reused and callable(getattr(conn, "connect", None)):
-                    began = time.perf_counter()
+            if not reused and callable(getattr(conn, "connect", None)):
+                began = time.perf_counter()
+                try:
                     conn.connect()
-                    http_net(host)["connect"].append((time.perf_counter() - began) * 1000)
+                except (OSError, http.client.HTTPException) as error:
+                    # no connection (refused, unreachable, the TLS handshake failed or timed out): not a byte of the request
+                    # was written — a POST is told as not sent, so an order that never left holds nothing
+                    conn.close()
+                    if data is not None:
+                        raise NotSent(f"{NOT_CONNECTED}（{_net_error(error)}），请求没有发出") from None
+                    raise _net_error(error) from None
+                http_net(host)["connect"].append((time.perf_counter() - began) * 1000)
+            try:
                 if gate is not None and (waited or not reused) and (why := gate()):
                     _pool_put(host, port, conn)  # (untouched by this request: kept for the next one)
                     raise NotSent(why)

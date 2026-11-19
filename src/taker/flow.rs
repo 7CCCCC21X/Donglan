@@ -713,6 +713,7 @@ pub async fn turn(me: &Me) {
     let (order, warm) = {
         let mut t = me.borrow_mut();
         t.ticks += 1;
+        t.hold_loss_stop();
         let now = t.now();
         if now - t.planned_ms >= PLAN_EVERY_MS {
             t.plan(now);

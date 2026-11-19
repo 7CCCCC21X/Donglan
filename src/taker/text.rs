@@ -299,7 +299,12 @@ impl Taker {
             );
         }
         if let Some(floor) = self.loss_floor() {
-            head += &format!("｜日亏损停机线 {}（今天已结算 {}）", money(floor), money(day_pnl(recs, &today)));
+            head += &format!(
+                "｜日亏损停机线 {}（今天已结算 {}{}）",
+                money(floor),
+                money(day_pnl(recs, &today)),
+                if self.loss_stop_why().is_empty() { "" } else { "，今天已停机：/resume 解除" }
+            );
         }
         let error = self.stream.error();
         head += &format!(

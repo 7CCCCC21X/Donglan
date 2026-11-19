@@ -189,13 +189,12 @@ pub async fn route(
             }
         }
         "/api/settings" => {
-            if data.contains_key("reset") {
-                let keys: Vec<String> = data
-                    .get("reset")
-                    .and_then(Value::as_array)
-                    .map(|a| a.iter().map(crate::util::py_str).collect())
-                    .unwrap_or_default();
-                control::reset_settings(me, &keys).await
+            if let Some(reset) = data.get("reset") {
+                match reset_keys(reset) {
+                    Ok(None) => control::reset_settings(me, None).await,
+                    Ok(Some(keys)) => control::reset_settings(me, Some(&keys)).await,
+                    Err(why) => return json_reply(400, json!({"ok": false, "message": why})),
+                }
             } else {
                 match data.get("values").and_then(Value::as_object) {
                     Some(values) if !values.is_empty() => control::save_settings(me, values).await,
@@ -210,6 +209,27 @@ pub async fn route(
         // (in force, not on disk: never told as saved — "applied" lets the page show the values in force)
         control::SaveResult::NotOnDisk(message) => json_reply(200, json!({"ok": false, "applied": true, "message": message})),
         control::SaveResult::Refused(message) => json_reply(200, json!({"ok": false, "message": message})),
+    }
+}
+
+/// The fields a reset names: "all" (every one the page saved), or a list of the page's field names — anything else (a
+/// bare name, an empty list, a name the page has not) is refused, never read as "all".
+fn reset_keys(reset: &Value) -> Result<Option<Vec<String>>, String> {
+    const HOW: &str = "reset 要写成字段名的数组（例如 [\"RULE_GOLD_SHUT_CENTS\"]），全部恢复写 \"all\"";
+    match reset {
+        Value::String(s) if s == "all" => Ok(None),
+        Value::Array(items) if !items.is_empty() => {
+            let mut keys = vec![];
+            for item in items {
+                let Some(key) = item.as_str() else { return Err(HOW.into()) };
+                if crate::console::field(key).is_none() {
+                    return Err(format!("{key} 不是控制台的设置项"));
+                }
+                keys.push(key.to_string());
+            }
+            Ok(Some(keys))
+        }
+        _ => Err(HOW.into()),
     }
 }
 

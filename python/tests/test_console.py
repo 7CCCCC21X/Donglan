@@ -58,7 +58,7 @@ class SettingsTest(unittest.TestCase):
             self.assertIn("恢复", msg)
             self.assertEqual(again.settings.price("gold_shut"), 58)
             self.assertEqual(again.loss_cap, 150)
-            await again.reset_settings([])
+            await again.reset_settings(None)
             self.assertEqual(again.loss_cap, 0)
         run(go())
 

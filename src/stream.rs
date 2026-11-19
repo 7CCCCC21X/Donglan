@@ -91,7 +91,9 @@ pub struct BookStream {
     pub url: String,
     pub wanted: RefCell<BTreeSet<String>>,
     pub books: RefCell<HashMap<String, Book>>,
-    versions: RefCell<HashMap<String, i64>>,
+    /// market id -> the version and the server's update time (updateTimestampMs, 0 when absent) of the book applied last —
+    /// shared by the connections: a frame older than it is dropped, whichever connection brings it
+    versions: RefCell<HashMap<String, (i64, i64)>>,
     /// markets whose book changed since the taker last looked
     pub changed: RefCell<HashSet<String>>,
     pub arrivals: Cell<u64>,
@@ -242,11 +244,18 @@ impl BookStream {
         }
         if let Some(version) = data.get("version").filter(|v| v.is_number()) {
             let v = version.as_f64().unwrap_or(0.0);
+            let wall = now_ms();
+            let stamp = data.get("updateTimestampMs").and_then(Value::as_f64).unwrap_or(0.0);
+            let stamp = if stamp > 0.0 && stamp <= (wall + 60_000) as f64 { stamp as i64 } else { 0 };
             let mut versions = self.versions.borrow_mut();
-            if v < *versions.get(mid).unwrap_or(&-1) as f64 {
-                return;
+            if let Some(&(held, held_stamp)) = versions.get(mid) {
+                // older than the book in hand: dropped — unless the server's own clock says it is the newer (its counter
+                // started over: a restarted book), which a version alone cannot tell
+                if v < held as f64 && !(stamp > 0 && held_stamp > 0 && stamp > held_stamp) {
+                    return;
+                }
             }
-            versions.insert(mid.to_string(), v as i64);
+            versions.insert(mid.to_string(), (v as i64, stamp));
         }
         let changed = {
             let mut books = self.books.borrow_mut();
@@ -333,12 +342,7 @@ impl BookStream {
                 }
             };
             let since = mono();
-            c.last_frame.set(since);
-            c.connected.set(true);
-            c.connects.set(c.connects.get() + 1);
-            c.subscribed.borrow_mut().clear();
-            c.pending.borrow_mut().clear();
-            self.versions.borrow_mut().clear(); // (a fresh connection's snapshot starts the versions over)
+            self.connected_anew(n);
             let why = self.session(n, ws).await;
             c.connected.set(false);
             let gone: Vec<String> = std::mem::take(&mut *c.subscribed.borrow_mut()).into_iter().collect();
@@ -353,6 +357,18 @@ impl BookStream {
             c.backoff.set(if mono() - since >= 60.0 { Self::BACKOFF.0 } else { (c.backoff.get() * 2.0).min(Self::BACKOFF.1) });
             self.pause(c.backoff.get()).await;
         }
+    }
+
+    /// Connection ``n`` (re)opened: its own subscriptions start over. The versions stay — another connection may be
+    /// serving the same markets, and a frame older than the book it brought must never replace it (a market no connection
+    /// serves any more was forgotten when its last one went).
+    fn connected_anew(&self, n: usize) {
+        let c = &self.conns[n];
+        c.last_frame.set(mono());
+        c.connected.set(true);
+        c.connects.set(c.connects.get() + 1);
+        c.subscribed.borrow_mut().clear();
+        c.pending.borrow_mut().clear();
     }
 
     async fn pause(&self, seconds: f64) {
@@ -534,5 +550,24 @@ mod tests {
         assert!(s.held("8").is_none());
         assert!(!s.merge("7", (*bids).clone(), (*asks).clone(), mono()));
         assert_eq!(told.get(), 2);
+    }
+
+    #[test]
+    fn a_connection_coming_back_never_lets_an_older_book_in() {
+        let s = BookStream::new("", 2);
+        s.fake_alive.set(Some(true));
+        s.want(&["7".to_string()].into_iter().collect());
+        s.conns[0].subscribed.borrow_mut().insert("7".into()); // connection 0 serves it
+        let now = now_ms();
+        s.take("7", &json!({"version": 102, "asks": [[0.60, 10]], "updateTimestampMs": now - 5}));
+        s.connected_anew(1); // connection 1 comes back...
+        s.take("7", &json!({"version": 101, "asks": [[0.55, 10]], "updateTimestampMs": now - 50})); // ...an older book arrives
+        assert_eq!(s.book("7").unwrap().1[0].0.to_string(), "0.6");
+        // a book whose counter started over (restarted): the server's own later clock lets it in
+        s.take("7", &json!({"version": 3, "asks": [[0.62, 10]], "updateTimestampMs": now + 10}));
+        assert_eq!(s.book("7").unwrap().1[0].0.to_string(), "0.62");
+        // without a stamp the version alone decides
+        s.take("7", &json!({"version": 2, "asks": [[0.50, 10]]}));
+        assert_eq!(s.book("7").unwrap().1[0].0.to_string(), "0.62");
     }
 }

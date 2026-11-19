@@ -543,6 +543,11 @@ pub async fn look(me: &Me, slug: &str, w: &W) -> Res<()> {
         let now = t.now();
         let pace = t.rush_pace();
         let mut b = w.borrow_mut();
+        if t.phase(&b, now) != if course { "live" } else { "before" } {
+            // (the book's read took that long: past the line no real order goes out, so no paper one is recorded either)
+            b.word = "开场前 15 秒（盘中：结束前 15 秒）已到，这一轮不下单也不记录".into();
+            return Ok(());
+        }
         let there = total(&levels);
         if b.open_ms == 0 {
             let status = b.market.as_ref().map(|m| m.s("tradingStatus")).filter(|s| !s.is_empty()).unwrap_or_else(|| "?".into());
@@ -938,7 +943,9 @@ pub async fn send_order(
         let mut b = w.borrow_mut();
         let held_back = state_now == "not_sent" && RECHECKED.iter().any(|p| order.s("error").starts_with(p));
         b.held_back = if held_back { b.held_back + 1 } else { 0 };
-        if !held_back || b.held_back >= HELD_BACK_MAX {
+        if state_now == "not_sent" && order.s("error").starts_with(crate::http::NOT_CONNECTED) {
+            b.look_ms = t.now() + CONNECT_RETRY_MS; // (the network: tried again in a moment, never hammered)
+        } else if !held_back || b.held_back >= HELD_BACK_MAX {
             b.held_back = 0;
             b.look_ms = t.now() + REJECT_PAUSE_MS;
         } else {

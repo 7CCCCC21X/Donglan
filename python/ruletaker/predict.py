@@ -337,7 +337,9 @@ class PredictApi:
         return {"removed": [str(i) for i in (data.get("removed") or [])], "noop": [str(i) for i in (data.get("noop") or [])]}
 
     async def order(self, order_id: str, hash_: str = "") -> dict | None:
-        """One order, open or closed, by its hash (GET /orders/{hash}); None when Predict knows nothing of it (404)."""
+        """One order, open or closed, by its hash (GET /orders/{hash}); None when Predict knows nothing of it (404). An answer
+        with no order in it (an empty body, ``{}``) is None only for an order Predict never gave an id to: one it did is there,
+        and such an answer says nothing of it — an error, read again later (its fills are never closed on it)."""
         if not hash_:
             return None
         try:
@@ -349,7 +351,11 @@ class PredictApi:
         row = data.get("data", data) if isinstance(data, dict) else None
         if isinstance(row, list):
             row = next((r for r in row if isinstance(r, dict) and (order_hash_of(r) == hash_.lower() or (order_id and str(r.get("id")) == str(order_id)))), None)
-        return row if isinstance(row, dict) and (row.get("id") is not None or row.get("order") or row.get("status")) else None
+        if isinstance(row, dict) and (row.get("id") is not None or row.get("order") or row.get("status")):
+            return row
+        if order_id:
+            raise RemoteError(f"查单应答里没有订单 #{order_id} 的内容（不是 404）：过一会儿再查")
+        return None
 
 
 async def category_market(api: PredictApi, slug: str) -> dict | None:

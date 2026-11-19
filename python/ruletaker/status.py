@@ -8,7 +8,7 @@
   GET  /api/review?days=30 the review page's data (7 / 30 / 90 / all)
   GET  /api/records.csv    every order of every window
   POST /api/control        {"action": "pause" | "resume" | "mode" | "withdraw" | "check"（自检） | "test"（挂单测试）, "arg": ...}
-  POST /api/settings       {"values": {"RULE_GOLD_SHUT_CENTS": "60", ...}} or {"reset": ["RULE_…"] (empty: all)}
+  POST /api/settings       {"values": {"RULE_GOLD_SHUT_CENTS": "60", ...}} or {"reset": ["RULE_…", ...]} or {"reset": "all"}
   POST /pause  /resume  /mode?to=off|paper|on   (rt.sh)
 
 With STATUS_KEY set every path but / and /healthz needs it (?key=… or the X-Status-Key header). Every POST also needs the header
@@ -25,10 +25,25 @@ import os
 import urllib.parse
 from typing import Any
 
+from . import console
 from .util import LOG, NotOnDisk, clean_error
 
 PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "console.html")
 MAX_BODY = 65_536
+
+
+def reset_keys(reset: Any) -> list[str] | None | str:
+    """The fields a reset names: "all" -> None (every one the page saved), a list of the page's field names -> that list;
+    anything else (a bare name, an empty list, a name the page has not) -> why it is refused (a str), never "all"."""
+    how = 'reset 要写成字段名的数组（例如 ["RULE_GOLD_SHUT_CENTS"]），全部恢复写 "all"'
+    if reset == "all":
+        return None
+    if not isinstance(reset, list) or not reset or not all(isinstance(k, str) for k in reset):
+        return how
+    for key in reset:
+        if key not in console.FIELDS:
+            return f"{key} 不是控制台的设置项"
+    return list(reset)
 
 
 class StatusServer:
@@ -137,7 +152,10 @@ class StatusServer:
                     return 400, js, json.dumps({"ok": False, "message": f"不认识的操作：{action}"}, ensure_ascii=False)
             elif path == "/api/settings":
                 if "reset" in data:
-                    message = await self.taker.reset_settings([str(k) for k in data.get("reset") or []])
+                    keys = reset_keys(data["reset"])
+                    if isinstance(keys, str):  # (refused: never read as "all")
+                        return 400, js, json.dumps({"ok": False, "message": keys}, ensure_ascii=False)
+                    message = await self.taker.reset_settings(keys)
                 else:
                     values = data.get("values")
                     if not isinstance(values, dict) or not values:

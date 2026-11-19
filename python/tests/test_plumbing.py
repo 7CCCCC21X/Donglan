@@ -107,7 +107,8 @@ class FakeConn:
         FakeConn.made.append(self)
 
     def connect(self) -> None:
-        pass
+        if self.mode == "connect-fail":
+            raise ConnectionRefusedError("refused")
 
     def request(self, method: str, path: str, body: bytes | None = None, headers: dict | None = None) -> None:
         self.requests.append((method, path, body, headers))
@@ -177,6 +178,15 @@ class HttpTest(unittest.TestCase):
         self.assertEqual((len(dead.requests), warm.requests), (1, []))
         # a GET has no gate: as before
         self.assertEqual(nethttp.request("https://api.predict.fun/v1/x"), b'{"ok": 1}')
+
+    def test_a_post_that_got_no_connection_is_not_sent(self) -> None:
+        FakeConn.script = ["connect-fail", "connect-fail"]
+        with self.assertRaises(NotSent) as caught:  # not a byte of it written: an order that never left
+            nethttp.request("https://api.predict.fun/v1/orders", b"{}")
+        self.assertTrue(str(caught.exception).startswith(nethttp.NOT_CONNECTED), caught.exception)
+        with self.assertRaises(RemoteError) as caught:  # a read: as before
+            nethttp.request("https://api.predict.fun/v1/x")
+        self.assertNotIsInstance(caught.exception, NotSent)
 
     def test_post_on_a_stale_connection_gets_a_fresh_one(self) -> None:
         nethttp.request("https://api.predict.fun/v1/x")

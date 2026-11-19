@@ -77,6 +77,7 @@ FOLLOW_EVERY_MS = 1_000
 UNKNOWN_EVERY_MS = 10_000
 GIVE_UP_MS = 15 * 60_000
 REJECT_PAUSE_MS = 30_000
+CONNECT_RETRY_MS = 2_000      # an order that got no connection (nothing sent): the window looks again this soon
 MAX_REJECTS = 5
 SETTLE_AFTER_MS = 120_000
 SETTLE_EVERY_MS = 60_000
@@ -177,6 +178,8 @@ class RuleTaker:
         self.paused = str(store.get("control:paused") or "")
         floor = store.get("control:loss_floor")
         self.loss_floor_at = floor if isinstance(floor, dict) else {}
+        stop = store.get("control:loss_stop")
+        self.loss_stop = stop if isinstance(stop, dict) else {}  # the day the loss stop was reached: it holds that whole day
         # readiness (real orders): the sign-in, the Predict account's owner on-chain, the balance
         self.ready_error = "尚未登录 Predict"
         self.account_checked = not (self.wallet is not None and self.wallet.predict_account)
@@ -284,10 +287,11 @@ class RuleTaker:
         return float(getattr(self.api, "blocked_until", 0.0)) - time.monotonic()
 
     def usd(self, excluding: dict | None = None) -> float | None:
-        """The USDT this taker may still spend: the balance last read on-chain, less what the real orders placed since just
-        before that read began may have spent (a fill reaches the chain a few seconds after it is matched: BALANCE_LAG_MS) —
-        at their price for an order whose word is final, at their limit in full for one that is not. None before a read.
-        ``excluding``: an order not to count (before_send judges an order against what is left beside it)."""
+        """The USDT this taker may still spend: the balance last read on-chain, less what that read could not have seen (a fill
+        reaches the chain a few seconds after it is matched: BALANCE_LAG_MS) — an order placed, or filled, since just before
+        the read began: its fills at their price once its word is final, its limit in full while not; any other order not
+        final yet: its unfilled rest at its limit (resting, or its answer lost: it may still take the money, whatever its
+        age). None before a read. ``excluding``: an order not to count (before_send judges an order against what is left)."""
         if self.usdt is None:
             return None
         since = self.balance_asked_ms - BALANCE_LAG_MS
@@ -296,10 +300,14 @@ class RuleTaker:
             if rec.get("mode") != "on" or int(rec.get("start_ms") or 0) < since - DAY_MS:
                 continue
             for o in rec.get("orders") or []:
-                if o is excluding or o.get("paper") or o.get("state") in NEVER_PLACED or int(o.get("at") or 0) < since:
+                if o is excluding or o.get("paper") or o.get("state") in NEVER_PLACED:
                     continue
-                spent += (float(o.get("filled") or 0) * float(o.get("avg") or o.get("limit") or 0) if o.get("state") in FINAL_STATES
-                          else float(o.get("shares") or 0) * float(o.get("limit") or 0))
+                unseen = int(o.get("at") or 0) >= since or int(o.get("filled_ms") or 0) >= since
+                shares, done, limit = float(o.get("shares") or 0), float(o.get("filled") or 0), float(o.get("limit") or 0)
+                if o.get("state") in FINAL_STATES:
+                    spent += done * float(o.get("avg") or o.get("limit") or 0) if unseen else 0.0
+                else:
+                    spent += shares * limit if unseen else max(shares - done, 0.0) * limit
         return from_wei(self.usdt) - spent
 
     @property
@@ -336,6 +344,34 @@ class RuleTaker:
             return float(self.loss_floor_at.get("floor") or -cap)
         return -cap
 
+    def hold_loss_stop(self) -> None:
+        """The day's loss stop, once reached, holds for the rest of the (Beijing) day: a profit settled afterwards does not lift
+        it — /resume does (another cap from the P&L then), and the next day. Latched and saved here: where the P&L or the
+        floor changes (a settlement, a saved setting) and at every turn."""
+        floor = self.loss_floor()
+        if floor is None:
+            return
+        today = day_of(self.now())
+        if self.loss_stop.get("day") == today:
+            return
+        pnl = self.today_pnl()
+        if pnl <= floor:
+            self.loss_stop = {"day": today, "pnl": pnl, "floor": floor, "at": self.now()}
+            self.store.put("control:loss_stop", self.loss_stop)
+
+    def loss_stop_why(self) -> str:
+        """Why the day's loss stop holds now ("" when it does not): the P&L at the floor, or there earlier today."""
+        floor = self.loss_floor()
+        if floor is None:
+            return ""
+        pnl = self.today_pnl()
+        if pnl <= floor:
+            return f"今日已结算 {money(pnl)} 已到 RULE_MAX_DAILY_LOSS_USD 的停机线（{money(floor)}），今天不再开新单"
+        if self.loss_stop.get("day") == day_of(self.now()):
+            return (f"今日已结算到过 RULE_MAX_DAILY_LOSS_USD 的停机线（{money(floor)}，当时 {money(float(self.loss_stop.get('pnl') or 0))}）："
+                    f"之后的盈利不解除，今天不再开新单（现在 {money(pnl)}；/resume 从现在的盈亏起再给一个额度）")
+        return ""
+
     def block(self, usd: float, excluding: dict | None = None) -> str:
         """Why no real order goes out now ("" to send): the mode, the deploy's switch, the pause, the day's loss stop, the
         readiness, the records' store, the API's cooldown, the balance (spendable beside ``excluding``)."""
@@ -345,11 +381,8 @@ class RuleTaker:
             return "部署变量 LIVE_TRADING_ALLOWED 不是 on，不下单"
         if self.paused:
             return f"已暂停（{self.paused}）"
-        floor = self.loss_floor()
-        if floor is not None:
-            pnl = self.today_pnl()
-            if pnl <= floor:
-                return f"今日已结算 {money(pnl)} 已到 RULE_MAX_DAILY_LOSS_USD 的停机线（{money(floor)}），今天不再开新单"
+        if stop := self.loss_stop_why():
+            return stop
         if not self.ready:
             return f"真实交易未就绪：{self.not_ready_why}"
         if error := str(getattr(self.store, "error", "") or ""):
@@ -366,8 +399,7 @@ class RuleTaker:
         pause, the loss stop, the process ending."""
         if self.settings.mode != "on" or not self.config.trading_allowed or self.paused or self.stop.is_set():
             return True
-        floor = self.loss_floor()
-        return floor is not None and self.today_pnl() <= floor
+        return bool(self.loss_stop_why())
 
     def before_send(self, digest: str) -> str:
         """Judged right before an order's bytes go out: the gates again, the settings the look decided under, the window's start
@@ -661,6 +693,7 @@ class RuleTaker:
         """One tick's work: the plan, the pace, the looks that are due, a REST read beside the pushes, the orders signed
         beforehand, the follow-ups and the results."""
         self.ticks += 1
+        self.hold_loss_stop()
         now = self.now()
         if now - self.planned_ms >= PLAN_EVERY_MS:
             self.plan(now)
@@ -1218,6 +1251,10 @@ class RuleTaker:
                 w["word"] = (f"盘口已有 ≤{int(limit * 100)}¢ 的{rule.word} {sum(q for _, q in levels):g} 份，等撮合开启就买"
                              f"（现在 {w['market'].get('tradingStatus') or '?'}" + (f"，每 {self.rush_pace():g} 秒读一次状态" if self.rushing(w) else "") + "）")
                 return
+        if self.phase(w, self.now()) != ("live" if course else "before"):
+            # (the book's read took that long: past the line no real order goes out, so no paper one is recorded either)
+            w["word"] = "开场前 15 秒（盘中：结束前 15 秒）已到，这一轮不下单也不记录"
+            return
         size = self.settings.shares_of(rule.market)
         room = D(str(size)) - D(str(held(rec) if rec else 0.0))
         there = sum(q for _, q in levels)
@@ -1535,7 +1572,9 @@ class RuleTaker:
             self.note(f"{rec['name']} 没下成：{order.get('error') or order['state']}")
             held_back = order["state"] == "not_sent" and str(order.get("error") or "").startswith(RECHECKED)
             w["held_back"] = int(w.get("held_back") or 0) + 1 if held_back else 0
-            if not held_back or w["held_back"] >= HELD_BACK_MAX:
+            if order["state"] == "not_sent" and str(order.get("error") or "").startswith(nethttp.NOT_CONNECTED):
+                w["look_ms"] = self.now() + CONNECT_RETRY_MS  # (the network: tried again in a moment, never hammered)
+            elif not held_back or w["held_back"] >= HELD_BACK_MAX:
                 w["held_back"] = 0
                 w["look_ms"] = self.now() + REJECT_PAUSE_MS
             else:
@@ -1747,6 +1786,7 @@ class RuleTaker:
         before = float(order.get("filled") or 0)
         if shares > before + DUST:
             order["filled"] = shares
+            order["filled_ms"] = self.now()  # (the balance read before this cannot have seen it)
             self.balance_ms = 0  # (the balance read again at once: the fill spent it)
             avg = float(order.get("avg") or order["limit"])
             rule = RULE_OF.get(rec.get("rule"))
@@ -1793,6 +1833,7 @@ class RuleTaker:
                                                    if rec.get("mode") == "on" and pay > 0 else ""))
             floor = self.loss_floor()
             if rec.get("mode") == "on" and floor is not None and day_pnl(self.recs, day_of(now)) <= floor:
+                self.hold_loss_stop()
                 self.alarm(f"⛔ 规则吃单今日已结算 {money(day_pnl(self.recs, day_of(now)))}，到了 RULE_MAX_DAILY_LOSS_USD 的停机线：今天不再开新单（明天自动恢复；/resume 从现在的盈亏起再给一个额度）")
 
     # -- the operator --
@@ -1815,7 +1856,11 @@ class RuleTaker:
                 parts.append("暂停已解除")
             floor = self.loss_floor()
             pnl = day_pnl(self.recs, day_of(self.now()))
-            if floor is not None and pnl <= floor:
+            held = self.loss_stop.get("day") == day_of(self.now())
+            if held:  # (the day's stop, held since it was reached: lifted — another cap from the P&L now)
+                self.loss_stop = {}
+                self.store.put("control:loss_stop", {})
+            if floor is not None and (pnl <= floor or held):
                 self.loss_floor_at = {"day": day_of(self.now()), "floor": pnl - self.loss_cap}
                 self.store.put("control:loss_floor", self.loss_floor_at)
                 parts.append(f"今日停机线移到 {money(self.loss_floor_at['floor'])}（从现在的 {money(pnl)} 起再亏 ${self.loss_cap:g} 再停）")
@@ -1878,8 +1923,8 @@ class RuleTaker:
         live = s.mode == "on"
         if live and not self.config.trading_allowed:
             no("LIVE_TRADING_ALLOWED 不是 on：真实吃单模式也不会下单")
-        if live and floor is not None and self.today_pnl() <= floor:
-            no(f"今天已到日亏损停机线 {money(floor)}：今天不再开新单（/resume 从现在的盈亏起再给一个额度）")
+        if live and floor is not None and self.loss_stop_why():
+            no(f"今天已到过日亏损停机线 {money(floor)}：今天不再开新单（/resume 从现在的盈亏起再给一个额度）")
         if self.wallet is None:
             (no if live else warn)("没有设置 PREDICT_PRIVATE_KEY：只能 off / paper")
         else:
@@ -2085,9 +2130,11 @@ class RuleTaker:
                     return "\n".join(lines)
                 lines.append(f"1/4 按哈希找到了：订单 #{oid}（Predict 收下了，只是应答没送到）")
             began = time.perf_counter()
+            filled_seen = 0.0  # (fills only grow: the most any step read is the order's)
             try:
                 row = await self.api.order(oid, digest)
                 filled_now, status = order_fill(row, float(shares)) if row else (0.0, "")
+                filled_seen = filled_now
                 lines.append(f"2/4 按哈希查到：{status or '?'}，成交 {filled_now:g}/{shares:g}（往返 {(time.perf_counter() - began) * 1000:.0f} ms）" if row
                              else f"2/4 按哈希暂时查不到（往返 {(time.perf_counter() - began) * 1000:.0f} ms）：Predict 的记录可能晚一点出现")
             except Exception as error:
@@ -2100,16 +2147,25 @@ class RuleTaker:
                 lines.append(("3/4 撤单成功" if removed else "3/4 撤单请求发出，Predict 的应答里没有它") + f"（往返 {(time.perf_counter() - began) * 1000:.0f} ms）")
             except Exception as error:
                 lines.append(f"3/4 撤单失败：{clean_error(error) or type(error).__name__}（它 {self.TEST_SECONDS // 60} 分钟后自己过期）")
-            filled_end = 0.0
+            def spent(n: float) -> str:
+                return f"（花了约 ${n * float(price):.2f}，这几份照常结算）" if n > DUST else ""
+            final_read = False
             try:
                 row = await self.api.order(oid, digest)
-                filled_end, status = order_fill(row, float(shares)) if row else (0.0, "")
-                lines.append(f"4/4 最终状态：{status or '查不到'}，成交 {filled_end:g} 份" + (f"（花了约 ${filled_end * float(price):.2f}，这几份照常结算）" if filled_end > DUST else ""))
+                if row:
+                    got, status = order_fill(row, float(shares))
+                    filled_seen, final_read = max(filled_seen, got), True
+                    lines.append(f"4/4 最终状态：{status or '?'}，成交 {filled_seen:g} 份" + spent(filled_seen))
+                else:
+                    lines.append(f"4/4 最终状态暂时查不到：成交按前面查到的 {filled_seen:g} 份记" + spent(filled_seen))
             except Exception as error:
-                lines.append(f"4/4 最终状态没读到：{clean_error(error) or type(error).__name__}")
-            lines.append("结论：" + ("✅ 下单、查询、撤单都正常：签名、授权、这个区域都没问题，可以真实吃单" if removed
-                                  else "⚠️ 下单成功但撤单没确认：到 Predict 网站看一下这张单（10 分钟后自己过期）"))
-            self.store.put(f"test:{digest.lower()}", {**record, "steps": lines, "order_id": oid, "removed": removed, "filled": filled_end})
+                lines.append(f"4/4 最终状态没读到：{clean_error(error) or type(error).__name__}——成交按前面查到的 {filled_seen:g} 份记" + spent(filled_seen))
+            lines.append("结论：" + ("⚠️ 下单成功但撤单没确认：到 Predict 网站看一下这张单（10 分钟后自己过期）" if not removed
+                                  else "⚠️ 下单、撤单都正常，但最后一次查询没读到这张单的最终状态：成交数以 Predict 网站为准，核对一下" if not final_read
+                                  else "✅ 下单、查询、撤单都正常：签名、授权、这个区域都没问题，可以真实吃单"
+                                  + (f"（这张测试单撤掉前成交了 {filled_seen:g} 份）" if filled_seen > DUST else "")))
+            self.store.put(f"test:{digest.lower()}", {**record, "steps": lines, "order_id": oid, "removed": removed, "filled": filled_seen,
+                                                      "final_read": final_read})
             return "\n".join(lines)
         return "❌ 没找到能做挂单测试的市场（需要撮合已开启、最低卖价高于 1¢）：\n" + "\n".join(tried[:6])
 
@@ -2132,6 +2188,7 @@ class RuleTaker:
         self.saved_settings, self.loss_cap = saved, cap
         self.store.put(console.SAVED, saved)
         self.configure(settings)
+        self.hold_loss_stop()
         names = "、".join(console.FIELDS[k][1] + "＝" + (v or "（空）") for k, v in values.items())
         late = await self.on_disk("设置", "回到改之前的值")
         if late:
@@ -2140,14 +2197,15 @@ class RuleTaker:
         self.notify(f"⚙️ 规则吃单设置已改（控制台）：{names}")
         return f"已保存：{names}"
 
-    async def reset_settings(self, keys: list) -> str:
-        """Back to the settings file's value for these fields (all of them when ``keys`` is empty)."""
-        keys = [k for k in (keys or list(self.saved_settings)) if k in self.saved_settings]
+    async def reset_settings(self, keys: list | None) -> str:
+        """Back to the settings file's value for these fields (``None``: all of them)."""
+        keys = [k for k in (list(self.saved_settings) if keys is None else keys) if k in self.saved_settings]
         saved = {k: v for k, v in self.saved_settings.items() if k not in keys}
         settings, cap = console.build(self.base_env, saved, self.settings.mode)
         self.saved_settings, self.loss_cap = saved, cap
         self.store.put(console.SAVED, saved)
         self.configure(settings)  # (in force at once, as a save is)
+        self.hold_loss_stop()
         reply = "已恢复部署设置：" + ("、".join(console.FIELDS[k][1] for k in keys if k in console.FIELDS) or "（没有网页保存的值）")
         late = await self.on_disk("恢复部署设置", "回到网页保存的值")
         if late:
@@ -2359,7 +2417,8 @@ class RuleTaker:
                  + (f"，运行中调成 {s.mode}" if s.mode != self.env_mode else "") + f"）｜{'开场前吃' if in_course else '只在开场前吃'}，盘口一有就买，到开场前 {STOP_MS // 1000} 秒"
                  + (f"；设了盘中价格的规则开场后接着买（开场 {LIVE_START_MS // 1000} 秒后到结束前 {LIVE_STOP_MS // 1000} 秒，第 1 分钟最高按盘前的价格）" if in_course else "")
                  + (f"｜每天最多花 ${s.max_day_usd:g}（今天已花 ${spent_on(recs, day_of(now), s.mode):,.2f}）" if s.max_day_usd else "")
-                 + (f"｜日亏损停机线 {money(self.loss_floor() or 0)}（今天已结算 {money(day_pnl(recs, day_of(now)))}）" if self.loss_floor() is not None else "")
+                 + (f"｜日亏损停机线 {money(self.loss_floor() or 0)}（今天已结算 {money(day_pnl(recs, day_of(now)))}"
+                    + ("，今天已停机：/resume 解除" if self.loss_stop_why() else "") + "）" if self.loss_floor() is not None else "")
                  + f"｜推送 {'已连接' if self.stream.connected else '未连接' + ('（' + self.stream.error + '）' if self.stream.error else '')}"
                  + (f"｜币安指数 {'已连接' if self.index.ws is not None else '未连接' + ('（' + self.index.error + '）' if self.index.error else '')}" if self.index is not None and in_course else "")]
         if s.mode == "on" and (why := self.block(0.0)):

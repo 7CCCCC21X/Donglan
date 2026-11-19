@@ -92,8 +92,13 @@ fn resume(me: &Me) -> String {
         let floor = t.loss_floor();
         let today = day_of(t.now());
         let pnl = day_pnl(&t.recs, &today);
+        let held = t.loss_stop.s("day") == today;
+        if held {
+            t.loss_stop = Obj::new();
+            t.store.put("control:loss_stop", &json!({}));
+        }
         if let Some(floor) = floor {
-            if pnl <= floor {
+            if pnl <= floor || held {
                 let new_floor = pnl - t.loss_cap;
                 t.loss_floor_at = crate::obj! {"day" => today, "floor" => jf(new_floor)};
                 let saved = Value::Object(t.loss_floor_at.clone());
@@ -174,9 +179,9 @@ pub async fn self_check(me: &Me) -> String {
         )],
         bad: 0,
     };
-    let (floor, today) = {
+    let (floor, today, stop) = {
         let t = me.borrow();
-        (t.loss_floor(), t.today_pnl())
+        (t.loss_floor(), t.today_pnl(), t.loss_stop_why())
     };
     r.lines.push(format!(
         "模式：{}（RULE_TAKER={env_mode}）｜LIVE_TRADING_ALLOWED {}｜{}｜今天已结算 {}{}",
@@ -191,8 +196,8 @@ pub async fn self_check(me: &Me) -> String {
         r.no("LIVE_TRADING_ALLOWED 不是 on：真实吃单模式也不会下单");
     }
     if let Some(f) = floor {
-        if live && today <= f {
-            r.no(format!("今天已到日亏损停机线 {}：今天不再开新单（/resume 从现在的盈亏起再给一个额度）", money(f)));
+        if live && !stop.is_empty() {
+            r.no(format!("今天已到过日亏损停机线 {}：今天不再开新单（/resume 从现在的盈亏起再给一个额度）", money(f)));
         }
     }
     match &wallet {
@@ -613,9 +618,11 @@ pub async fn order_test(me: &Me) -> String {
             }
         };
         let began = mono();
+        let mut filled_seen = 0.0_f64; // (fills only grow: the most any step read is the order's)
         match api.order(&oid, &digest).await {
             Ok(Some(row)) => {
                 let (got, status) = order_fill(&row, shares);
+                filled_seen = got;
                 lines.push(format!(
                     "2/4 按哈希查到：{}，成交 {}/{}（往返 {:.0} ms）",
                     if status.is_empty() { "?" } else { &status },
@@ -641,36 +648,55 @@ pub async fn order_test(me: &Me) -> String {
             }
             Err(e) => lines.push(format!("3/4 撤单失败：{}（它 {} 分钟后自己过期）", clean(&e), TEST_SECONDS / 60)),
         }
-        let mut filled_end = 0.0;
-        match api.order(&oid, &digest).await {
-            Ok(row) => {
-                let (got, status) = row.as_ref().map(|r| order_fill(r, shares)).unwrap_or((0.0, String::new()));
-                filled_end = got;
+        let spent = |n: f64| {
+            if n > crate::util::DUST { format!("（花了约 ${:.2}，这几份照常结算）", n * pf) } else { String::new() }
+        };
+        let final_read = match api.order(&oid, &digest).await {
+            Ok(Some(row)) => {
+                let (got, status) = order_fill(&row, shares);
+                filled_seen = filled_seen.max(got);
                 lines.push(format!(
                     "4/4 最终状态：{}，成交 {} 份{}",
-                    if status.is_empty() { "查不到" } else { &status },
-                    g(got),
-                    if got > crate::util::DUST {
-                        format!("（花了约 ${:.2}，这几份照常结算）", got * pf)
-                    } else {
-                        String::new()
-                    }
+                    if status.is_empty() { "?" } else { &status },
+                    g(filled_seen),
+                    spent(filled_seen)
                 ));
+                true
             }
-            Err(e) => lines.push(format!("4/4 最终状态没读到：{}", clean(&e))),
-        }
+            Ok(None) => {
+                lines.push(format!("4/4 最终状态暂时查不到：成交按前面查到的 {} 份记{}", g(filled_seen), spent(filled_seen)));
+                false
+            }
+            Err(e) => {
+                lines.push(format!(
+                    "4/4 最终状态没读到：{}——成交按前面查到的 {} 份记{}",
+                    clean(&e),
+                    g(filled_seen),
+                    spent(filled_seen)
+                ));
+                false
+            }
+        };
         lines.push(format!(
             "结论：{}",
-            if removed {
-                "✅ 下单、查询、撤单都正常：签名、授权、这个区域都没问题，可以真实吃单"
+            if !removed {
+                "⚠️ 下单成功但撤单没确认：到 Predict 网站看一下这张单（10 分钟后自己过期）".to_string()
+            } else if !final_read {
+                "⚠️ 下单、撤单都正常，但最后一次查询没读到这张单的最终状态：成交数以 Predict 网站为准，核对一下".to_string()
+            } else if filled_seen > crate::util::DUST {
+                format!(
+                    "✅ 下单、查询、撤单都正常：签名、授权、这个区域都没问题，可以真实吃单（这张测试单撤掉前成交了 {} 份）",
+                    g(filled_seen)
+                )
             } else {
-                "⚠️ 下单成功但撤单没确认：到 Predict 网站看一下这张单（10 分钟后自己过期）"
+                "✅ 下单、查询、撤单都正常：签名、授权、这个区域都没问题，可以真实吃单".to_string()
             }
         ));
         record.insert("steps".into(), json!(lines.clone()));
         record.insert("order_id".into(), json!(oid));
         record.insert("removed".into(), json!(removed));
-        record.insert("filled".into(), jf(filled_end));
+        record.insert("filled".into(), jf(filled_seen));
+        record.insert("final_read".into(), json!(final_read));
         me.borrow_mut().store.put(&test_key, &Value::Object(record));
         return lines.join("\n");
     }
@@ -731,6 +757,7 @@ pub async fn save_settings(me: &Me, values: &serde_json::Map<String, Value>) -> 
         t.loss_cap = cap;
         t.store.put(console::SAVED, &Value::Object(as_json));
         t.configure(settings);
+        t.hold_loss_stop();
         values
             .iter()
             .map(|(k, v)| format!("{}＝{}", console::label(k), if v.is_empty() { "（空）" } else { v }))
@@ -746,12 +773,15 @@ pub async fn save_settings(me: &Me, values: &serde_json::Map<String, Value>) -> 
     SaveResult::Done(format!("已保存：{names}"))
 }
 
-/// Back to the settings file's value for these fields (all of them when ``keys`` is empty) — in force at once, as a save is.
-pub async fn reset_settings(me: &Me, keys: &[String]) -> SaveResult {
+/// Back to the settings file's value for these fields (``None``: all of them) — in force at once, as a save is.
+pub async fn reset_settings(me: &Me, keys: Option<&[String]>) -> SaveResult {
     let names = {
         let mut held = me.borrow_mut();
         let t = &mut *held;
-        let keys: Vec<String> = if keys.is_empty() { t.saved_settings.keys().cloned().collect() } else { keys.to_vec() };
+        let keys: Vec<String> = match keys {
+            None => t.saved_settings.keys().cloned().collect(),
+            Some(keys) => keys.to_vec(),
+        };
         let keys: Vec<String> = keys.into_iter().filter(|k| t.saved_settings.contains_key(k)).collect();
         let saved: Saved =
             t.saved_settings.iter().filter(|(k, _)| !keys.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -764,6 +794,7 @@ pub async fn reset_settings(me: &Me, keys: &[String]) -> SaveResult {
         t.loss_cap = cap;
         t.store.put(console::SAVED, &Value::Object(as_json));
         t.configure(settings);
+        t.hold_loss_stop();
         keys.iter().filter(|k| console::field(k).is_some()).map(|k| console::label(k)).collect::<Vec<_>>().join("、")
     };
     let names = if names.is_empty() { "（没有网页保存的值）".to_string() } else { names };

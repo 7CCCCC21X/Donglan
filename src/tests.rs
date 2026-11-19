@@ -59,6 +59,13 @@ pub struct FakePredict {
     pub connect_delay: Cell<f64>,
     /// the order taken (it is on the book) and its answer lost on the way back
     pub lose_answer: Cell<bool>,
+    /// no connection to be had (refused): an order's request never leaves, as the real client tells it
+    pub refuse_connect: Cell<bool>,
+    /// the taker's clock, moved on by ``book_ms`` while a REST book read is out
+    pub clock: RefCell<Option<Rc<Cell<i64>>>>,
+    pub book_ms: Cell<i64>,
+    /// GET /orders/{hash}, one answer each in turn: "" as it stands, "empty" a 200 with no order in it, "timeout" lost
+    pub order_reads: RefCell<std::collections::VecDeque<&'static str>>,
 }
 
 impl FakePredict {
@@ -96,6 +103,9 @@ impl FakePredict {
         }
         if let Some(rest) = path.strip_prefix("/markets/") {
             if let Some(mid) = rest.strip_suffix("/orderbook") {
+                if let Some(clock) = self.clock.borrow().as_ref() {
+                    clock.set(clock.get() + self.book_ms.get()); // (the read took that long)
+                }
                 if let Some(b) = self.books.borrow().get(mid) {
                     return Self::ok(b.clone());
                 }
@@ -141,6 +151,11 @@ impl FakePredict {
             return Self::ok(json!({"removed": ids, "noop": []}));
         }
         if let Some(hash) = path.strip_prefix("/orders/") {
+            match self.order_reads.borrow_mut().pop_front().unwrap_or("") {
+                "empty" => return Self::ok(json!({})),
+                "timeout" => return Err(RemoteError::new("网络错误 (TimeoutError: timed out)")),
+                _ => {}
+            }
             let Some(row) = self.orders.borrow().get(&hash.to_lowercase()).cloned() else { return not_found() };
             return Self::ok(Value::Object(row));
         }
@@ -183,6 +198,12 @@ impl Transport for FakePredict {
             if method == "POST" && path == "/orders" {
                 let raw = req.payload.as_deref().map(Vec::as_slice).unwrap_or(b"{}");
                 if raw != br#"{"data":{}}"# {
+                    if self.refuse_connect.get() {
+                        return Err(RemoteError::not_sent(format!(
+                            "{}（网络错误 (ConnectionRefusedError: Connection refused)），请求没有发出",
+                            crate::http::NOT_CONNECTED
+                        )));
+                    }
                     if self.connect_delay.get() > 0.0 {
                         crate::sync::sleep(self.connect_delay.get()).await;
                         if let Some(gate) = &req.gate {
@@ -252,6 +273,7 @@ pub fn rig_full(
     stream.fake_alive.set(Some(true));
     *api.stream.borrow_mut() = Some(stream.clone());
     let clock = Rc::new(Cell::new(clock_ms));
+    *api.clock.borrow_mut() = Some(clock.clone());
     let t = Taker::new(Parts {
         config,
         store,
@@ -832,7 +854,7 @@ fn settings_save_check_reset_and_mode() {
         assert!(matches!(control::save_settings(&r.me, &values).await, control::SaveResult::Refused(_)));
         assert_eq!(r.me.borrow().settings.price("gold_shut"), 61);
         assert!(
-            matches!(control::reset_settings(&r.me, &[]).await, control::SaveResult::Done(m) if m.contains("已恢复部署设置"))
+            matches!(control::reset_settings(&r.me, None).await, control::SaveResult::Done(m) if m.contains("已恢复部署设置"))
         );
         assert_eq!(r.me.borrow().settings.price("gold_shut"), 58);
         // the mode never above the settings file's RULE_TAKER
@@ -1260,5 +1282,237 @@ fn an_order_test_whose_answer_is_lost_is_found_by_its_hash_and_withdrawn() {
         let text = control::order_test(&r.me).await;
         assert!(text.contains("下单结果未知"), "{text}");
         assert!(!text.contains("结论：❌") && !text.contains("这张测试单没下成"), "{text}");
+    });
+}
+
+// -- the second review --
+
+#[test]
+fn the_day_s_loss_stop_holds_after_a_later_profit_until_resume() {
+    run(async {
+        let (_dir, path) = store_at("loss-stop");
+        let pairs = [("RULE_MAX_DAILY_LOSS_USD", "10")];
+        let r = rig_with(start() - 3_600_000, Store::open(&path).unwrap(), FakePredict::new(), &pairs);
+        r.found().await;
+        let settle = |t: &mut Taker, key: &str, pnl: f64| {
+            let day = t.now();
+            let rec = json!({"slug": key, "mode": "on", "rule": "gold_shut", "side": "up", "pnl": pnl, "orders": [],
+                             "settled_day": day_of(day), "start_ms": day});
+            t.recs.insert(key.into(), rec.as_object().cloned().unwrap());
+            t.pnl_epoch += 1;
+            t.hold_loss_stop(); // (as a settlement does)
+        };
+        settle(&mut r.me.borrow_mut(), "a", -12.0); // -$12 settled: the $10 line passed
+        assert!(r.me.borrow().block(0.0, None).contains("停机线"));
+        // a profit settled later the same day (-$7 now, over the line again): the stop holds all the same
+        settle(&mut r.me.borrow_mut(), "b", 5.0);
+        let why = r.me.borrow().block(0.0, None);
+        assert!(why.contains("之后的盈利不解除"), "{why}");
+        assert!(r.me.borrow().halted());
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        assert!(r.created().is_empty(), "{}", r.word());
+        assert!(r.me.borrow().status().contains("今天已停机"));
+        // ... over a restart too
+        assert!(r.me.borrow().store.flush(10.0));
+        let again = rig_with(start() - 3_600_000, Store::open(&path).unwrap(), FakePredict::new(), &pairs);
+        assert!(again.me.borrow().block(0.0, None).contains("之后的盈利不解除"));
+        // /resume lifts it: another $10 from the P&L now (-$7 -> the line at -$17)
+        let reply = control::control(&r.me, "resume", "").await;
+        assert!(reply.contains("停机线移到 −$17.00"), "{reply}");
+        assert_eq!(r.me.borrow().block(0.0, None), "");
+        flow::turn(&r.me).await; // (a turn latches nothing over the new line)
+        assert_eq!(r.me.borrow().block(0.0, None), "");
+        // and the next day starts free
+        let (_dir2, path2) = store_at("loss-stop-2");
+        let r = rig_with(start() - 3_600_000, Store::open(&path2).unwrap(), FakePredict::new(), &pairs);
+        settle(&mut r.me.borrow_mut(), "a", -12.0);
+        r.advance(crate::util::DAY_MS);
+        assert_eq!(r.me.borrow().loss_stop_why(), "");
+    });
+}
+
+#[test]
+fn the_balance_keeps_what_an_unconfirmed_order_may_still_take() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.me.borrow_mut().usdt = Some(100 * WEI);
+        *r.api.create_error.borrow_mut() = Some(RemoteError::new("网络错误 (TimeoutError: timed out)"));
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        assert_eq!(r.order(0).state(), "unknown");
+        // read again 20 s on, the chain still at $100 (nothing taken yet): the $29 the order may take stays aside
+        r.advance(20_000);
+        let read_again = |r: &Rig| {
+            let mut t = r.me.borrow_mut();
+            t.balance_asked_ms = t.now();
+        };
+        read_again(&r);
+        let left = r.me.borrow().usd(None).unwrap();
+        assert!((left - 71.0).abs() < 1e-9, "{left}");
+        // resting on the book with 20 of its 50 matched (the chain has those): the unfilled 30 at 58¢ aside
+        let key = crate::rules::rid(&slug_of(start()), "on");
+        let hash = r.order(0).s("hash");
+        let set = |r: &Rig, state: &str, filled: f64, filled_ms: i64| {
+            let mut t = r.me.borrow_mut();
+            let o = t.order_mut(&key, &hash).unwrap();
+            o.insert("state".into(), json!(state));
+            o.insert("filled".into(), json!(filled));
+            o.insert("filled_ms".into(), json!(filled_ms));
+        };
+        let now = r.me.borrow().now();
+        set(&r, "open", 20.0, now - 60_000);
+        let left = r.me.borrow().usd(None).unwrap();
+        assert!((left - (100.0 - 30.0 * 0.58)).abs() < 1e-9, "{left}");
+        // filled since the read began (the chain may not have it yet): the whole order aside
+        set(&r, "open", 20.0, now - 1_000);
+        let left = r.me.borrow().usd(None).unwrap();
+        assert!((left - 71.0).abs() < 1e-9, "{left}");
+        // done, its fills older than the read: nothing aside (the chain has them)
+        set(&r, "final", 50.0, now - 60_000);
+        assert!((r.me.borrow().usd(None).unwrap() - 100.0).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn an_order_that_got_no_connection_holds_nothing_and_is_tried_again_soon() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.refuse_connect.set(true);
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        let o = r.order(0);
+        assert_eq!(o.state(), "not_sent", "{}", o.s("error"));
+        assert!(o.s("error").starts_with(crate::http::NOT_CONNECTED));
+        {
+            let t = r.me.borrow();
+            assert_eq!(held(t.record(&slug_of(start()), Some("on")).unwrap()), 0.0); // the window's shares all still free
+            let w = t.track.get(&slug_of(start())).unwrap().borrow();
+            assert_eq!(w.look_ms, t.now() + taker::CONNECT_RETRY_MS); // looked at again in a moment, not half a minute
+        }
+        r.api.refuse_connect.set(false);
+        r.advance(taker::CONNECT_RETRY_MS + 1);
+        r.push(MID, book(&[("0.54", "100")], &[]));
+        r.sends().await;
+        assert_eq!(r.created().len(), 1);
+        assert_eq!(r.taker_amount(0), 50 * WEI); // the whole window, as if nothing had happened
+    });
+}
+
+#[test]
+fn an_empty_answer_never_closes_an_order_with_an_id() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        let o = r.order(0);
+        assert_eq!((o.state(), o.s("id").as_str()), ("open", "id1"));
+        // long past its end, Predict's read answers 200 with nothing in it: no word on the order — read again, not closed
+        r.clock.set(o.i("expires") * 1000 + taker::GIVE_UP_MS + 1_000);
+        r.api.order_reads.borrow_mut().push_back("empty");
+        orders::follow(&r.me).await;
+        let o = r.order(0);
+        assert_eq!(o.state(), "open", "{}", o.s("error"));
+        assert!(o.s("error").contains("查单应答里没有"), "{}", o.s("error"));
+        // the read back: its fills taken
+        {
+            let hash = o.s("hash");
+            let mut orders = r.api.orders.borrow_mut();
+            let row = orders.get_mut(&hash).unwrap();
+            row.insert("status".into(), json!("FILLED"));
+            row.insert("amountFilled".into(), json!((50 * WEI).to_string()));
+        }
+        r.advance(taker::UNKNOWN_EVERY_MS + 1);
+        orders::follow(&r.me).await;
+        let o = r.order(0);
+        assert_eq!((o.state(), o.f("filled")), ("final", 50.0));
+        // an order Predict never gave an id to: an empty answer is as good as its 404 (the API's own word for none)
+        let api = r.me.borrow().api.clone();
+        r.api.order_reads.borrow_mut().push_back("empty");
+        assert!(api.order("", &o.s("hash")).await.unwrap().is_none());
+        r.api.order_reads.borrow_mut().push_back("empty");
+        assert!(api.order("id1", &o.s("hash")).await.is_err());
+    });
+}
+
+#[test]
+fn an_order_test_keeps_the_fills_an_earlier_step_read() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.books.borrow_mut().insert(MID.into(), json!({"bids": [["0.40", "10"]], "asks": [["0.60", "10"]]}));
+        r.api.fill_on_create.set(10.0); // 10 of its 50 shares matched before the cancel
+        r.api.order_reads.borrow_mut().extend(["", "timeout"]); // the last read lost
+        let text = control::order_test(&r.me).await;
+        assert!(text.contains("2/4 按哈希查到：OPEN，成交 10/50"), "{text}");
+        assert!(text.contains("3/4 撤单成功"), "{text}");
+        assert!(text.contains("4/4 最终状态没读到") && text.contains("成交按前面查到的 10 份记"), "{text}");
+        assert!(!text.contains("结论：✅") && text.contains("最后一次查询没读到"), "{text}");
+        let hash = r.created()[0]["data"]["order"]["hash"].as_str().unwrap().to_lowercase();
+        let saved = r.me.borrow().store.get(&format!("test:{hash}")).unwrap();
+        assert_eq!((saved["filled"].as_f64(), saved["final_read"].as_bool()), (Some(10.0), Some(false)));
+    });
+}
+
+#[test]
+fn a_reset_of_the_wrong_shape_resets_nothing() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        let mut values = serde_json::Map::new();
+        values.insert("RULE_GOLD_SHUT_CENTS".into(), json!("61"));
+        values.insert("RULE_MAX_DAY_USD".into(), json!("100"));
+        assert!(matches!(control::save_settings(&r.me, &values).await, control::SaveResult::Done(_)));
+        let q = HashMap::new();
+        let mut h = HashMap::new();
+        h.insert("x-rt".to_string(), "1".to_string());
+        let bodies: [&[u8]; 6] = [
+            br#"{"reset":"RULE_GOLD_SHUT_CENTS"}"#,
+            br#"{"reset":[]}"#,
+            br#"{"reset":["NOPE"]}"#,
+            br#"{"reset":[1]}"#,
+            br#"{"reset":null}"#,
+            br#"{"reset":{"RULE_GOLD_SHUT_CENTS":true}}"#,
+        ];
+        for body in bodies {
+            let reply = crate::server::route(&r.me, "", "POST", "/api/settings", &q, &h, body).await;
+            assert_eq!(reply.status, 400, "{}", reply.body);
+            let t = r.me.borrow();
+            assert_eq!((t.saved_settings.len(), t.settings.max_day_usd), (2, 100.0), "{}", String::from_utf8_lossy(body));
+        }
+        let reply =
+            crate::server::route(&r.me, "", "POST", "/api/settings", &q, &h, br#"{"reset":["RULE_GOLD_SHUT_CENTS"]}"#).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert_eq!((r.me.borrow().saved_settings.len(), r.me.borrow().settings.max_day_usd), (1, 100.0));
+        let reply = crate::server::route(&r.me, "", "POST", "/api/settings", &q, &h, br#"{"reset":"all"}"#).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert!(r.me.borrow().saved_settings.is_empty());
+    });
+}
+
+#[test]
+fn paper_records_nothing_past_the_15_second_line() {
+    run(async {
+        // the look begins 16 s before the start; Predict's book takes 2 s to read: no real order could go now, so no
+        // paper one is recorded either
+        let r = rig(start() - 3_600_000, &[("RULE_TAKER", "paper")]);
+        r.found().await;
+        r.api.books.borrow_mut().insert(MID.into(), json!({"asks": [["0.55", "100"]], "bids": []}));
+        r.stream.fake_alive.set(Some(false)); // (no push to go by: the book read from REST)
+        r.clock.set(start() - 16_000);
+        r.api.book_ms.set(2_000);
+        flow::turn(&r.me).await;
+        let bought = r.me.borrow().record(&slug_of(start()), Some("paper")).map(crate::rules::filled).unwrap_or(0.0);
+        assert_eq!(bought, 0.0, "{}", r.word()); // (the window itself is over by then: nothing more to look at)
+        // the same read done quickly: recorded
+        let r = rig(start() - 3_600_000, &[("RULE_TAKER", "paper")]);
+        r.found().await;
+        r.api.books.borrow_mut().insert(MID.into(), json!({"asks": [["0.55", "100"]], "bids": []}));
+        r.stream.fake_alive.set(Some(false));
+        r.clock.set(start() - 16_000);
+        flow::turn(&r.me).await;
+        let bought = r.me.borrow().record(&slug_of(start()), Some("paper")).map(crate::rules::filled).unwrap_or(0.0);
+        assert_eq!(bought, 50.0, "{}", r.word());
     });
 }

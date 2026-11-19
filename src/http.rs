@@ -228,6 +228,9 @@ pub fn http() -> Rc<Http> {
     HTTP.with(Rc::clone)
 }
 
+/// How a request that never got a connection is told: nothing of it went out (an order may be sent again).
+pub const NOT_CONNECTED: &str = "连接没建立";
+
 fn net_error(error: &io::Error) -> RemoteError {
     let kind = match error.kind() {
         io::ErrorKind::TimedOut => "TimeoutError",
@@ -564,7 +567,17 @@ impl Http {
                     Some(c) => (c, true),
                     None => {
                         waited = true;
-                        (self.open(&url, timeout_d).await.map_err(|e| net_error(&e))?, false)
+                        // no connection (refused, unreachable, the TLS handshake failed or timed out): not a byte of the
+                        // request was written — a POST is told as not sent, so an order that never left holds nothing
+                        let conn = self.open(&url, timeout_d).await.map_err(|e| {
+                            let error = net_error(&e);
+                            if payload.is_some() {
+                                RemoteError::not_sent(format!("{NOT_CONNECTED}（{}），请求没有发出", error.msg))
+                            } else {
+                                error
+                            }
+                        })?;
+                        (conn, false)
                     }
                 };
                 if let (true, Some(check)) = (waited, gate) {
@@ -834,6 +847,23 @@ pub mod tests {
             let pass = || String::new();
             assert_eq!(h.request_gated(&url, Some(b"2"), 5.0, &[], Some(&pass)).await.unwrap(), b"POST2");
             assert_eq!(h.stats.borrow().new, 1);
+        });
+    }
+
+    #[test]
+    fn a_post_that_got_no_connection_is_not_sent() {
+        run(async {
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            }; // (closed again: nothing listens there)
+            let h = Http::new();
+            let url = format!("http://127.0.0.1:{port}/orders");
+            let e = h.request(&url, Some(b"{}"), 2.0, &[]).await.unwrap_err();
+            assert_eq!(e.kind, crate::util::Kind::NotSent, "{}", e.msg);
+            assert!(e.msg.starts_with(NOT_CONNECTED), "{}", e.msg);
+            let e = h.request(&url, None, 2.0, &[]).await.unwrap_err(); // a read: as before
+            assert_eq!(e.kind, crate::util::Kind::Remote, "{}", e.msg);
         });
     }
 

@@ -539,7 +539,9 @@ impl PredictApi {
         Ok((list("removed"), list("noop")))
     }
 
-    /// One order, open or closed, by its hash (GET /orders/{hash}); None when Predict knows nothing of it (404).
+    /// One order, open or closed, by its hash (GET /orders/{hash}); None when Predict knows nothing of it (404). An answer
+    /// with no order in it (an empty body, ``{}``) is None only for an order Predict never gave an id to: one it did is
+    /// there, and such an answer says nothing of it — an error, read again later (its fills are never closed on it).
     pub async fn order(&self, order_id: &str, hash: &str) -> Res<Option<Obj>> {
         if hash.is_empty() {
             return Ok(None);
@@ -564,6 +566,9 @@ impl PredictApi {
         }
         Ok(match row {
             Value::Object(o) if !o.none("id") || o.t("order") || o.t("status") => Some(o),
+            _ if !order_id.is_empty() => {
+                return Err(RemoteError::new(format!("查单应答里没有订单 #{order_id} 的内容（不是 404）：过一会儿再查")));
+            }
             _ => None,
         })
     }

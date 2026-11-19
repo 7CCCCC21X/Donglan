@@ -299,6 +299,7 @@ pub fn take_fills(t: &mut Taker, key: &str, hash: &str, row: &Obj) {
         let Some(rec) = t.recs.get(key) else { return };
         (rec.s("rule"), rec.s("name"), rec.s("side"))
     };
+    let now = t.now();
     let Some(o) = t.order_mut(key, hash) else { return };
     let (shares, _) = order_fill(row, o.f("shares"));
     if let Some(price) = order_price(row) {
@@ -308,6 +309,7 @@ pub fn take_fills(t: &mut Taker, key: &str, hash: &str, row: &Obj) {
     let before = o.f("filled");
     if shares > before + DUST {
         o.insert("filled".into(), jf(shares));
+        o.insert("filled_ms".into(), json!(now)); // (the balance read before this cannot have seen it)
         let avg = if o.f("avg") != 0.0 { o.f("avg") } else { o.f("limit") };
         let live = o.t("live");
         let (total, limit) = (o.f("shares"), o.f("limit"));
@@ -442,6 +444,7 @@ pub async fn settle(me: &Me) {
             if let Some(floor) = t.loss_floor() {
                 let today = day_pnl(&t.recs, &day_of(now));
                 if today <= floor {
+                    t.hold_loss_stop();
                     t.alarm(&format!(
                         "⛔ 规则吃单今日已结算 {}，到了 RULE_MAX_DAILY_LOSS_USD 的停机线：今天不再开新单（明天自动恢复；/resume 从现在的盈亏起再给一个额度）",
                         money(today)

@@ -215,7 +215,7 @@ function renderSettings(groups,dropped){
         h("details",{},h("summary",{},"说明"),h("p",{},f.help))))}
     box.append(h("h3",{},g.group),grid)}
   if(groups.some(g=>g.fields.some(f=>f.saved)))box.append(h("div",{class:"row",style:"margin-top:12px"},
-    h("button",{class:"b danger",type:"button",onclick:()=>{if(confirm("所有网页保存的设置都回到设置文件里的值？"))saveField({reset:[]})}},"全部恢复部署设置")))}
+    h("button",{class:"b danger",type:"button",onclick:()=>{if(confirm("所有网页保存的设置都回到设置文件里的值？"))saveField({reset:"all"})}},"全部恢复部署设置")))}
 async function refreshSettings(){try{const s=await api("api/state");state=s;renderState(s);renderSettings(s.settings||[],s.settings_dropped||[])}catch(e){toast(e.message,true)}}
 
 // ---------- 复盘 ----------

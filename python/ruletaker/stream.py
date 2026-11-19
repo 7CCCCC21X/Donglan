@@ -49,7 +49,9 @@ class BookStream:
         self.count = max(1, int(connections))
         self.wanted: set[str] = set()
         self.books: dict[str, tuple] = {}     # market id -> (bids, asks, monotonic time of the push)
-        self.versions: dict[str, int] = {}
+        # market id -> (version, the server's update time — updateTimestampMs, 0 when absent) of the book applied last: shared
+        # by the connections — a frame older than it is dropped, whichever connection brings it
+        self.versions: dict[str, tuple[int, int]] = {}
         self.changed: set[str] = set()       # markets whose book changed since the taker last looked
         self.arrivals = 0
         self.pushed = asyncio.Event()
@@ -124,9 +126,14 @@ class BookStream:
             return
         version = data.get("version")
         if isinstance(version, (int, float)) and not isinstance(version, bool):
-            if version < self.versions.get(mid, -1):
+            stamp, wall = data.get("updateTimestampMs"), int(time.time() * 1000)
+            stamp = int(stamp) if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and 0 < stamp <= wall + 60_000 else 0
+            held = self.versions.get(mid)
+            # older than the book in hand: dropped — unless the server's own clock says it is the newer (its counter started
+            # over: a restarted book), which a version alone cannot tell
+            if held is not None and version < held[0] and not (stamp and held[1] and stamp > held[1]):
                 return
-            self.versions[mid] = int(version)
+            self.versions[mid] = (int(version), stamp)
         old = self.books.get(mid)
         bids = predict_levels(data.get("bids"), True) if isinstance(data.get("bids"), list) else (old[0] if old else ())
         asks = predict_levels(data.get("asks"), False) if isinstance(data.get("asks"), list) else (old[1] if old else ())
@@ -181,6 +188,13 @@ class _Conn:
     def alive(self) -> bool:
         return self.ws is not None and time.monotonic() - self.last_frame <= BookStream.ALIVE_S
 
+    def connected_anew(self) -> None:
+        """This connection (re)opened: its own subscriptions start over. The versions stay — another connection may be serving
+        the same markets, and a frame older than the book it brought must never replace it (a market no connection serves any
+        more was forgotten when its last one went)."""
+        self.subscribed.clear()
+        self.pending.clear()
+
     async def pause(self, seconds: float) -> None:
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self.stream.stopping.wait(), seconds)
@@ -204,9 +218,7 @@ class _Conn:
                 continue
             since = self.last_frame = time.monotonic()
             self.ws, self.connects = ws, self.connects + 1
-            self.subscribed.clear()
-            self.pending.clear()
-            s.versions.clear()  # (a fresh connection's snapshot starts the versions over: the server's may have restarted)
+            self.connected_anew()
             why = ""
             try:
                 why = await self.session(ws)
