@@ -36,6 +36,10 @@ RULE_DENY="ruletaker-deny-inbound"       # ...and every other connection from ou
 IAP_RANGE="35.235.240.0/20"
 
 die() { echo "错误：$*" >&2; exit 1; }
+case "${RT_IMPL:-}" in
+  ""|rust|python) ;;
+  *) die "RT_IMPL 只能是 rust 或 python（现在是 ${RT_IMPL}）" ;;
+esac
 [ -n "$PROJECT" ] || die "没有选 Google Cloud 项目：先运行 gcloud config set project 你的项目ID"
 G=(--project "$PROJECT")
 Z=(--zone "$ZONE")
@@ -116,10 +120,6 @@ upload_env() {
 }
 
 setup() {
-  case "${RT_IMPL:-}" in
-    ""|rust|python) ;;
-    *) die "RT_IMPL 只能是 rust 或 python" ;;
-  esac
   remote "sudo ${RT_IMPL:+RT_IMPL=$RT_IMPL }bash /opt/ruletaker/deploy/gcp/vm-setup.sh"
 }
 
