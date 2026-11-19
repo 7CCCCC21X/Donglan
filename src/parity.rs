@@ -35,7 +35,8 @@ fn signatures_match_python() {
     use crate::wallet::{Wallet, build_order, limit_amounts, order_body, to_wei};
     let v = vectors("wallet.json");
     for w in v["wallets"].as_array().unwrap() {
-        let wallet = Wallet::new(w["key"].as_str().unwrap(), w["chain"].as_i64().unwrap(), w["account"].as_str().unwrap()).unwrap();
+        let wallet =
+            Wallet::new(w["key"].as_str().unwrap(), w["chain"].as_i64().unwrap(), w["account"].as_str().unwrap()).unwrap();
         assert_eq!(wallet.signer, w["signer"].as_str().unwrap());
         assert_eq!(wallet.maker, w["maker"].as_str().unwrap());
         assert_eq!(wallet.sign_text(w["message"].as_str().unwrap()), w["text_sig"].as_str().unwrap());
@@ -44,8 +45,15 @@ fn signatures_match_python() {
             assert_eq!(a.maker.to_string(), o["maker"].as_str().unwrap());
             assert_eq!(a.taker.to_string(), o["taker"].as_str().unwrap());
             assert_eq!(a.price_per_share.to_string(), o["pps"].as_str().unwrap());
-            let order = build_order(&wallet, o["token"].as_str().unwrap(), a.maker, a.taker, o["fee"].as_i64().unwrap(),
-                                    o["exp"].as_i64().unwrap(), o["salt"].as_u64().unwrap());
+            let order = build_order(
+                &wallet,
+                o["token"].as_str().unwrap(),
+                a.maker,
+                a.taker,
+                o["fee"].as_i64().unwrap(),
+                o["exp"].as_i64().unwrap(),
+                o["salt"].as_u64().unwrap(),
+            );
             let (hash, sig) = wallet.sign_order(&order, o["neg"].as_bool().unwrap(), o["yb"].as_bool().unwrap()).unwrap();
             assert_eq!(hash, o["digest"].as_str().unwrap());
             assert_eq!(sig, o["sig"].as_str().unwrap());

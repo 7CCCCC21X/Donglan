@@ -6,15 +6,17 @@
 
 - **独立进程**：不再和原策略、预挂、复盘页挤在同一个事件循环里。huice 自己的记录里，盘口到了以后被主循环别的活儿占住的时间有 111 ms、2098 ms、2540 ms（σ 重算、复盘页重算、垃圾回收、几万条预挂记录）——这些在这里都不存在。
 - **部署在东京**：huice 11-18 实测，机器人在阿姆斯特丹（`europe-west4`），到 Cloudflare 入口只要 7–31 ms，读一次盘口却要 233–311 ms：入口很近、Predict 的服务器很远。东京到它近得多，部署后用 `rt.sh latency` 量真实数字。
-- **路上的每一步都更短**（见下面“提速”）：本机测，推送帧到达 → 下单请求交出 **0.3 ms**（预先签好）/ 0.8 ms（当场签名）。
+- **Rust 写的（3.0 起）**：同一台机器上实测，推送帧到达 → 下单请求交给网络 **0.07 ms**（预先签好）/ **0.12 ms**（当场签名）；原来的 Python 版是 0.31 ms / 0.90 ms。见“[Rust 版](#rust-版30)”。
+- **路上的每一步都更短**（见下面“提速”）。
 - **有自己的网页控制台和复盘页**（huice 控制台“规则吃单”一组、复盘页“规则吃单”一节的对应物）：看状态、暂停 / 恢复、切模式、在线改规则价格和份数；按规则、按日期复盘，抢单记录、盘口观察、累计盈亏曲线、导出 CSV。见“[控制台和复盘页](#控制台和复盘页)”。
 
-> 先说清楚：这里只有“规则吃单”。原策略、预挂、提醒仍然在 Railway 上的 huice 里跑。两边怎么配合见“和 Railway 上的 huice 一起用”，**一定先看**。
+> 先说清楚：这里只有“规则吃单”。原策略、预挂、提醒仍然在 Railway 上的 huice 里跑。原来的 Python 版留在 `python/` 目录当备用，一条命令就能换回去（记录、设置两边通用）。两边怎么配合见“和 Railway 上的 huice 一起用”，**一定先看**。
 
 ---
 
 ## 目录
 
+0. [Rust 版（3.0）](#rust-版30)
 1. [和 Railway 上的 huice 一起用（必看）](#和-railway-上的-huice-一起用必看)
 2. [部署到 Google Cloud 东京（一步一步）](#部署到-google-cloud-东京一步一步)
 3. [日常操作](#日常操作)
@@ -27,6 +29,37 @@
 10. [记录、恢复与风控](#记录恢复与风控)
 11. [和 huice 相比没搬过来的](#和-huice-相比没搬过来的)
 12. [本地运行与测试](#本地运行与测试)
+
+---
+
+## Rust 版（3.0）
+
+3.0 起服务是 Rust 写的（`src/`），逻辑逐行照 Python 版（2.0，`python/ruletaker/`）移植，记录格式、设置、网页控制台、Telegram 命令、`rt.sh` 的用法都不变。
+
+**快了多少**（同一台机器，`cargo test --release bench_hot_path -- --ignored --nocapture` 和 `python python/tests/bench_hotpath.py`，记录里都已有 600 场）：
+
+| 推送帧到达 → 下单请求交给网络 | Python 版 2.0 | Rust 版 3.0 |
+|---|---|---|
+| 预先签好的单 | 中位 0.31 ms | 中位 **0.07 ms** |
+| 当场签名 | 中位 0.90 ms | 中位 **0.12 ms** |
+
+说实话：这省下的是 0.2～0.8 ms；一次到 Predict 的网络往返是几毫秒到几十毫秒，**决定抢不抢得到的仍然主要是网络**（所以才部署在东京）。Rust 版的好处还有：没有垃圾回收停顿；同一个回合里从收到推送到请求字节写进网络连接，中间不会被别的任务插队；内存占用小、启动快。
+
+**和 Python 版逐字节一致的地方**（`src/parity.rs` 用 Python 版生成的数据 `tests/vectors/` 核对）：两年里每条规则的每一场、CME 日历、市场标题核对、订单签名（普通钱包和 Predict 智能账户的 Kernel 包装）、登录签名、下单请求体的每一个字节、订单金额的取整。
+
+**比 Python 版多做的两件事**：
+
+- 复用连接前先看一眼服务器是不是已经把它关了（读一下套接字，不等待）：关了就换新连接，下单请求不会发到一条已断的连接上、变成“结果未知”。
+- 记录写库挪到下单请求发出之后（订单日志仍然先写，崩溃恢复不受影响），请求早几十微秒出门。
+
+**换回 Python 版 / 再换回来**（记录、网页保存的设置、暂停状态两边通用，同一个数据库文件）：
+
+```bash
+RT_IMPL=python bash deploy/gcp/rt.sh update   # 换成 Python 版（之后一直用它，直到再指定）
+RT_IMPL=rust bash deploy/gcp/rt.sh update     # 换回 Rust 版
+```
+
+**编译**：虚拟机上用 Ubuntu 官方源里的 Rust 工具链（`rustc-1.97` / `cargo-1.97`，和别的 Ubuntu 软件包一样有签名），依赖按 `Cargo.lock` 锁定的版本编译，cargo 会逐个核对每个包的 SHA-256。第一次部署要多 3～5 分钟编译，以后 `update` 只编译改动的部分；编译完先跑全部离线测试，有一个失败就不换、原来的版本继续运行。
 
 ---
 
@@ -90,7 +123,7 @@ nano ruletaker.env
 bash deploy/gcp/rt.sh deploy
 ```
 
-它会：在 **asia-northeast1-b（东京）** 建一台虚拟机 `ruletaker`（`e2-standard-2`，Ubuntu 24.04，20 GB 盘）→ 上传代码 → 装 Python 依赖 → 跑全部离线测试（有一个失败就不启动）→ 把设置文件放到虚拟机的 `/etc/ruletaker/ruletaker.env`（权限 640）→ 用 systemd 启动并设成开机自启、崩溃自动重启。第一次大约 3～5 分钟。第一次运行 `gcloud compute ssh` 会问是否生成 SSH 密钥，直接回车。
+它会：在 **asia-northeast1-b（东京）** 建一台虚拟机 `ruletaker`（`e2-standard-2`，Ubuntu 24.04，20 GB 盘）→ 上传代码 → 装 Ubuntu 官方源的 Rust 工具链、编译 → 跑全部离线测试（有一个失败就不启动）→ 把设置文件放到虚拟机的 `/etc/ruletaker/ruletaker.env`（权限 640）→ 用 systemd 启动并设成开机自启、崩溃自动重启。第一次大约 8～10 分钟（多数时间在编译）。第一次运行 `gcloud compute ssh` 会问是否生成 SSH 密钥，直接回车。
 
 想换机器或区域：`MACHINE=n2-standard-2 ZONE=asia-northeast1-a bash deploy/gcp/rt.sh deploy`。
 
@@ -224,20 +257,20 @@ bash deploy/gcp/rt.sh env
 | 环节 | huice（Railway 阿姆斯特丹，共用一个进程） | 本服务（东京，独立进程） |
 |---|---|---|
 | 盘口变化 → 推送到达 | 中位 178–246 ms | 东京就近接收；部署后 `status` 的“推送延迟中位”就是它 |
-| 推送到达 → 请求发出 | 最快 1 ms，但常被主循环占住（111 ms、2098 ms、2540 ms） | 本机测 0.3 ms（预先签好）/ 0.8 ms（当场签名）；没有别的任务和它抢 |
+| 推送到达 → 请求发出 | 最快 1 ms，但常被主循环占住（111 ms、2098 ms、2540 ms） | Rust 版本机测 0.07 ms（预先签好）/ 0.12 ms（当场签名）；没有别的任务和它抢 |
 | 请求 → Predict（半个往返） | 约 150–180 ms（读一次 233–311 ms） | `rt.sh latency` 量；`status` 的“网络”一行持续显示 |
 
 具体做法：
 
 1. **只做规则吃单的独立进程**：没有原策略的整步、预挂的几万条记录和账户快照、复盘页重算、σ 校准，主循环延迟只剩零点几毫秒（`status` 的“速度”一行实时显示）。
-2. **推送一到，当场看这一场**：每一场有自己的“正在看”标记，推送带来的变化在同一个事件循环回合里判断、定份数、签名、交给发单线程（Python 3.12 的 eager task）。另一场在等 REST 读取，不再挡住这一场（huice 同一时刻只能跑一轮）。
+2. **推送一到，当场看这一场**：每一场有自己的“正在看”标记，读推送的那个任务直接调用这一场的判断、定份数、签名，并当场把下单请求的字节写进到 Predict 的连接，然后才去读下一帧（不经过调度、也不受调度器的轮转预算限制）。另一场在等 REST 读取，不再挡住这一场（huice 同一时刻只能跑一轮）。
 3. **预先签好单**：每秒检查时段和对手挂单时刻（`RULE_LEAD_MINUTES`）前后，每场“这一场还能买的全部份数、按规则价”的那张单提前签好。salt 由场次和第几张单决定，所以预先签的和当场签的是**同一张单**，用上时 `status` 的抢单记录写“预先签好”。
 4. **不等上一张的应答**：一张单发出后马上可以看下一次推送；盘口上新出现、超出在途订单份数的卖单立刻另下一张（每场最多 3 张同时在途，份数上限照算在途的）。
 5. **连接保温**：忙的时段（开场前 15 分钟、对手挂单时刻、每秒检查时段、盘中）保证 2 秒内用过一条到 Predict 的连接——下单请求只复用 3 秒内用过的连接（否则怕连接已被服务器关掉、订单结果不明），这样下单永远不用重新 TCP+TLS 握手。
 6. **下单路上不读链**：交易所授权额度是无限额度时不再在下单前读链（后台每小时核对），登录 token 在后台提前续期，余额在后台读（忙的时段每 20 秒、平时每 2 分钟、每次成交后马上读一次）。
-7. **订单走自己的线程**：下单、撤单和读取用不同的线程池，读取慢的时候订单不排队。
-8. **更快的编码和签名**：推送帧用 orjson 解析，订单请求体提前编码成字节；EIP-712 哈希按字段直接拼（不走 eth-account 的通用编码器，测试里逐字节核对一致），签名用 coincurve 原生 secp256k1。
-9. **抢单那几秒不做垃圾回收**：启动后把已有对象冻结（`gc.freeze`），对手挂单时刻前 6 秒到后 15 秒、盘中开头、等撮合开启时关掉自动垃圾回收。
+7. **订单不排在读取后面**：下单、撤单有自己的并发名额（读取最多占 4 个，至少留 2 个给订单），限流节拍里订单可以预支，读取慢的时候订单不排队。
+8. **更快的编码和签名**：Rust 原生 JSON 解析和 secp256k1 签名（带预计算表，启动时就建好）；订单请求体直接按字段拼成字节；EIP-712 哈希按字段直接拼——和 Python 版、和 eth-account 的通用编码器逐字节一致（测试里核对）。
+9. **没有垃圾回收停顿**：Rust 没有垃圾回收（Python 版要在抢单那几秒手动关掉它）；连接复用前先确认服务器没关它，下单请求不会落在一条已断的连接上。
 10. **部署在东京**，systemd 里给进程 `Nice=-5`。
 
 没有改的：规则本身、价格、份数、每天上限、开场前 15 秒停止下单、签名在开场前 5 秒到期、1.5 秒后撤掉没成交的部分、60 秒确认没有晚到的成交、409 / 应答丢失按哈希核对绝不重发、手续费按份数扣——全部和 huice 一样。
@@ -259,7 +292,7 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 
 比较输出里“读盘口 … 中位”那个数：最小的区域离 Predict 最近（下单的往返和它差不多）。
 
-**AWS 还是 Google Cloud？** 对速度起作用的是机器在哪个城市，不是哪家云：两家在东京都有机房，请求都是先到 Cloudflare 的东京入口、再到 Predict。估计两家只差一两毫秒（没有实测过），而从阿姆斯特丹搬到东京省的是几百毫秒。这个仓库的部署脚本是给 Google Cloud 写的（Cloud Shell 一条命令部署、用网页预览看控制台，自己电脑上什么都不用装）；代码本身不挑云，`deploy/gcp/vm-setup.sh` 在任何 Ubuntu 24.04 机器上都能装。建议先在 Google Cloud 东京跑起来看实测；想和 AWS 东京（`ap-northeast-1`）比，在那边开一台小机器跑同一个 `python -m ruletaker latency`，比“读盘口”的中位数。如果别的区域明显更小，`ZONE=那个区域 bash deploy/gcp/rt.sh deploy` 换过去（先 `delete` 旧的，或者用 `VM=ruletaker2` 另起一台再删旧的，注意不要两台同时 `on`）。
+**AWS 还是 Google Cloud？** 对速度起作用的是机器在哪个城市，不是哪家云：两家在东京都有机房，请求都是先到 Cloudflare 的东京入口、再到 Predict。估计两家只差一两毫秒（没有实测过），而从阿姆斯特丹搬到东京省的是几百毫秒。这个仓库的部署脚本是给 Google Cloud 写的（Cloud Shell 一条命令部署、用网页预览看控制台，自己电脑上什么都不用装）；代码本身不挑云，`deploy/gcp/vm-setup.sh` 在任何 Ubuntu 24.04 机器上都能装。建议先在 Google Cloud 东京跑起来看实测；想和 AWS 东京（`ap-northeast-1`）比，在那边开一台小机器跑同一个 `ruletaker latency`（或 Python 版的 `python -m ruletaker latency`），比“读盘口”的中位数。如果别的区域明显更小，`ZONE=那个区域 bash deploy/gcp/rt.sh deploy` 换过去（先 `delete` 旧的，或者用 `VM=ruletaker2` 另起一台再删旧的，注意不要两台同时 `on`）。
 
 ---
 
@@ -337,7 +370,7 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 - 机器**不带服务账号**：就算有人进了机器，也拿不到能操作你 Google Cloud 项目的令牌。
 - 服务只往外连（Predict、BNB 链节点、币安、Telegram），**不监听任何公网端口**；控制台只在本机 `127.0.0.1`，要看得走 SSH 通道。
 - **`bash deploy/gcp/rt.sh lockdown`**（部署后运行一次）：防火墙封掉这台机器的所有入站连接，SSH 只能走 Google 的 IAP 通道——连接先过 Google 登录和项目权限检查，公网上连不到它的 22 端口。脚本先验证通道能用才封；封完验证失败会自动撤回。之后 `rt.sh` 的所有命令自动走通道（慢一两秒）；`rt.sh unlock` 解除。
-- **依赖锁定并校验哈希**（`requirements.lock`）：机器上装的每个 Python 包都按 SHA-256 校验，只装和测试时完全相同的文件，被调包的、之后新发布的版本一律拒绝；只装现成的 wheel，不在机器上编译。
+- **依赖锁定并校验哈希**：Rust 版的每个依赖包按 `Cargo.lock` 锁定版本，cargo 下载时逐个核对 SHA-256（`--locked`：锁文件和代码对不上就拒绝编译）；编译器来自 Ubuntu 官方源（有签名的软件包，不从网上下载安装脚本）。Python 版（备用）的每个包按 `python/requirements.lock` 的 SHA-256 校验，只装现成的 wheel。
 - Shielded VM（安全启动、vTPM、完整性监控）；Ubuntu 默认自动装安全更新。
 - 网页控制台的所有修改操作要专用请求头（别的网站的页面发不出来）；私钥、Key 不能在网页或 Telegram 里改；Telegram 只认 `ADMIN_USER_ID`，而且改不了价格和份数。
 
@@ -378,30 +411,43 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 
 ## 本地运行与测试
 
+Rust 版（需要 Rust 1.85 以上：Ubuntu 24.04 上 `sudo apt install cargo-1.97`，或用 rustup）：
+
 ```bash
-python3 -m venv venv && venv/bin/pip install --require-hashes --only-binary :all: -r requirements.lock   # 需要 Python 3.12 以上
-venv/bin/python -m unittest discover -s tests      # 全部离线测试（不联网、不要 Key）
-venv/bin/python tests/bench_hotpath.py              # 推送帧 → 下单请求交出 的耗时
-venv/bin/python -m ruletaker plan                   # 接下来两天每条规则的场次（北京 / 纽约时间）
-venv/bin/python -m ruletaker run --env ruletaker.env
+cargo test                                            # 全部离线测试（不联网、不要 Key）
+cargo test --release bench_hot_path -- --ignored --nocapture   # 推送帧 → 下单请求交给网络 的耗时
+cargo run --release -- plan                           # 接下来两天每条规则的场次（北京 / 纽约时间）
+cargo run --release -- check --env ruletaker.env      # 只读自检
+cargo run --release -- run --env ruletaker.env
 ```
 
-测试覆盖：时段和 CME 日历（夏令时、周末、节假日）、盘口换算、签名（快路径和 eth-account 通用路径逐字节一致、能还原签名人）、一张单从推送到结算的全过程（整场一张单、在途订单旁边再下一张、读成交、撤单、晚到成交、结算盈亏）、每天上限和余额、暂停和亏损停机、被拒、应答丢失按哈希找回、409、发单途中设置变了、撮合没开启时等待、预先签名、订单日志崩溃恢复、只记录模式、开场前 15 秒、盘中吃单（指数领先、第 1 分钟价格上限）、推送连接、HTTP 连接复用（POST 绝不重发）、控制台（网页保存设置、整体校验、重启后仍有效、和设置文件冲突时只删冲突项、模式不高于部署设置、没有 X-RT 头的 POST 一律拒绝）、复盘统计和 CSV。有 huice 仓库在旁边时（`../huice` 或 `HUICE_PATH`），`tests/test_parity.py` 会直接调用 huice 的原函数逐项对照：一年里每条规则的场次、CME 日历、盘口换算、订单金额、签名、结果解析、设置解析都一致。
+Python 版（备用，在 `python/` 目录里）：
+
+```bash
+cd python
+python3 -m venv venv && venv/bin/pip install --require-hashes --only-binary :all: -r requirements.lock   # 需要 Python 3.12 以上
+venv/bin/python -m unittest discover -s tests
+venv/bin/python tests/bench_hotpath.py
+```
+
+测试覆盖（Rust 版）：时段和 CME 日历（夏令时、周末、节假日，两年逐场和 Python 版对照）、盘口换算（含 1 − 0.42 这种必须精确的比较）、签名和请求体（和 Python 版逐字节一致、能还原签名人）、一张单从推送到结算的全过程（整场一张单、在途订单旁边再下一张、读成交、撤单、晚到成交、结算盈亏）、每天上限和余额、暂停和亏损停机、被拒、应答丢失按哈希找回、409、发单途中设置变了、发出那一刻再核开场前 15 秒、停止时撤掉在途单、跟单不碰在途单、撮合没开启时等待、预先签名、订单日志崩溃恢复、只记录模式、数据库写不进去时不下单、自检、挂单测试、网页控制台的接口（设置保存 / 校验 / 恢复、模式不高于部署设置、没有 X-RT 头的 POST 一律拒绝、STATUS_KEY）、Telegram 命令和 /id、HTTP 连接复用（服务器悄悄关掉的连接在发单前就被发现、POST 绝不重发、gzip、chunked、重定向）、推送的版本和合并、币安指数、SQLite 读写、复盘统计和 CSV、主循环从启动到停止。
 
 代码结构：
 
 | 文件 | 内容 |
 |---|---|
-| `ruletaker/taker.py` | 规则吃单本体（找市场、看盘、下单、跟单、结算、状态） |
-| `ruletaker/rules.py` | 规则和场次、盘口换算、记录的统计 |
-| `ruletaker/stream.py` | Predict 盘口推送 |
-| `ruletaker/predict.py` | Predict REST 接口、限流节拍、链上读余额和授权 |
-| `ruletaker/wallet.py` | 订单签名（EIP-712，Predict 账户的 Kernel 包装） |
-| `ruletaker/index.py` | 币安合约指数（盘中吃单用） |
-| `ruletaker/http.py` | 长连接 HTTP |
-| `ruletaker/store.py` | SQLite 记录 |
-| `ruletaker/notify.py`、`status.py` | Telegram、状态页和控制台的接口 |
-| `ruletaker/console.py`、`review.py`、`web/console.html` | 控制台的设置（网页保存、整体校验）、复盘的统计和 CSV、网页本身 |
-| `ruletaker/config.py`、`clock.py`、`cards.py` | 设置、纽约时间和 CME 日历、15 分钟市场 |
+| `src/taker/` | 规则吃单本体：`look.rs`（看盘、定份数、签名、下单）、`orders.rs`（跟单、撤单、结算）、`flow.rs`（主循环、节奏、预热、核对、盘中）、`control.rs`（暂停 / 模式 / 自检 / 挂单测试 / 网页设置）、`text.rs`（状态文字） |
+| `src/rules.rs` | 规则和场次、盘口换算、记录的统计、抢单记录 |
+| `src/stream.rs` | Predict 盘口推送 |
+| `src/predict.rs` | Predict REST 接口、限流节拍、链上读余额和授权、应答解析 |
+| `src/wallet.rs` | 订单签名（EIP-712，Predict 账户的 Kernel 包装） |
+| `src/index.rs` | 币安合约指数（盘中吃单用） |
+| `src/http.rs` | 长连接 HTTP/1.1（TLS、连接池、断连检测、POST 绝不重发） |
+| `src/store.rs` | SQLite 记录（和 Python 版同一个表、同一种格式） |
+| `src/telegram.rs`、`src/server.rs` | Telegram、状态页和控制台的接口 |
+| `src/console.rs`、`src/review.rs`、`web/console.html` | 控制台的设置、复盘的统计和 CSV、网页本身 |
+| `src/config.rs`、`src/clock.rs`、`src/cards.rs` | 设置、纽约时间和 CME 日历、15 分钟市场 |
+| `src/tests.rs`、`src/parity.rs`、`tests/vectors/` | 全过程测试、和 Python 版逐字节对照的数据 |
 | `deploy/gcp/` | Google Cloud 部署脚本（`rt.sh`，含安全加固 `lockdown`）、systemd 服务、虚拟机安装脚本 |
-| `requirements.txt`、`requirements.lock` | 直接依赖；全部依赖的版本和哈希锁定（部署时逐个校验） |
+| `Cargo.toml`、`Cargo.lock` | Rust 依赖；全部依赖的版本和哈希锁定 |
+| `python/` | Python 版 2.0（备用）：`python/ruletaker/`、测试、`requirements.lock` |

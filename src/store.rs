@@ -89,6 +89,13 @@ impl Store {
         self.tx.is_some()
     }
 
+    /// The tests' stand-in for a disk that refuses the writes.
+    pub fn fail_for_test(&self, text: &str) {
+        if let Ok(mut e) = self.shared.error.lock() {
+            *e = text.to_string();
+        }
+    }
+
     /// The write that failed last ("" while the writes go through).
     pub fn error(&self) -> String {
         self.shared.error.lock().map(|e| e.clone()).unwrap_or_default()
@@ -118,6 +125,12 @@ impl Store {
         if !key.starts_with(crate::rules::PREFIX) {
             self.data.insert(key.to_string(), value.clone());
         }
+        self.enqueue(Item::Put(key.to_string(), text));
+    }
+
+    /// A rule record written behind, serialised from the taker's own copy (nothing kept here: the taker holds it).
+    pub fn put_record(&mut self, key: &str, rec: &serde_json::Map<String, Value>) {
+        let text = serde_json::to_string(rec).unwrap_or_else(|_| "null".into());
         self.enqueue(Item::Put(key.to_string(), text));
     }
 

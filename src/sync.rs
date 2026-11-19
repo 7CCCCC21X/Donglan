@@ -44,7 +44,9 @@ impl Event {
 
 /// The future run now up to its first real wait (its request's bytes out in this very call), then left to the loop.
 pub fn start_now<F: Future<Output = ()> + 'static>(fut: F) -> Option<JoinHandle<()>> {
-    let mut boxed: Pin<Box<dyn Future<Output = ()>>> = Box::pin(fut);
+    // (unconstrained: the loop's cooperative budget, spent by whatever ran before in this turn, never makes the look or the
+    // order's request yield on the way — its bytes go out now)
+    let mut boxed: Pin<Box<dyn Future<Output = ()>>> = Box::pin(tokio::task::unconstrained(fut));
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     match boxed.as_mut().poll(&mut cx) {

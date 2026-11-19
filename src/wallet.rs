@@ -19,7 +19,8 @@ pub const KERNEL_NAME: &str = "Kernel";
 pub const KERNEL_VERSION: &str = "0.3.1";
 pub const PRICE_TICK_WEI: u128 = 10_000_000_000_000_000;
 
-pub const EXCHANGES: [&str; 4] = ["CTF_EXCHANGE", "NEG_RISK_CTF_EXCHANGE", "YIELD_BEARING_CTF_EXCHANGE", "YIELD_BEARING_NEG_RISK_CTF_EXCHANGE"];
+pub const EXCHANGES: [&str; 4] =
+    ["CTF_EXCHANGE", "NEG_RISK_CTF_EXCHANGE", "YIELD_BEARING_CTF_EXCHANGE", "YIELD_BEARING_NEG_RISK_CTF_EXCHANGE"];
 
 /// Contract addresses per chain, as published in the official SDKs.
 pub fn addresses(chain_id: i64) -> Option<[(&'static str, &'static str); 6]> {
@@ -244,7 +245,15 @@ impl Order {
     }
 }
 
-pub fn build_order(wallet: &Wallet, token_id: &str, maker_amount: u128, taker_amount: u128, fee_bps: i64, expiration: i64, salt: u64) -> Order {
+pub fn build_order(
+    wallet: &Wallet,
+    token_id: &str,
+    maker_amount: u128,
+    taker_amount: u128,
+    fee_bps: i64,
+    expiration: i64,
+    salt: u64,
+) -> Order {
     Order {
         salt,
         maker: wallet.maker.clone(),
@@ -292,7 +301,8 @@ impl Wallet {
         let mut addr = [0u8; 20];
         addr.copy_from_slice(&digest[12..]);
         let signer = checksum(&addr);
-        let predict_account = if predict_account.trim().is_empty() { String::new() } else { checksum(&address_bytes(predict_account.trim())?) };
+        let predict_account =
+            if predict_account.trim().is_empty() { String::new() } else { checksum(&address_bytes(predict_account.trim())?) };
         let maker = if predict_account.is_empty() { signer.clone() } else { predict_account.clone() };
         let domain_type = keccak(DOMAIN_TYPE_TEXT.as_bytes());
         let domain = |name: &str, version: &str, contract: &str| -> Result<[u8; 32], String> {
@@ -309,7 +319,10 @@ impl Wallet {
             let contract = book.iter().find(|(k, _)| *k == name).map(|(_, v)| *v).unwrap_or(ZERO_ADDRESS);
             domains.push((name, domain(PROTOCOL_NAME, PROTOCOL_VERSION, contract)?));
         }
-        let kernel_domain = if predict_account.is_empty() { [0u8; 32] } else { domain(KERNEL_NAME, KERNEL_VERSION, &predict_account)? };
+        let kernel_domain =
+            if predict_account.is_empty() { [0u8; 32] } else { domain(KERNEL_NAME, KERNEL_VERSION, &predict_account)? };
+        // (the curve's precomputed tables made now, at the start, not at the first order)
+        let _ = key.sign_prehash_recoverable(&[1u8; 32]);
         Ok(Wallet {
             chain_id,
             addresses: book.to_vec(),
@@ -413,11 +426,30 @@ impl Wallet {
 
 /// The request body of an order: {"data": {"order": {fields, signature, hash}, "strategy": "LIMIT", "pricePerShare"}}.
 pub fn order_body(order: &Order, signature: &str, hash: &str, price_per_share: u128) -> Vec<u8> {
-    let mut fields = order.fields();
-    fields.insert("signature".into(), json!(signature));
-    fields.insert("hash".into(), json!(hash));
-    let body = json!({"data": {"order": Value::Object(fields), "strategy": "LIMIT", "pricePerShare": price_per_share.to_string()}});
-    serde_json::to_vec(&body).unwrap_or_default()
+    let quoted = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        concat!(
+            r#"{{"data":{{"order":{{"salt":"{}","maker":{},"signer":{},"taker":{},"tokenId":{},"makerAmount":"{}","takerAmount":"{}","#,
+            r#""expiration":"{}","nonce":"{}","feeRateBps":"{}","side":{},"signatureType":{},"signature":{},"hash":{}}},"#,
+            r#""strategy":"LIMIT","pricePerShare":"{}"}}}}"#
+        ),
+        order.salt,
+        quoted(&order.maker),
+        quoted(&order.signer),
+        quoted(&order.taker),
+        quoted(&order.token_id),
+        order.maker_amount,
+        order.taker_amount,
+        order.expiration,
+        order.nonce,
+        order.fee_rate_bps,
+        order.side,
+        order.signature_type,
+        quoted(signature),
+        quoted(hash),
+        price_per_share
+    )
+    .into_bytes()
 }
 
 #[cfg(test)]

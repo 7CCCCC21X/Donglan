@@ -50,7 +50,8 @@ pub async fn ws_connect(url: &str, headers: &[(String, String)]) -> Result<Ws, S
             tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&crate::http::user_agent()).map_err(|e| e.to_string())?,
         );
         let config = WebSocketConfig::default().max_message_size(Some(4 << 20)).max_frame_size(Some(4 << 20));
-        let (ws, _) = tokio_tungstenite::client_async_with_config(request, stream, Some(config)).await.map_err(|e| e.to_string())?;
+        let (ws, _) =
+            tokio_tungstenite::client_async_with_config(request, stream, Some(config)).await.map_err(|e| e.to_string())?;
         Ok::<Ws, String>(ws)
     };
     tokio::time::timeout(Duration::from_secs(15), opening).await.map_err(|_| "timed out during opening handshake".to_string())?
@@ -131,7 +132,9 @@ impl BookStream {
             on_change: RefCell::new(None),
             stamps: RefCell::new(HashMap::new()),
             lags: RefCell::new(VecDeque::new()),
-            conns: (0..connections.max(1)).map(|_| ConnState { backoff: Cell::new(Self::BACKOFF.0), ..Default::default() }).collect(),
+            conns: (0..connections.max(1))
+                .map(|_| ConnState { backoff: Cell::new(Self::BACKOFF.0), ..Default::default() })
+                .collect(),
             stopping: Event::new(),
             fake_alive: Cell::new(None),
         }
@@ -466,7 +469,8 @@ impl BookStream {
                         self.take(mid, obj.get("data").unwrap_or(&Value::Null));
                     }
                 } else if topic == HEARTBEAT {
-                    let echo = json!({"method": "heartbeat", "data": obj.get("data").cloned().unwrap_or(Value::Null)}).to_string();
+                    let echo =
+                        json!({"method": "heartbeat", "data": obj.get("data").cloned().unwrap_or(Value::Null)}).to_string();
                     sink.send(Message::text(echo)).await.map_err(|e| clean_error(e.to_string()))?;
                 }
             }
@@ -477,12 +481,17 @@ impl BookStream {
                     if let Some((method, mid)) = found {
                         let success = obj.get("success");
                         let failed = matches!(success, Some(Value::Bool(false)))
-                            || (matches!(success, None | Some(Value::Null)) && obj.get("error").map(crate::util::truthy).unwrap_or(false));
+                            || (matches!(success, None | Some(Value::Null))
+                                && obj.get("error").map(crate::util::truthy).unwrap_or(false));
                         if !mid.is_empty() && failed {
                             if method == "subscribe" {
                                 c.subscribed.borrow_mut().remove(&mid); // asked for again at the next sync
                             }
-                            let said = obj.get("error").filter(|e| crate::util::truthy(e)).map(crate::util::py_str).unwrap_or_else(|| "拒绝".into());
+                            let said = obj
+                                .get("error")
+                                .filter(|e| crate::util::truthy(e))
+                                .map(crate::util::py_str)
+                                .unwrap_or_else(|| "拒绝".into());
                             *c.error.borrow_mut() = format!("{method} {mid}：{said}");
                         }
                     }

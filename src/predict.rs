@@ -100,7 +100,13 @@ fn type_name(v: &Value) -> &'static str {
         Value::Array(_) => "list",
         Value::String(_) => "str",
         Value::Bool(_) => "bool",
-        Value::Number(n) => if n.is_f64() { "float" } else { "int" },
+        Value::Number(n) => {
+            if n.is_f64() {
+                "float"
+            } else {
+                "int"
+            }
+        }
         Value::Object(_) => "dict",
     }
 }
@@ -123,7 +129,15 @@ impl Pacer {
     pub const BURST: f64 = 8.0;
 
     pub fn new(per_min: f64) -> Pacer {
-        Pacer { per_min, tokens: 0.0, at: mono(), waited: 0.0, waits: VecDeque::new(), sent: VecDeque::new(), limits: VecDeque::new() }
+        Pacer {
+            per_min,
+            tokens: 0.0,
+            at: mono(),
+            waited: 0.0,
+            waits: VecDeque::new(),
+            sent: VecDeque::new(),
+            limits: VecDeque::new(),
+        }
     }
     pub fn refill(&mut self) {
         let now = mono();
@@ -230,6 +244,8 @@ pub struct PredictApi {
     /// monotonic: the last answered request (a warm connection)
     pub last_ok: Cell<f64>,
     pub transport: Rc<dyn Transport>,
+    /// the tests' stand-in for whatever a request waits for before its bytes leave (a token, a slot, a sign-in)
+    pub pre_send: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 impl PredictApi {
@@ -261,6 +277,7 @@ impl PredictApi {
             trips: RefCell::new(VecDeque::new()),
             last_ok: Cell::new(0.0),
             transport,
+            pre_send: RefCell::new(None),
         }
     }
 
@@ -287,7 +304,15 @@ impl PredictApi {
 
     /// One request: the key's token, a slot (a read takes one of the reads' slots first), then the request. ``check``: the
     /// order hash before_send judges inside the slot, right before the bytes go out. An explicit success=false is a refusal.
-    pub async fn call(&self, method: &str, path: &str, payload: Option<Rc<Vec<u8>>>, timeout: f64, priority: bool, check: &str) -> Res<Value> {
+    pub async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        payload: Option<Rc<Vec<u8>>>,
+        timeout: f64,
+        priority: bool,
+        check: &str,
+    ) -> Res<Value> {
         let left = self.cooling();
         if left > 0.0 {
             return Err(Self::cooling_error(left));
@@ -336,6 +361,10 @@ impl PredictApi {
             return Err(Self::cooling_error(left));
         }
         if !check.is_empty() {
+            let hook = self.pre_send.borrow().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
             let gate = self.before_send.borrow().clone();
             if let Some(f) = gate {
                 let why = f(check);
@@ -362,7 +391,15 @@ impl PredictApi {
         }
     }
 
-    pub async fn authed(&self, method: &str, path: &str, payload: Option<Rc<Vec<u8>>>, timeout: f64, priority: bool, check: &str) -> Res<Value> {
+    pub async fn authed(
+        &self,
+        method: &str,
+        path: &str,
+        payload: Option<Rc<Vec<u8>>>,
+        timeout: f64,
+        priority: bool,
+        check: &str,
+    ) -> Res<Value> {
         self.ensure_auth().await?;
         let used = self.jwt.borrow().clone();
         match self.call(method, path, payload.clone(), timeout, priority, check).await {
@@ -402,7 +439,9 @@ impl PredictApi {
                 return Err(RemoteError::new(format!("登录消息格式异常（应答字段：{}）", answer_shape(&data))));
             }
             let body = json!({"signer": wallet.maker, "signature": wallet.sign_text(&message), "message": message});
-            let answer = self.call("POST", "/auth", Some(Rc::new(serde_json::to_vec(&body).unwrap_or_default())), API_TIMEOUT, false, "").await?;
+            let answer = self
+                .call("POST", "/auth", Some(Rc::new(serde_json::to_vec(&body).unwrap_or_default())), API_TIMEOUT, false, "")
+                .await?;
             let token = answer.val("data").map(|d| d.s("token")).unwrap_or_default();
             if token.is_empty() {
                 return Err(RemoteError::new(format!("登录未返回 token（应答字段：{}）", answer_shape(&answer))));
@@ -441,7 +480,10 @@ impl PredictApi {
         let Some(d) = data.as_object().filter(|d| d.contains_key("bids") || d.contains_key("asks")) else {
             return Err(RemoteError::new("订单簿格式异常"));
         };
-        Ok((predict_levels(d.get("bids").unwrap_or(&Value::Null), true), predict_levels(d.get("asks").unwrap_or(&Value::Null), false)))
+        Ok((
+            predict_levels(d.get("bids").unwrap_or(&Value::Null), true),
+            predict_levels(d.get("asks").unwrap_or(&Value::Null), false),
+        ))
     }
 
     /// POST /orders -> the order's id and hash; ``body`` the request's bytes made beforehand, ``digest`` the order's hash
@@ -462,13 +504,16 @@ impl PredictApi {
         if order_id.is_empty() {
             return Err(RemoteError::new(format!("下单应答没有订单号：{}", shown())));
         }
-        let hash = [data.get("orderHash"), data.get("hash")].into_iter().flatten().find(|v| truthy(v)).map(py_str).unwrap_or_default();
+        let hash =
+            [data.get("orderHash"), data.get("hash")].into_iter().flatten().find(|v| truthy(v)).map(py_str).unwrap_or_default();
         Ok(Created { order_id, hash })
     }
 
     pub async fn remove_orders(&self, ids: &[String]) -> Res<(Vec<String>, Vec<String>)> {
         let body = json!({"data": {"ids": ids}});
-        let answer = self.authed("POST", "/orders/remove", Some(Rc::new(serde_json::to_vec(&body).unwrap_or_default())), API_TIMEOUT, true, "").await?;
+        let answer = self
+            .authed("POST", "/orders/remove", Some(Rc::new(serde_json::to_vec(&body).unwrap_or_default())), API_TIMEOUT, true, "")
+            .await?;
         let data = answer.get("data").filter(|d| d.is_object()).cloned().unwrap_or(answer);
         let list = |k: &str| data.arr(k).iter().map(py_str).collect::<Vec<_>>();
         Ok((list("removed"), list("noop")))
@@ -489,7 +534,11 @@ impl PredictApi {
             let want = hash.to_lowercase();
             row = rows
                 .iter()
-                .find(|r| r.is_object() && (order_hash_of(r) == want || (!order_id.is_empty() && py_str(r.get("id").unwrap_or(&Value::Null)) == order_id)))
+                .find(|r| {
+                    r.is_object()
+                        && (order_hash_of(r) == want
+                            || (!order_id.is_empty() && py_str(r.get("id").unwrap_or(&Value::Null)) == order_id))
+                })
                 .cloned()
                 .unwrap_or(Value::Null);
         }
@@ -545,7 +594,11 @@ pub fn quote(text: &str) -> String {
 pub fn dec_of(v: &Value) -> Option<Decimal> {
     let text = match v {
         Value::Number(n) => {
-            if n.is_f64() { crate::util::py_float(n.as_f64()?) } else { n.to_string() }
+            if n.is_f64() {
+                crate::util::py_float(n.as_f64()?)
+            } else {
+                n.to_string()
+            }
         }
         Value::String(s) => s.trim().to_string(),
         Value::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
@@ -560,10 +613,7 @@ pub fn predict_levels(rows: &Value, bids: bool) -> Vec<Level> {
     for row in rows.as_array().map(Vec::as_slice).unwrap_or(&[]) {
         let (price, size) = match row {
             Value::Array(a) if a.len() >= 2 => (dec_of(&a[0]), dec_of(&a[1])),
-            Value::Object(o) => (
-                o.get("price").and_then(dec_of),
-                o.get("size").or_else(|| o.get("quantity")).and_then(dec_of),
-            ),
+            Value::Object(o) => (o.get("price").and_then(dec_of), o.get("size").or_else(|| o.get("quantity")).and_then(dec_of)),
             _ => continue,
         };
         let (Some(price), Some(size)) = (price, size) else { continue };
@@ -735,9 +785,16 @@ pub fn predict_resolution(market: &Obj) -> Option<Resolution> {
     if !["RESOLV", "SETTL", "FINAL"].iter().any(|w| status.contains(w)) {
         return None;
     }
-    let res = ["resolution", "resolvedOutcome", "winningOutcome", "winner"].iter().find_map(|k| market.get(*k).filter(|v| truthy(v)));
+    let res =
+        ["resolution", "resolvedOutcome", "winningOutcome", "winner"].iter().find_map(|k| market.get(*k).filter(|v| truthy(v)));
     let name = match res {
-        Some(Value::Object(r)) => if r.t("name") { r.s("name") } else { r.s("outcome") },
+        Some(Value::Object(r)) => {
+            if r.t("name") {
+                r.s("name")
+            } else {
+                r.s("outcome")
+            }
+        }
         Some(Value::String(s)) => s.clone(),
         _ => String::new(),
     };
@@ -811,7 +868,13 @@ pub fn outcome_for_side(side: &str, outcomes: &[Outcome]) -> (Option<Outcome>, S
     let ups: Vec<usize> = (0..2).filter(|i| UP_WORDS.contains(&names[*i].as_str())).collect();
     let downs: Vec<usize> = (0..2).filter(|i| DOWN_WORDS.contains(&names[*i].as_str())).collect();
     let hit = if side == "up" {
-        if ups.len() == 1 { Some(ups[0]) } else if downs.len() == 1 { Some(1 - downs[0]) } else { None }
+        if ups.len() == 1 {
+            Some(ups[0])
+        } else if downs.len() == 1 {
+            Some(1 - downs[0])
+        } else {
+            None
+        }
     } else if downs.len() == 1 {
         Some(downs[0])
     } else if ups.len() == 1 {
@@ -834,16 +897,33 @@ pub fn book_up_first(market: &Obj) -> bool {
 
 pub fn order_hash_of(row: &Value) -> String {
     let inner = row.get("order").filter(|o| o.is_object());
-    let pick = inner.and_then(|o| o.get("hash")).filter(|v| truthy(v)).or_else(|| row.get("hash").filter(|v| truthy(v))).or_else(|| row.get("orderHash").filter(|v| truthy(v)));
+    let pick = inner
+        .and_then(|o| o.get("hash"))
+        .filter(|v| truthy(v))
+        .or_else(|| row.get("hash").filter(|v| truthy(v)))
+        .or_else(|| row.get("orderHash").filter(|v| truthy(v)));
     pick.map(py_str).unwrap_or_default().to_lowercase()
 }
 
 pub const FILLED_STATUSES: [&str; 4] = ["FILLED", "MATCHED", "COMPLETED", "DONE"];
 pub const FINAL_STATUSES: [&str; 14] = [
-    "FILLED", "CANCELLED", "CANCELED", "EXPIRED", "INVALIDATED", "REJECTED", "FAILED", "MATCHED", "CLOSED", "COMPLETED", "DONE",
-    "SETTLED", "RESOLVED", "UNKNOWN",
+    "FILLED",
+    "CANCELLED",
+    "CANCELED",
+    "EXPIRED",
+    "INVALIDATED",
+    "REJECTED",
+    "FAILED",
+    "MATCHED",
+    "CLOSED",
+    "COMPLETED",
+    "DONE",
+    "SETTLED",
+    "RESOLVED",
+    "UNKNOWN",
 ];
-pub const OPEN_STATUSES: [&str; 9] = ["OPEN", "PENDING", "ACTIVE", "LIVE", "NEW", "PARTIAL", "PARTIALLY_FILLED", "PARTIALLY FILLED", "RESTING"];
+pub const OPEN_STATUSES: [&str; 9] =
+    ["OPEN", "PENDING", "ACTIVE", "LIVE", "NEW", "PARTIAL", "PARTIALLY_FILLED", "PARTIALLY FILLED", "RESTING"];
 
 fn is_final_status(s: &str) -> bool {
     FINAL_STATUSES.contains(&s)
@@ -853,7 +933,9 @@ fn big_int(v: Option<&Value>) -> Option<i128> {
     match v {
         None | Some(Value::Null) => Some(0),
         Some(v) if !truthy(v) => Some(0),
-        Some(Value::Number(n)) => n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from)).or_else(|| n.as_f64().map(|x| x as i128)),
+        Some(Value::Number(n)) => {
+            n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from)).or_else(|| n.as_f64().map(|x| x as i128))
+        }
         Some(Value::String(s)) => s.trim().parse::<i128>().ok(),
         Some(other) => Some(as_f64(other) as i128),
     }
@@ -1056,7 +1138,10 @@ mod tests {
         assert_eq!(info.fee_bps, 200);
         let (o, note) = outcome_for_side("down", &info.outcomes);
         assert_eq!((o.unwrap().token.as_str(), note.as_str()), ("22", ""));
-        let row: Obj = serde_json::from_value(json!({"status": "open", "amount": "50000000000000000000", "amountFilled": "25000000000000000000"})).unwrap();
+        let row: Obj = serde_json::from_value(
+            json!({"status": "open", "amount": "50000000000000000000", "amountFilled": "25000000000000000000"}),
+        )
+        .unwrap();
         assert_eq!(order_fill(&row, 50.0), (25.0, "OPEN".to_string()));
         assert!(!order_final(&row, 50.0));
         let row: Obj = serde_json::from_value(json!({"status": "FILLED", "amount": "0"})).unwrap();

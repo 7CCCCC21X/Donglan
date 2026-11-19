@@ -73,7 +73,11 @@ impl Date {
     pub fn parse(text: &str) -> Option<Date> {
         let t = text.trim();
         let b = t.as_bytes();
-        if b.len() != 10 || b[4] != b'-' || b[7] != b'-' || !t.bytes().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()) {
+        if b.len() != 10
+            || b[4] != b'-'
+            || b[7] != b'-'
+            || !t.bytes().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+        {
             return None;
         }
         let (y, m, d) = (t[0..4].parse::<i64>().ok()?, t[5..7].parse::<u32>().ok()?, t[8..10].parse::<u32>().ok()?);
@@ -228,19 +232,37 @@ fn is_word(c: char) -> bool {
 
 /// Telegram tokens (digits:secret) and URLs taken out of a text.
 fn redact(text: &str) -> String {
+    redact_with(text, true)
+}
+
+/// ``urls``: every URL taken out (an error's text: a URL may carry a key); else only the tokens and a Telegram URL (a log line:
+/// the console's own address, an API's host stay readable).
+fn redact_with(text: &str, urls: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
         // https?://\S+
         let rest: String = chars[i..chars.len().min(i + 8)].iter().collect();
-        let scheme = if rest.starts_with("https://") { 8 } else if rest.starts_with("http://") { 7 } else { 0 };
+        let scheme = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            0
+        };
         if scheme > 0 && i + scheme < chars.len() && !chars[i + scheme].is_whitespace() {
             let mut j = i + scheme;
             while j < chars.len() && !chars[j].is_whitespace() {
                 j += 1;
             }
-            out.push_str("[URL]");
+            let url: String = chars[i..j].iter().collect();
+            if urls || url.contains("telegram.org") || url.contains("key=") || url.contains("token=") {
+                out.push_str("[URL]");
+                i = j;
+                continue;
+            }
+            out.push_str(&url);
             i = j;
             continue;
         }
@@ -277,13 +299,34 @@ fn redact(text: &str) -> String {
 
 /// An error's text for logs and messages: Telegram tokens and URLs taken out (a URL may carry a key), cut to 280 characters.
 pub fn clean_error(text: impl fmt::Display) -> String {
-    let text = redact(&text.to_string());
-    text.chars().take(280).collect()
+    let text = text.to_string();
+    let text = if may_hold_secret(&text) { redact(&text) } else { text };
+    if text.len() <= 280 { text } else { text.chars().take(280).collect() }
+}
+
+/// Whether a text may hold what redact() takes out: a URL, or five digits and a colon (a bot token's head).
+fn may_hold_secret(text: &str) -> bool {
+    if text.contains("http://") || text.contains("https://") {
+        return true;
+    }
+    let b = text.as_bytes();
+    let mut run = 0;
+    for &c in b {
+        if c.is_ascii_digit() {
+            run += 1;
+        } else {
+            if c == b':' && run >= 5 {
+                return true;
+            }
+            run = 0;
+        }
+    }
+    false
 }
 
 /// A log line: the tokens and URLs taken out, not cut.
 fn clean_error_keep(text: &str) -> String {
-    if text.contains("http") || text.contains(':') { redact(text) } else { text.to_string() }
+    if may_hold_secret(text) { redact_with(text, false) } else { text.to_string() }
 }
 
 pub fn brief_error(text: &str, limit: usize) -> String {
@@ -354,11 +397,7 @@ pub fn gp(x: f64, p: usize) -> String {
 }
 
 fn strip_zeros(text: &str) -> String {
-    if text.contains('.') {
-        text.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        text.to_string()
-    }
+    if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_string() } else { text.to_string() }
 }
 
 /// Python's ``str(x)`` / ``repr(x)`` of a float: the shortest digits, "5.0" for a whole number, the exponent form outside
@@ -394,9 +433,19 @@ pub fn py_float(x: f64) -> String {
 pub fn py_str(v: &Value) -> String {
     match v {
         Value::Null => "None".into(),
-        Value::Bool(b) => if *b { "True".into() } else { "False".into() },
+        Value::Bool(b) => {
+            if *b {
+                "True".into()
+            } else {
+                "False".into()
+            }
+        }
         Value::Number(n) => {
-            if n.is_f64() { py_float(n.as_f64().unwrap_or(0.0)) } else { n.to_string() }
+            if n.is_f64() {
+                py_float(n.as_f64().unwrap_or(0.0))
+            } else {
+                n.to_string()
+            }
         }
         Value::String(s) => s.clone(),
         other => other.to_string(),
@@ -464,11 +513,7 @@ pub fn median_json(xs: &mut [i64]) -> Value {
     }
     xs.sort();
     let n = xs.len();
-    if n % 2 == 1 {
-        Value::from(xs[n / 2])
-    } else {
-        Value::from((xs[n / 2 - 1] + xs[n / 2]) as f64 / 2.0)
-    }
+    if n % 2 == 1 { Value::from(xs[n / 2]) } else { Value::from((xs[n / 2 - 1] + xs[n / 2]) as f64 / 2.0) }
 }
 
 // --- the records' JSON, read as the Python dicts are -------------------------------------------------------------------
@@ -496,7 +541,9 @@ pub fn as_f64(v: &Value) -> f64 {
 /// ``int(v)`` of a truthy value (a float truncated).
 pub fn as_i64(v: &Value) -> i64 {
     match v {
-        Value::Number(n) => n.as_i64().or_else(|| n.as_u64().map(|u| u as i64)).unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64),
+        Value::Number(n) => {
+            n.as_i64().or_else(|| n.as_u64().map(|u| u as i64)).unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64)
+        }
         Value::Bool(b) => *b as i64,
         Value::String(s) => s.trim().parse::<i64>().unwrap_or_else(|_| s.trim().parse::<f64>().map(|x| x as i64).unwrap_or(0)),
         _ => 0,
@@ -553,6 +600,10 @@ pub trait Py {
     }
     fn state(&self) -> &str {
         self.val("state").and_then(Value::as_str).unwrap_or("")
+    }
+    /// A string field as it stands ("" for anything else) — no copy.
+    fn sv(&self, k: &str) -> &str {
+        self.val(k).and_then(Value::as_str).unwrap_or("")
     }
 }
 
@@ -636,6 +687,8 @@ mod tests {
         assert_eq!(clean_error("HTTP 429: too many"), "HTTP 429: too many");
         assert_eq!(http_status("HTTP 429: x"), 429);
         assert_eq!(http_status("网络错误"), 0);
+        assert_eq!(clean_error_keep("控制台：http://127.0.0.1:8080/"), "控制台：http://127.0.0.1:8080/");
+        assert_eq!(clean_error_keep("POST https://api.telegram.org/bot1234567:ABCDEFGHIJKLMNOPQRS/sendMessage"), "POST [URL]");
     }
 
     #[test]

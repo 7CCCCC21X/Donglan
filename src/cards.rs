@@ -92,7 +92,9 @@ fn find_range(question: &str) -> Option<Found> {
                     for (q, half2) in after_time(&c, p) {
                         for zone in ["ET", "EST", "EDT"] {
                             let z: Vec<char> = zone.chars().collect();
-                            if q + z.len() <= c.len() && c[q..q + z.len()].iter().zip(&z).all(|(a, b)| a.to_ascii_uppercase() == *b) {
+                            if q + z.len() <= c.len()
+                                && c[q..q + z.len()].iter().zip(&z).all(|(a, b)| a.to_ascii_uppercase() == *b)
+                            {
                                 let end = q + z.len();
                                 if end < c.len() && is_word(c[end]) {
                                     continue;
@@ -190,7 +192,8 @@ impl WindowCard {
     }
 }
 
-pub static XAU: WindowCard = WindowCard { key: "XAU-15M", stem: "xau", symbol: "XAUUSDT", coin: "黄金", minutes: 15, hours: "cme" };
+pub static XAU: WindowCard =
+    WindowCard { key: "XAU-15M", stem: "xau", symbol: "XAUUSDT", coin: "黄金", minutes: 15, hours: "cme" };
 pub static CL: WindowCard = WindowCard { key: "CL-15M", stem: "cl", symbol: "CLUSDT", coin: "原油", minutes: 15, hours: "cme" };
 
 pub fn card(key: &str) -> &'static WindowCard {

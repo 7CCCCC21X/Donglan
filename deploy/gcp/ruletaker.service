@@ -7,11 +7,11 @@ Wants=network-online.target
 Type=simple
 User=ruletaker
 Group=ruletaker
-WorkingDirectory=/opt/ruletaker
-Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/var/lib/ruletaker
 Environment=STATE_DB=/var/lib/ruletaker/ruletaker.sqlite3
 # The service reads its settings file itself (inline comments allowed); the process environment above wins over it.
-ExecStart=/opt/ruletaker/venv/bin/python -u -m ruletaker run --env /etc/ruletaker/ruletaker.env
+# (The Rust version; rt.sh python puts the Python version in instead: ruletaker.service.d/python.conf.)
+ExecStart=/opt/ruletaker/bin/ruletaker run --env /etc/ruletaker/ruletaker.env
 Restart=always
 RestartSec=3
 # On a stop: the orders on their way get their answers (25 s at the most) and the resting rest is withdrawn, the records are
@@ -29,6 +29,12 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
 ReadWritePaths=/var/lib/ruletaker
 
 [Install]

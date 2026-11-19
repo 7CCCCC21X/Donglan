@@ -61,7 +61,8 @@ pub fn daily_reopen(start_ms: i64) -> bool {
     if weekday > 3 || (hour, minute) != (18, 0) {
         return false;
     }
-    let ending: Vec<(i64, i64)> = market_shuts("cme", start_ms - 60_000, start_ms).into_iter().filter(|s| s.1 == start_ms).collect();
+    let ending: Vec<(i64, i64)> =
+        market_shuts("cme", start_ms - 60_000, start_ms).into_iter().filter(|s| s.1 == start_ms).collect();
     !ending.is_empty() && ending[0].1 - ending[0].0 <= 65 * 60_000
 }
 
@@ -283,7 +284,18 @@ pub fn walk(levels: &[Level], shares: Decimal) -> Decimal {
     if shares > left { total / (shares - left) } else { Decimal::ZERO }
 }
 
+const POW10: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21,
+    1e22,
+];
+
+/// ``float(d)``: correctly rounded (an exact quotient of two exact doubles when the digits allow, else through the text).
 pub fn dec_f64(d: Decimal) -> f64 {
+    let m = d.mantissa();
+    let scale = d.scale() as usize;
+    if m.unsigned_abs() < (1u128 << 53) && scale < POW10.len() {
+        return m as f64 / POW10[scale];
+    }
     d.to_string().parse().unwrap_or(0.0)
 }
 
@@ -356,10 +368,10 @@ pub fn claims(rec: &Obj) -> f64 {
 
 /// What the orders placed on a Beijing day cost in USDT, the mode's own records: the fills at their price, and the whole of an
 /// order whose word is not final at its limit (RULE_MAX_DAY_USD).
-pub fn spent_on(recs: &Recs, day: &str, mode: &str) -> f64 {
+pub fn spent_on<'a>(recs: impl IntoIterator<Item = &'a Obj>, day: &str, mode: &str) -> f64 {
     let mut total = 0.0;
-    for rec in recs.values() {
-        if rec.s("mode") != mode {
+    for rec in recs {
+        if rec.sv("mode") != mode {
             continue;
         }
         for o in orders(rec) {
@@ -518,8 +530,14 @@ pub fn races(recs: &Recs, mode: &str, since_ms: i64) -> Vec<Obj> {
             x.insert("error".into(), json!(if never_placed(o.state()) { o.s("error") } else { String::new() }));
             let both = |a: &str, b: &str| o.t(a) && o.t(b);
             x.insert("after".into(), opt_i(if o.t("sent_wall") && shown != 0 { Some(o.i("sent_wall") - shown) } else { None }));
-            x.insert("lag".into(), opt_i(if both("book_ts", "seen_wall") { Some(o.i("seen_wall") - o.i("book_ts")) } else { None }));
-            x.insert("own".into(), opt_i(if both("sent_wall", "seen_wall") { Some(o.i("sent_wall") - o.i("seen_wall")) } else { None }));
+            x.insert(
+                "lag".into(),
+                opt_i(if both("book_ts", "seen_wall") { Some(o.i("seen_wall") - o.i("book_ts")) } else { None }),
+            );
+            x.insert(
+                "own".into(),
+                opt_i(if both("sent_wall", "seen_wall") { Some(o.i("sent_wall") - o.i("seen_wall")) } else { None }),
+            );
             x.insert(
                 "wake".into(),
                 opt_i(if both("look_wall", "seen_wall") && o.i("look_wall") >= o.i("seen_wall") {
@@ -530,9 +548,16 @@ pub fn races(recs: &Recs, mode: &str, since_ms: i64) -> Vec<Obj> {
             );
             x.insert(
                 "prep".into(),
-                opt_i(if both("signed_wall", "look_wall") { Some(o.i("signed_wall") - o.i("look_wall").max(o.i("seen_wall"))) } else { None }),
+                opt_i(if both("signed_wall", "look_wall") {
+                    Some(o.i("signed_wall") - o.i("look_wall").max(o.i("seen_wall")))
+                } else {
+                    None
+                }),
             );
-            x.insert("out".into(), opt_i(if both("sent_wall", "signed_wall") { Some(o.i("sent_wall") - o.i("signed_wall")) } else { None }));
+            x.insert(
+                "out".into(),
+                opt_i(if both("sent_wall", "signed_wall") { Some(o.i("sent_wall") - o.i("signed_wall")) } else { None }),
+            );
             x.insert("presigned".into(), json!(o.t("presigned")));
             x.insert("open_wait".into(), o.get("open_wait").cloned().unwrap_or(Value::Null));
             x.insert("open_reads".into(), o.get("open_reads").cloned().unwrap_or(Value::Null));
@@ -574,7 +599,11 @@ pub fn race_text(row: &Obj) -> String {
             parts.push(if open { "还没吃光".into() } else { "到开场前没吃光".into() });
         }
         let joined = parts.join("、");
-        text += &if joined.is_empty() { (if open { "还没有被吃" } else { "到开场前没人吃" }).to_string() } else { joined };
+        text += &if joined.is_empty() {
+            (if open { "还没有被吃" } else { "到开场前没人吃" }).to_string()
+        } else {
+            joined
+        };
     } else {
         text += "卖单出现的时刻没有记到（重启前的，或没看到规则价以内的卖单）";
     }
@@ -653,7 +682,8 @@ pub fn race_text(row: &Obj) -> String {
 }
 
 pub fn race_summary(rows: &[Obj]) -> String {
-    let mut marks: Vec<f64> = rows.iter().filter(|r| r.t("stamped")).map(|r| (r.i("offer_at") % 900_000) as f64 / 1000.0).collect();
+    let mut marks: Vec<f64> =
+        rows.iter().filter(|r| r.t("stamped")).map(|r| (r.i("offer_at") % 900_000) as f64 / 1000.0).collect();
     let mut cuts: Vec<f64> = rows
         .iter()
         .filter(|r| r.t("stamped"))
@@ -681,7 +711,10 @@ pub fn race_summary(rows: &[Obj]) -> String {
     }
     if !ours.is_empty() {
         let a = lo(&ours);
-        parts.push(format!("我们的单在出现后 中位 {:.0} ms 发出（最快 {a:.0}），再加半个往返才到", median(&mut ours).unwrap_or(0.0)));
+        parts.push(format!(
+            "我们的单在出现后 中位 {:.0} ms 发出（最快 {a:.0}），再加半个往返才到",
+            median(&mut ours).unwrap_or(0.0)
+        ));
     }
     parts.join("；")
 }
@@ -739,7 +772,8 @@ pub fn speed_stats(recs: &Recs, since_ms: i64) -> Option<Obj> {
     }
     let marked = rows.iter().any(|o| o.has("fresh"));
     let quick: Vec<&Obj> = if marked { rows.iter().copied().filter(|o| o.t("fresh")).collect() } else { rows.clone() };
-    let lag: Vec<i64> = rows.iter().filter(|o| o.t("book_ts") && o.t("seen_wall")).map(|o| o.i("seen_wall") - o.i("book_ts")).collect();
+    let lag: Vec<i64> =
+        rows.iter().filter(|o| o.t("book_ts") && o.t("seen_wall")).map(|o| o.i("seen_wall") - o.i("book_ts")).collect();
     let own: Vec<i64> = quick.iter().filter(|o| o.t("seen_wall")).map(|o| o.i("sent_wall") - o.i("seen_wall")).collect();
     let wake: Vec<i64> =
         quick.iter().filter(|o| o.t("seen_wall") && o.t("look_wall")).map(|o| o.i("look_wall") - o.i("seen_wall")).collect();

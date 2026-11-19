@@ -4,7 +4,8 @@
 #   bash deploy/gcp/rt.sh deploy          第一次：在东京建一台虚拟机（asia-northeast1），装好、启动
 #   bash deploy/gcp/rt.sh lockdown        安全加固：封掉这台机器所有对外的入站连接，SSH 只能走 Google 的 IAP 通道（要 Google 登录）
 #   bash deploy/gcp/rt.sh unlock          解除上面的加固
-#   bash deploy/gcp/rt.sh update          代码更新后：重新上传代码、跑测试、重启（设置不动）
+#   bash deploy/gcp/rt.sh update          代码更新后：重新上传代码、编译、跑测试、重启（设置不动）
+#   RT_IMPL=python bash deploy/gcp/rt.sh update   换回 Python 版（备用）；RT_IMPL=rust 再换回 Rust 版（记录、设置都通用）
 #   bash deploy/gcp/rt.sh env [文件]      上传新的设置文件（默认 ./ruletaker.env）并重启
 #   bash deploy/gcp/rt.sh console         打开网页控制台和复盘页（通过 Cloud Shell 的“网页预览”，不开公网端口）
 #   bash deploy/gcp/rt.sh status          看状态（就是 huice 的 /rules）
@@ -19,6 +20,7 @@
 #   bash deploy/gcp/rt.sh delete          删除虚拟机（数据一起删掉，先确认）
 #
 # 可用环境变量改默认值：PROJECT（默认 gcloud 当前项目）ZONE（asia-northeast1-b）VM（ruletaker）MACHINE（e2-standard-2）
+#   RT_IMPL（rust | python：默认 Rust 版；换过之后一直用换成的那个，直到再指定）
 set -euo pipefail
 
 PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
@@ -97,8 +99,11 @@ create_vm() {  # create_vm NAME ZONE MACHINE DISK [NETWORK TAG]
 upload_code() {
   local name="$1" zone="$2"
   echo "上传代码…"
-  (cd "$ROOT" && tar czf - --exclude=__pycache__ ruletaker tests requirements.txt requirements.lock deploy/gcp) | ssh_to "$name" "$zone" \
-    --command "sudo mkdir -p /opt/ruletaker && sudo rm -rf /opt/ruletaker/ruletaker /opt/ruletaker/tests /opt/ruletaker/deploy && sudo tar xzf - -C /opt/ruletaker"
+  # The sources only (the Rust version and the Python one beside it); the build and its cache stay on the VM (target/, .cargo/).
+  (cd "$ROOT" && tar czf - --exclude=__pycache__ --exclude=venv --exclude=target \
+      Cargo.toml Cargo.lock rustfmt.toml src web tests deploy/gcp python/ruletaker python/tests python/requirements.txt python/requirements.lock) \
+    | ssh_to "$name" "$zone" --command "sudo mkdir -p /opt/ruletaker && sudo rm -rf /opt/ruletaker/src /opt/ruletaker/web /opt/ruletaker/tests \
+        /opt/ruletaker/deploy /opt/ruletaker/python/ruletaker /opt/ruletaker/python/tests && sudo tar xzf - -C /opt/ruletaker"
 }
 
 upload_env() {
@@ -111,8 +116,16 @@ upload_env() {
 }
 
 setup() {
-  remote "sudo bash /opt/ruletaker/deploy/gcp/vm-setup.sh"
+  case "${RT_IMPL:-}" in
+    ""|rust|python) ;;
+    *) die "RT_IMPL 只能是 rust 或 python" ;;
+  esac
+  remote "sudo ${RT_IMPL:+RT_IMPL=$RT_IMPL }bash /opt/ruletaker/deploy/gcp/vm-setup.sh"
 }
+
+# The command line of the version in use on the VM (its subcommands: run, check, latency, plan).
+RUN_ON_VM='if [ "$(cat /opt/ruletaker/IMPL 2>/dev/null || echo rust)" = python ]; then echo "env PYTHONPATH=/opt/ruletaker/python /opt/ruletaker/python/venv/bin/python -m ruletaker"; else echo /opt/ruletaker/bin/ruletaker; fi'
+
 
 remind_env() {  # the settings file left in this shell holds the private key: said once it is on the VM
   if [ -n "${ENV_UPLOADED:-}" ] && [ -f "$ENV_UPLOADED" ]; then
@@ -219,9 +232,9 @@ case "$cmd" in
     remote "sudo bash -c 'F=/etc/ruletaker/ruletaker.env; K=\$(grep -E \"^STATUS_KEY=\" \$F | tail -1 | cut -d= -f2-); P=\$(grep -E \"^STATUS_PORT=\" \$F | tail -1 | cut -d= -f2-); \
       curl -sf -m 90 -X POST -H \"X-RT: 1\" -H \"X-Status-Key: \$K\" -H \"Content-Type: application/json\" -d \"{\\\"action\\\":\\\"$cmd\\\"}\" \"http://127.0.0.1:\${P:-8080}/api/control\" \
       | python3 -c \"import json,sys; print(json.load(sys.stdin)[\\\"message\\\"])\" \
-      || { [ $cmd = check ] && echo \"（服务没在运行：改用命令行自检）\" && sudo -u ruletaker /opt/ruletaker/venv/bin/python -m ruletaker check --env \$F; }'"
+      || { [ $cmd = check ] && echo \"（服务没在运行：改用命令行自检）\" && sudo -u ruletaker \$($RUN_ON_VM) check --env \$F; }'"
     ;;
-  latency) remote "sudo -u ruletaker /opt/ruletaker/venv/bin/python -m ruletaker latency --env /etc/ruletaker/ruletaker.env" ;;
+  latency) remote "sudo -u ruletaker \$($RUN_ON_VM) latency --env /etc/ruletaker/ruletaker.env" ;;
   restart|stop|start) remote "sudo systemctl $cmd ruletaker && sudo systemctl --no-pager --lines=5 status ruletaker || true" ;;
   ssh) ssh_to "$VM" "$ZONE" ;;
   probe)
@@ -233,20 +246,20 @@ case "$cmd" in
     keys="$(grep -E '^(RULE_API_KEY|PREDICT_API_KEY|PREDICT_CHAIN_ID)=' "$file" || true)"
     printf '%s\n' "$keys" | grep -qE '^(RULE_API_KEY|PREDICT_API_KEY)=.+' || die "$file 里没有填 RULE_API_KEY / PREDICT_API_KEY"
     name="rt-probe-$(date +%s)"
-    echo "在 $zone 临时创建 $name 量延迟（量完删除；只带 API Key 过去，不带私钥）…"
+    echo "在 $zone 临时创建 $name 量延迟（量完删除；只带 API Key 过去，不带私钥；量网络用不着编译，临时机器上用轻量的 Python 版）…"
     create_vm "$name" "$zone" e2-small 10GB
     trap 'echo "删除临时虚拟机 $name…"; gcloud compute instances delete "$name" "${G[@]}" --zone "$zone" --quiet >/dev/null 2>&1 || true' EXIT
     wait_ssh "$name" "$zone"
     upload_code "$name" "$zone"
     printf '%s\n' "$keys" | ssh_to "$name" "$zone" --command "umask 077; cat > /tmp/probe.env"
     ssh_to "$name" "$zone" --command \
-      "sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq python3-venv >/dev/null && cd /opt/ruletaker && sudo python3 -m venv venv && sudo venv/bin/pip install -q --require-hashes --only-binary :all: -r requirements.lock && RULE_TAKER=off venv/bin/python -m ruletaker latency --env /tmp/probe.env"
+      "sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq python3-venv >/dev/null && cd /opt/ruletaker/python && sudo python3 -m venv venv && sudo venv/bin/pip install -q --require-hashes --only-binary :all: -r requirements.lock && RULE_TAKER=off venv/bin/python -m ruletaker latency --env /tmp/probe.env"
     ;;
   delete)
     read -r -p "确定删除虚拟机 $VM（$ZONE）？上面的记录和设置会一起删掉。输入 yes 确认：" ok
     [ "$ok" = "yes" ] && gcloud compute instances delete "$VM" "${G[@]}" "${Z[@]}" --quiet
     ;;
   *)
-    sed -n '2,22p' "$0"
+    sed -n '2,25p' "$0"
     ;;
 esac

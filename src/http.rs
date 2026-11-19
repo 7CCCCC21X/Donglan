@@ -161,7 +161,9 @@ impl Url {
         };
         let authority = authority.rsplit('@').next().unwrap_or(authority);
         let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) if !h.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && !p.is_empty() => (h, p.parse().map_err(|_| bad())?),
+            Some((h, p)) if !h.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && !p.is_empty() => {
+                (h, p.parse().map_err(|_| bad())?)
+            }
             _ => (authority, if https { 443 } else { 80 }),
         };
         if host.is_empty() {
@@ -262,7 +264,11 @@ pub fn remote_error(host: &str, code: u16, retry_after: &str, raw: &[u8]) -> Rem
         if host.contains("binance") && (code == 418 || code == 429) {
             retry = retry.max(if code == 418 { 120 } else { 30 });
         }
-        hint(code).map(str::to_string).unwrap_or(if description.is_empty() { "接口请求失败".to_string() } else { description })
+        hint(code).map(str::to_string).unwrap_or(if description.is_empty() {
+            "接口请求失败".to_string()
+        } else {
+            description
+        })
     };
     RemoteError::retry(clean_error(format!("HTTP {code}: {text}")), retry)
 }
@@ -572,10 +578,13 @@ impl Http {
             let status = head.status;
             let encoding = head.header("content-encoding").unwrap_or("").to_string();
             if status >= 400 {
-                let raw = match tokio::time::timeout(timeout_d.min(Duration::from_secs(5)), read_body(&mut conn, &head, 65_536, false)).await {
-                    Ok(Ok((raw, _))) => raw,
-                    _ => vec![],
-                };
+                let raw =
+                    match tokio::time::timeout(timeout_d.min(Duration::from_secs(5)), read_body(&mut conn, &head, 65_536, false))
+                        .await
+                    {
+                        Ok(Ok((raw, _))) => raw,
+                        _ => vec![],
+                    };
                 let raw = inflate(raw, &encoding).unwrap_or_default();
                 return Err(remote_error(&url.host, status, head.header("retry-after").unwrap_or(""), &raw));
             }
@@ -603,7 +612,9 @@ impl Http {
                 Ok(Ok(got)) => got,
                 Ok(Err(BodyError::TooBig)) => return Err(RemoteError::new("接口返回的数据过大")),
                 Ok(Err(BodyError::Io(e))) => return Err(net_error(&e)),
-                Err(_) => return Err(RemoteError::new(format!("网络错误 (响应过慢：{} 秒内没有读完)", (2.0 * timeout + 1.0) as i64))),
+                Err(_) => {
+                    return Err(RemoteError::new(format!("网络错误 (响应过慢：{} 秒内没有读完)", (2.0 * timeout + 1.0) as i64)));
+                }
             };
             if !close {
                 self.put(key, conn);
@@ -613,7 +624,13 @@ impl Http {
         Err(RemoteError::new("网络错误 (重定向过多)"))
     }
 
-    pub async fn request_json(&self, url: &str, payload: Option<&[u8]>, timeout: f64, headers: &[(&str, &str)]) -> Res<serde_json::Value> {
+    pub async fn request_json(
+        &self,
+        url: &str,
+        payload: Option<&[u8]>,
+        timeout: f64,
+        headers: &[(&str, &str)],
+    ) -> Res<serde_json::Value> {
         let raw = self.request(url, payload, timeout, headers).await?;
         serde_json::from_slice(&raw).map_err(|_| RemoteError::new("接口未返回有效 JSON"))
     }
@@ -658,7 +675,11 @@ pub mod tests {
                             let head = String::from_utf8_lossy(&buf[..end]).to_string();
                             let len = head
                                 .lines()
-                                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap())
+                                })
                                 .unwrap_or(0);
                             if buf.len() < end + 4 + len {
                                 break;
@@ -694,7 +715,8 @@ pub mod tests {
                 let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
                 enc.write_all(b"{\"zipped\":1}").unwrap();
                 let z = enc.finish().unwrap();
-                let mut out = format!("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n", z.len()).into_bytes();
+                let mut out =
+                    format!("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n", z.len()).into_bytes();
                 out.extend(z);
                 out
             }
@@ -739,7 +761,8 @@ pub mod tests {
             let e = h.request(&format!("{base}/moved"), Some(b"{}"), 5.0, &[]).await.unwrap_err();
             assert!(e.msg.contains("POST 不会重发"), "{e}");
             // one connection carried them all (the error answers close theirs)
-            let conns: std::collections::HashSet<String> = log.borrow().iter().map(|l| l.split(' ').next().unwrap().to_string()).collect();
+            let conns: std::collections::HashSet<String> =
+                log.borrow().iter().map(|l| l.split(' ').next().unwrap().to_string()).collect();
             assert!(conns.len() <= 4, "{:?}", log.borrow());
             assert!(h.stats.borrow().reused >= 3);
         });
@@ -773,7 +796,12 @@ pub mod tests {
         assert!(e.msg.starts_with("HTTP 403: 访问被拒绝；请核对权限与服务地区（Predict 不向受限地区开放交易"));
         let e = remote_error("fapi.binance.com", 429, "", b"");
         assert_eq!(e.retry_after, 30);
-        let e = remote_error("api.telegram.org", 429, "", br#"{"ok":false,"description":"Too Many Requests: retry after 5","parameters":{"retry_after":5}}"#);
+        let e = remote_error(
+            "api.telegram.org",
+            429,
+            "",
+            br#"{"ok":false,"description":"Too Many Requests: retry after 5","parameters":{"retry_after":5}}"#,
+        );
         assert_eq!((e.msg.as_str(), e.retry_after), ("HTTP 429: Too Many Requests: retry after 5", 5));
         let u = Url::parse("https://api.predict.fun/v1/markets?x=1").unwrap();
         assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("api.predict.fun", 443, "/v1/markets?x=1"));

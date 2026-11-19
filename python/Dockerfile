@@ -1,4 +1,5 @@
-# 容器方式（可选）：Google Cloud 上推荐 deploy/gcp/rt.sh 直接装在虚拟机上（systemd），这里给本地测试或别的平台用。
+# Python 版（备用）的容器：docker build -t ruletaker-py python/（在仓库根目录运行，构建目录是 python/）。
+# Google Cloud 上推荐 deploy/gcp/rt.sh 直接装在虚拟机上（systemd）。
 FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 STATE_DB=/data/ruletaker.sqlite3
 WORKDIR /app

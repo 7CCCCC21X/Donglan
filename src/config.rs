@@ -28,8 +28,10 @@ pub const RULE_DEFAULT_CENTS: [(&str, i64); 8] = [
     ("oil_open", 50),
     ("oil_0045", 0),
 ];
-pub const RULE_MARKET_KEYS: [(&str, &str, &str); 2] = [("gold", "RULE_GOLD", "RULE_GOLD_SHARES"), ("oil", "RULE_OIL", "RULE_OIL_SHARES")];
-pub const RULE_LIVE_KEYS: [(&str, &str); 2] = [("gold_shut", "RULE_GOLD_SHUT_LIVE_CENTS"), ("gold_open", "RULE_GOLD_OPEN_LIVE_CENTS")];
+pub const RULE_MARKET_KEYS: [(&str, &str, &str); 2] =
+    [("gold", "RULE_GOLD", "RULE_GOLD_SHARES"), ("oil", "RULE_OIL", "RULE_OIL_SHARES")];
+pub const RULE_LIVE_KEYS: [(&str, &str); 2] =
+    [("gold_shut", "RULE_GOLD_SHUT_LIVE_CENTS"), ("gold_open", "RULE_GOLD_OPEN_LIVE_CENTS")];
 pub const RULE_FAST_DEFAULT: &str = "01:00-07:00";
 
 pub fn default_cents(key: &str) -> i64 {
@@ -158,7 +160,9 @@ impl RuleSettings {
         let fast = day_spans(get(e, "RULE_FAST_HOURS", RULE_FAST_DEFAULT), "RULE_FAST_HOURS")?;
         let lead = int_of("RULE_LEAD_MINUTES", get(e, "RULE_LEAD_MINUTES", "300"))?;
         if !(0..=1440).contains(&lead) {
-            return Err("RULE_LEAD_MINUTES 0～1440（对手提前多少分钟挂单，规则吃单在那一刻前后每秒检查；0 = 不按这个时刻）".into());
+            return Err(
+                "RULE_LEAD_MINUTES 0～1440（对手提前多少分钟挂单，规则吃单在那一刻前后每秒检查；0 = 不按这个时刻）".into()
+            );
         }
         let mut live = vec![];
         for (key, name) in RULE_LIVE_KEYS {
@@ -191,7 +195,7 @@ impl RuleSettings {
     }
 }
 
-fn bounded(e: &Env, name: &str, default: f64, low: f64, high: f64, integer: bool) -> Result<f64, String> {
+pub fn bounded(e: &Env, name: &str, default: f64, low: f64, high: f64, integer: bool) -> Result<f64, String> {
     let raw = get(e, name, "").trim();
     let value = if raw.is_empty() {
         default
@@ -360,7 +364,10 @@ impl Config {
             telegram_command_token: get(e, "TELEGRAM_COMMAND_TOKEN", "").trim().to_string(),
             telegram_chats: chats,
             admin_user_id: bounded(e, "ADMIN_USER_ID", 0.0, 0.0, 1e15, true)? as i64,
-            telegram_commands: matches!(get(e, "TELEGRAM_COMMANDS", "off").trim().to_lowercase().as_str(), "on" | "1" | "true" | "yes"),
+            telegram_commands: matches!(
+                get(e, "TELEGRAM_COMMANDS", "off").trim().to_lowercase().as_str(),
+                "on" | "1" | "true" | "yes"
+            ),
             notify: !matches!(get(e, "RULE_NOTIFY", "on").trim().to_lowercase().as_str(), "off" | "0" | "false" | "no"),
             status_host,
             status_port: port,
@@ -406,7 +413,8 @@ mod tests {
 
     #[test]
     fn settings() {
-        let s = RuleSettings::parse(&env(&[("RULE_TAKER", "paper"), ("RULE_GOLD_SHARES", "900"), ("RULE_OIL", "off")]), None).unwrap();
+        let s = RuleSettings::parse(&env(&[("RULE_TAKER", "paper"), ("RULE_GOLD_SHARES", "900"), ("RULE_OIL", "off")]), None)
+            .unwrap();
         assert_eq!(s.mode, "paper");
         assert_eq!(s.shares_of("gold"), 900);
         assert_eq!(s.shares_of("oil"), 50);
@@ -422,7 +430,9 @@ mod tests {
 
     #[test]
     fn config() {
-        let c = Config::from_env(&env(&[("RULE_TAKER", "paper"), ("PREDICT_API_KEY", "k"), ("TELEGRAM_CHAT_ID", "-100123:7, 55")])).unwrap();
+        let c =
+            Config::from_env(&env(&[("RULE_TAKER", "paper"), ("PREDICT_API_KEY", "k"), ("TELEGRAM_CHAT_ID", "-100123:7, 55")]))
+                .unwrap();
         assert_eq!(c.telegram_chats, vec![(-100123, 7), (55, 0)]);
         assert!(!c.own_key);
         assert!(Config::from_env(&env(&[("RULE_TAKER", "paper")])).is_err());
