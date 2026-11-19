@@ -147,3 +147,68 @@ fn settings_match_python() {
         assert_eq!(s.shares_of("gold"), case["gold_shares"].as_i64().unwrap());
     }
 }
+
+/// Two JSON values the same, numbers within a hair (an int and a float of one value alike).
+fn same(a: &Value, b: &Value, path: &str) -> Result<(), String> {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+            if (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0) { Ok(()) } else { Err(format!("{path}: {x} vs {y}")) }
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            let mut kx: Vec<&String> = x.keys().collect();
+            let mut ky: Vec<&String> = y.keys().collect();
+            kx.sort();
+            ky.sort();
+            if kx != ky {
+                return Err(format!("{path}: keys {kx:?} vs {ky:?}"));
+            }
+            for (k, v) in x {
+                same(v, &y[k], &format!("{path}.{k}"))?;
+            }
+            Ok(())
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            if x.len() != y.len() {
+                return Err(format!("{path}: {} items vs {}", x.len(), y.len()));
+            }
+            for (i, (p, q)) in x.iter().zip(y).enumerate() {
+                same(p, q, &format!("{path}[{i}]"))?;
+            }
+            Ok(())
+        }
+        _ if a == b => Ok(()),
+        _ => Err(format!("{path}: {a} vs {b}")),
+    }
+}
+
+#[test]
+fn review_matches_python() {
+    use crate::config::{Env, RuleSettings};
+    let v = vectors("review.json");
+    let now = v["now"].as_i64().unwrap();
+    let recs: crate::rules::Recs = v["recs"].as_object().unwrap().iter().map(|(k, r)| (k.clone(), r.as_object().unwrap().clone())).collect();
+    let env: Env = [("RULE_TAKER", "on"), ("RULE_GOLD_SHUT_LIVE_CENTS", "80"), ("RULE_MAX_DAY_USD", "300")]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let settings = RuleSettings::parse(&env, None).unwrap();
+    for (days, key) in [(30, "review30"), (0, "review0")] {
+        let got = crate::review::review(&recs, &settings, now, days);
+        if let Err(e) = same(&got, &v[key], key) {
+            panic!("{e}");
+        }
+    }
+    let rows = crate::rules::races(&recs, "on", now - 30 * 86_400_000);
+    let texts: Vec<String> = rows.iter().map(crate::rules::race_text).collect();
+    let want: Vec<String> = v["race_texts"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+    for (i, (a, b)) in texts.iter().zip(&want).enumerate() {
+        assert_eq!(a, b, "race {i}");
+    }
+    assert_eq!(texts.len(), want.len());
+    assert_eq!(crate::rules::race_summary(&rows), v["summary"].as_str().unwrap());
+    let csv = crate::review::records_csv(&recs);
+    for (i, (a, b)) in csv.split("\r\n").zip(v["csv"].as_str().unwrap().split("\r\n")).enumerate() {
+        assert_eq!(a, b, "csv line {i}");
+    }
+}
