@@ -12,3 +12,4 @@ data/
 .venv/
 venv/
 .DS_Store
+target/

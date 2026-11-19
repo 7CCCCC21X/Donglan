@@ -1,0 +1,47 @@
+[package]
+name = "ruletaker"
+version = "3.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "规则吃单 · 独立服务（Predict.fun 黄金 / 原油 15 分钟涨跌的固定时段规则吃单），Rust 版"
+license = "UNLICENSED"
+publish = false
+default-run = "ruletaker"
+
+[[bin]]
+name = "ruletaker"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+httparse = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+sha3 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+libc = "0.2"
+indexmap = "2"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1
