@@ -349,6 +349,17 @@ pub async fn self_check(me: &Me) -> String {
     if live && !allowed {
         r.no("LIVE_TRADING_ALLOWED 不是 on：真实吃单模式也不会下单");
     }
+    {
+        let t = me.borrow();
+        match (t.calendar_left(now), t.cal_last) {
+            (Some(0), _) => r.either(live, t.calendar_why(now)),
+            (Some(left), Some(last)) if left <= super::CALENDAR_WARN_DAYS => r.warn(format!(
+                "CME 休市日历只排到 {last}（还剩 {left} 天）：到期前在设置文件补上之后的 CME_CLOSED_DAYS、CME_EARLY_DAYS，到期后不下单"
+            )),
+            (Some(_), Some(last)) => r.ok(format!("CME 休市日历排到 {last}")),
+            _ => r.warn("CME 休市日历是空的（CME_CLOSED_DAYS、CME_EARLY_DAYS 都没写）：节假日也会照常下单"),
+        }
+    }
     if let Some(f) = floor {
         if live && !stop.is_empty() {
             r.no(format!("今天已到过日亏损停机线 {}：今天不再开新单（/resume 从现在的盈亏起再给一个额度）", money(f)));
@@ -415,24 +426,23 @@ pub async fn self_check(me: &Me) -> String {
                 }
             }
             if chain.is_some() {
-                let yielding =
-                    me.borrow().track.values().any(|w| w.borrow().market.as_ref().is_some_and(|m| m.t("isYieldBearing")));
-                for (key, name, needed) in
-                    [("CTF_EXCHANGE", "标准交易所", !yielding), ("YIELD_BEARING_CTF_EXCHANGE", "收益型交易所", yielding)]
-                {
+                // the exchanges the markets followed now settle on (each market's isNegRisk × isYieldBearing, as an order
+                // checks it): each must have the USDT allowance, or its orders are refused the moment they are due; with no
+                // market followed yet, all four told (none of them failing the check)
+                let used = exchanges_in_use(me);
+                for key in crate::wallet::EXCHANGES {
+                    if !used.is_empty() && !used.contains(key) {
+                        continue;
+                    }
+                    let name = exchange_name(key);
                     match super::flow::read_allowance(me, key).await {
                         Ok((_, amount)) if amount >= 100_000_000_000_000_000_000 => r.ok(format!("授权：{name} USDT 额度已授权")),
-                        Ok(_) => r.either(
-                            needed,
-                            format!(
-                                "授权：{name} 没有 USDT 额度{}",
-                                if needed {
-                                    "（规则吃单的市场要用：在 Predict 网站用这个账户交易一次）"
-                                } else {
-                                    "（现在跟踪的市场用不到）"
-                                }
-                            ),
-                        ),
+                        Ok(_) if used.is_empty() => {
+                            r.warn(format!("授权：{name} 没有 USDT 额度（现在没有跟踪的市场，用到它的市场才需要）"))
+                        }
+                        Ok(_) => {
+                            r.no(format!("授权：{name} 没有 USDT 额度（跟踪的市场要用：在 Predict 网站用这个账户交易一次）"))
+                        }
                         Err(e) => r.warn(format!("授权：{name} 没读到（{}）", clean(&e))),
                     }
                 }
@@ -599,11 +609,55 @@ pub async fn self_check(me: &Me) -> String {
     r.lines.join("\n")
 }
 
+/// The exchanges (wallet::EXCHANGES keys) the markets followed now settle on.
+pub fn exchanges_in_use(me: &Me) -> std::collections::BTreeSet<&'static str> {
+    let t = me.borrow();
+    let fee = t.config.fee_bps;
+    t.track
+        .values()
+        .filter_map(|w| {
+            let w = w.borrow();
+            let info = parse_market(w.market.as_ref()?, fee);
+            Some(crate::wallet::exchange_key(info.neg_risk, info.yield_bearing))
+        })
+        .collect()
+}
+
+pub fn exchange_name(key: &str) -> &'static str {
+    match key {
+        "CTF_EXCHANGE" => "标准交易所",
+        "NEG_RISK_CTF_EXCHANGE" => "多结果交易所",
+        "YIELD_BEARING_CTF_EXCHANGE" => "收益型交易所",
+        "YIELD_BEARING_NEG_RISK_CTF_EXCHANGE" => "收益型多结果交易所",
+        _ => "交易所",
+    }
+}
+
 /// The real order path end to end with about a dollar for a few seconds: a LIMIT buy of Up far under the market (2¢ at the
 /// most, a cent under the best bid, never at or above the best ask: it rests), on a rule window whose matching is open — else
 /// the BTC quarter hour running now; read back by its hash, withdrawn, read again. Each step with Predict's answer and its
-/// round trip. Signed to expire in ten minutes; no rule order (nothing follows it but this).
+/// round trip. Signed to expire in ten minutes; no rule order (nothing follows it but this). One at a time: asked again
+/// while one is under way (Telegram, the console, both), the second is told so and places nothing.
 pub async fn order_test(me: &Me) -> String {
+    if std::mem::replace(&mut me.borrow_mut().testing, true) {
+        return "⏳ 挂单测试正在进行，等它的结果（同一时间只做一张，这次没有再挂）".into();
+    }
+    let _done = TestUnderWay(me.clone());
+    run_order_test(me).await
+}
+
+/// The order test's mark, taken off however the test ends (its answer, an early return, the task dropped).
+struct TestUnderWay(Me);
+
+impl Drop for TestUnderWay {
+    fn drop(&mut self) {
+        if let Ok(mut t) = self.0.try_borrow_mut() {
+            t.testing = false;
+        }
+    }
+}
+
+async fn run_order_test(me: &Me) -> String {
     let (now, wallet, api, stop, fee) = {
         let t = me.borrow();
         (t.now(), t.wallet.clone(), t.api.clone(), t.stop.clone(), t.config.fee_bps)

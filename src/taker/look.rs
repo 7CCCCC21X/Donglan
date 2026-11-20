@@ -710,6 +710,9 @@ pub async fn place(
             b.word = format!("认不出{}的代币", rule.word());
             return Ok(());
         };
+        // the record's shares are the ones signed: Predict keeps 5 significant digits of a quantity (a whole number up to the
+        // settings' 100 000 keeps every one; a longer one is cut, and its fills are read against what was cut)
+        let take = Decimal::try_from_i128_with_scale(amounts.taker as i128, 18).map(|d| d.normalize()).unwrap_or(take);
         let (digest, signature, ahead) =
             t.sign(&order, info.neg_risk, info.yield_bearing).map_err(crate::util::RemoteError::new)?;
         if ahead {

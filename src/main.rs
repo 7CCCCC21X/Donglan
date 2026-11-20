@@ -387,8 +387,8 @@ async fn check(config: Config, probe_order: bool) -> i32 {
         (Ok(u), Ok(b)) => println!("余额：USDT {}｜签名钱包 BNB {:.4}", util::comma(wallet::from_wei(u), 2), wallet::from_wei(b)),
         (Err(e), _) | (_, Err(e)) => println!("⚠️ 余额没读到：{}", clean_error(&e)),
     }
-    for neg in [false, true] {
-        let key = wallet::exchange_key(neg, false);
+    // (all four: which one a market settles on is its isNegRisk × isYieldBearing; the service's /check names the ones in use)
+    for key in wallet::EXCHANGES {
         match chain.allowance(key).await {
             Ok(a) => println!(
                 "授权 {key}：{}",

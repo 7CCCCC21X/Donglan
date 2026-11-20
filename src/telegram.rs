@@ -195,6 +195,9 @@ pub struct Telegram {
     pub stranger: RefCell<Option<(i64, String)>>,
     pub admin_seen: Cell<bool>,
     logged: RefCell<String>,
+    /// the confirm cards whose ✅ was pressed (chat, message, the card's own time and command): a card's yes runs its command
+    /// once, however often it is tapped (the menu's message shows a new card, with its own time, for the next one)
+    used_yes: RefCell<VecDeque<(i64, i64, String)>>,
 }
 
 impl Telegram {
@@ -233,6 +236,7 @@ impl Telegram {
             stranger: RefCell::new(None),
             admin_seen: Cell::new(false),
             logged: RefCell::new(String::new()),
+            used_yes: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -735,6 +739,22 @@ impl Telegram {
                         me.edit_card(chat, message_id, me.menu_card()).await;
                         return;
                     }
+                    let card = (chat, message_id, rest.to_string());
+                    let seen = {
+                        let mut used = me.used_yes.borrow_mut();
+                        let seen = used.contains(&card);
+                        if !seen {
+                            used.push_back(card);
+                            while used.len() > 64 {
+                                used.pop_front();
+                            }
+                        }
+                        seen
+                    };
+                    if seen {
+                        me.answer_button(&id, "已经确认过，正在执行或已执行完").await;
+                        return;
+                    }
                     cmd.to_string()
                 }
                 _ => {
@@ -745,6 +765,10 @@ impl Telegram {
             };
             let (command, args) = cmd.split_once(' ').unwrap_or((cmd.as_str(), ""));
             me.answer_button(&id, "收到").await;
+            if kind == "y" {
+                // the card's ✅ gone before the command runs (the menu back in its place; refreshed again when it is done)
+                me.edit_card(chat, message_id, me.menu_card()).await;
+            }
             if command == "/check" {
                 me.reply("🔎 自检中，结果几秒后发来…", (chat, thread));
             } else if command == "/test" {

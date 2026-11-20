@@ -82,10 +82,21 @@ pub struct Conn {
 }
 
 impl Conn {
-    /// Whether the server has closed the connection while it sat in the pool: a peek at the socket (no wait) finds its end (or
-    /// any byte at all — an idle connection carries none but a TLS close_notify).
-    fn closed(&self) -> bool {
+    /// Whether the server has closed the connection while it sat in the pool: bytes past the last answer already read (by us,
+    /// or by rustls with it: a close_notify that came on its heels); else a peek at the socket (no wait) finds its end, or
+    /// bytes no request asked for. On TLS such bytes may be the protocol's own — a TLS 1.3 session ticket or key update sent
+    /// after the answer — so rustls is let read them, without waiting: nothing for us behind them, the connection is good;
+    /// the end of the stream, a close_notify, an alert or data (a 408 before the server hangs up) are a dead one.
+    fn closed(&mut self) -> bool {
         use std::os::fd::AsRawFd;
+        if !self.buf.is_empty() {
+            return true;
+        }
+        if let Stream::Tls(tls) = &self.stream {
+            if !tls.get_ref().1.wants_read() {
+                return true; // (a close_notify taken in, or data it holds that nobody asked for)
+            }
+        }
         let fd = match &self.stream {
             Stream::Plain(s) => s.as_raw_fd(),
             Stream::Tls(s) => s.get_ref().0.as_raw_fd(),
@@ -97,7 +108,15 @@ impl Conn {
             let err = io::Error::last_os_error();
             return !matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted);
         }
-        true // 0: the end; > 0: bytes nobody asked for
+        let Stream::Tls(tls) = &mut self.stream else { return true }; // 0: the end; > 0: bytes nobody asked for
+        if got == 0 {
+            return true;
+        }
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut one = [0u8; 1];
+        let mut read = ReadBuf::new(&mut one);
+        // Pending: TLS records of its own, read, and the socket empty after them
+        !matches!(Pin::new(tls.as_mut()).poll_read(&mut cx, &mut read), Poll::Pending)
     }
 }
 
@@ -459,7 +478,7 @@ impl Http {
             if now - *last > max_idle {
                 break;
             }
-            let (conn, _) = rows.pop()?;
+            let (mut conn, _) = rows.pop()?;
             if conn.closed() {
                 self.stats.borrow_mut().dead += 1;
                 continue;
@@ -625,7 +644,12 @@ impl Http {
                     match tokio::time::timeout(timeout_d.min(Duration::from_secs(5)), read_body(&mut conn, &head, 65_536, false))
                         .await
                     {
-                        Ok(Ok((raw, _))) => raw,
+                        Ok(Ok((raw, close))) => {
+                            if !close {
+                                self.put(key, conn); // (its answer read whole: the connection serves the next request)
+                            }
+                            raw
+                        }
                         _ => vec![],
                     };
                 let raw = inflate(raw, &encoding).unwrap_or_default();
@@ -787,6 +811,147 @@ pub mod tests {
         tokio::task::LocalSet::new().block_on(&rt, f)
     }
 
+    // A throwaway CA and its "localhost" certificate (P-256, valid to 2126), for a TLS server on this machine alone.
+    const TEST_CA: &str = "-----BEGIN CERTIFICATE-----\
+MIIBnjCCAUWgAwIBAgIUOqfX6aXo6NlIiI/DvptlFIhyX8AwCgYIKoZIzj0EAwIw\
+HDEaMBgGA1UEAwwRcnVsZXRha2VyIHRlc3QgQ0EwIBcNMjYxMTIwMDYwMzE5WhgP\
+MjEyNjEwMjcwNjAzMTlaMBwxGjAYBgNVBAMMEXJ1bGV0YWtlciB0ZXN0IENBMFkw\
+EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/TgO2tFcIpiObsvu2LeLK3aDmIxodKHl\
+dxbZ1Xt361EpsH7nozeyK3UkZ583ZnFBjBR6+cMrLoHl7oN5K8PyDqNjMGEwHQYD\
+VR0OBBYEFPrSzeGNxhuXPgc3eXAVfcJa3gKfMB8GA1UdIwQYMBaAFPrSzeGNxhuX\
+Pgc3eXAVfcJa3gKfMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgIEMAoG\
+CCqGSM49BAMCA0cAMEQCIB/IFr5n3t9cDDMD9NAFADRRORHd7fJh9xXdIYhKt4uo\
+AiAXQoqBxdZ2fkVarobJM3UVSJBVCOmjnE55H+iX0IMtxA==\
+-----END CERTIFICATE-----";
+    const TEST_LEAF: &str = "-----BEGIN CERTIFICATE-----\
+MIIBvjCCAWSgAwIBAgIUQm5Da2Rjc+E1VJICNND50UBi67UwCgYIKoZIzj0EAwIw\
+HDEaMBgGA1UEAwwRcnVsZXRha2VyIHRlc3QgQ0EwIBcNMjYxMTIwMDYwMzIwWhgP\
+MjEyNjEwMjcwNjAzMjBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49\
+AgEGCCqGSM49AwEHA0IABALYsYucdVHYBFFJXS9LHP2O1Mm4KFeQfiq5/0l273H2\
+5fZEsXC8Nlv5piHCFNh1pTelRddDNyazSuol9UqmjlKjgYkwgYYwFAYDVR0RBA0w\
+C4IJbG9jYWxob3N0MAkGA1UdEwQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQM\
+MAoGCCsGAQUFBwMBMB0GA1UdDgQWBBTbb1YBSPPUQ29NVnOswtnhTRfzvzAfBgNV\
+HSMEGDAWgBT60s3hjcYblz4HN3lwFX3CWt4CnzAKBggqhkjOPQQDAgNIADBFAiEA\
+mAh6FOKPfIgRbiy6DyVU2OGedMKZCjcpOrhvgEmFgf8CIDouLX/N6Gejt0V/kN3N\
+WjuUKhV0CK7XVYafsCk/NzIt\
+-----END CERTIFICATE-----";
+    const TEST_LEAF_KEY: &str = "-----BEGIN PRIVATE KEY-----\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg1l5p9ecwhLZ8+qiE\
+ugon6QeKhziJ6kufs07JYpM//KihRANCAAQC2LGLnHVR2ARRSV0vSxz9jtTJuChX\
+kH4quf9Jdu9x9uX2RLFwvDZb+aYhwhTYdaU3pUXXQzcms0rqJfVKpo5S\
+-----END PRIVATE KEY-----";
+
+    fn pem_der(pem: &str) -> Vec<u8> {
+        use base64::Engine;
+        let text: String = pem.split("-----").filter(|p| !p.is_empty() && !p.contains("BEGIN") && !p.contains("END")).collect();
+        base64::engine::general_purpose::STANDARD.decode(text.trim()).unwrap()
+    }
+
+    /// A local TLS 1.3 server on one connection (its session tickets sent once the handshake is done, as a TLS 1.3 server
+    /// does): each request answered "ok"; ``after_ms`` after the first answer, ``then`` — a close_notify (the TCP connection
+    /// left open), bytes nobody asked for, or nothing.
+    async fn tls_serve(then: &'static str, after_ms: u64) -> u16 {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let certs = vec![CertificateDer::from(pem_der(TEST_LEAF))];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pem_der(TEST_LEAF_KEY)));
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::task::spawn_local(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let (mut buf, mut served) = (Vec::new(), 0);
+            loop {
+                let mut chunk = [0u8; 4096];
+                let n = match tls.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                while let Some(end) = find(&buf, b"\r\n\r\n") {
+                    buf.drain(..end + 4);
+                    tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
+                    tls.flush().await.unwrap();
+                    served += 1;
+                    if served == 1 {
+                        tokio::time::sleep(Duration::from_millis(after_ms)).await; // (0: on the answer's heels)
+                        match then {
+                            "close_notify" => tls.get_mut().1.send_close_notify(),
+                            "408" => tls.write_all(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n").await.unwrap(),
+                            _ => {}
+                        }
+                        tls.flush().await.unwrap();
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    async fn get_ok(conn: &mut Conn) -> Vec<u8> {
+        conn.stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        conn.stream.flush().await.unwrap();
+        let head = read_head(conn).await.unwrap();
+        match read_body(conn, &head, 1000, false).await {
+            Ok((body, _)) => body,
+            Err(_) => panic!("no body"),
+        }
+    }
+
+    #[test]
+    fn a_tls_record_of_its_own_after_the_answer_leaves_the_connection_good() {
+        run(async {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(rustls::pki_types::CertificateDer::from(pem_der(TEST_CA))).unwrap();
+            let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(config));
+            // the session tickets come after the client's side of the handshake is done: on the socket, nothing for us in them
+            let port = tls_serve("", 0).await;
+            let (stream, _) = connect(true, "localhost", port, Duration::from_secs(5), &connector).await.unwrap();
+            let mut conn = Conn { stream, buf: Vec::new() };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!conn.closed(), "session tickets");
+            assert_eq!(get_ok(&mut conn).await, b"ok");
+            let cases = [("close_notify", true), ("408", true), ("", false)];
+            for ((then, dead), after_ms) in cases.iter().flat_map(|c| [(*c, 0), (*c, 40)]) {
+                let port = tls_serve(then, after_ms).await;
+                let (stream, _) = connect(true, "localhost", port, Duration::from_secs(5), &connector).await.unwrap();
+                let mut conn = Conn { stream, buf: Vec::new() };
+                assert_eq!(get_ok(&mut conn).await, b"ok");
+                tokio::time::sleep(Duration::from_millis(100)).await; // (what the server sent after the answer is in)
+                assert_eq!(conn.closed(), dead, "{then} {after_ms} ms after");
+                if !dead {
+                    assert_eq!(get_ok(&mut conn).await, b"ok", "{then}"); // and it carries the next request
+                    assert!(!conn.closed());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn an_error_answer_read_whole_keeps_its_connection() {
+        run(async {
+            let (port, log) = serve(answers, 0).await;
+            let h = Http::new();
+            let base = format!("http://127.0.0.1:{port}");
+            let e = h.request(&format!("{base}/predict"), Some(b"{}"), 5.0, &[]).await.unwrap_err();
+            assert_eq!(e.msg, "HTTP 400: Order value too small");
+            assert_eq!(h.request_json(&format!("{base}/json"), None, 5.0, &[]).await.unwrap()["ok"], true);
+            assert_eq!(*log.borrow(), vec![format!("1 POST /predict"), format!("1 GET /json")]); // one connection
+            assert_eq!(h.stats.borrow().new, 1);
+        });
+    }
+
     #[test]
     fn requests() {
         run(async {
@@ -803,10 +968,10 @@ pub mod tests {
             assert_eq!(h.request_json(&format!("{base}/moved"), None, 5.0, &[]).await.unwrap()["ok"], true);
             let e = h.request(&format!("{base}/moved"), Some(b"{}"), 5.0, &[]).await.unwrap_err();
             assert!(e.msg.contains("POST 不会重发"), "{e}");
-            // one connection carried them all (the error answers close theirs)
+            // one connection carried them all (but for the POST's redirect, which is not followed: its rest left unread)
             let conns: std::collections::HashSet<String> =
                 log.borrow().iter().map(|l| l.split(' ').next().unwrap().to_string()).collect();
-            assert!(conns.len() <= 4, "{:?}", log.borrow());
+            assert!(conns.len() <= 2, "{:?}", log.borrow());
             assert!(h.stats.borrow().reused >= 3);
         });
     }

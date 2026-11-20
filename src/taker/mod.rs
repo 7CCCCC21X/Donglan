@@ -110,6 +110,28 @@ pub const BALANCE_BUSY_MS: i64 = 20_000;
 pub const BALANCE_IDLE_MS: i64 = 120_000;
 pub const BALANCE_LAG_MS: i64 = 10_000;
 pub const RECENT_MS: i64 = 2 * DAY_MS;
+/// A thread making the journal's lines durable when asked (lines written meanwhile covered by the one sync); it ends with the
+/// taker (its sender dropped).
+fn journal_syncer(
+    file: std::fs::File,
+    done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Option<std::sync::mpsc::Sender<()>> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("rt-journal-sync".into())
+        .spawn(move || {
+            while rx.recv().is_ok() {
+                while rx.try_recv().is_ok() {}
+                let _ = file.sync_data();
+                done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+        .ok()?;
+    Some(tx)
+}
+
+/// The CME holiday calendar's last days, told in /check, the status and once a day.
+pub const CALENDAR_WARN_DAYS: i64 = 30;
 pub const SEND_WAIT_S: f64 = 25.0;
 pub const READY_RETRY_MS: i64 = 60_000;
 pub const STRIKE_EVERY_MS: i64 = 5_000;
@@ -253,6 +275,10 @@ pub struct Taker {
     pub presign_hits: u64,
     pub journal: Option<std::fs::File>,
     pub journal_cut: bool,
+    /// the journal's lines made durable behind the request (fdatasync on a thread of its own: never in the order's path), and
+    /// how many times that has been done
+    pub journal_sync: Option<std::sync::mpsc::Sender<()>>,
+    pub journal_syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub errors: VecDeque<(i64, String)>,
     pub error: String,
     pub stop: Rc<Event>,
@@ -268,6 +294,12 @@ pub struct Taker {
     pub flush_wait_s: f64,
     /// the pause between the order test's looks for an order whose answer was lost (s)
     pub lookup_s: f64,
+    /// an order test under way (one at a time: a second asked meanwhile is told so, not run)
+    pub testing: bool,
+    /// the last day of the CME holiday calendar (CME_CLOSED_DAYS / CME_EARLY_DAYS, as set at the start), and the Beijing day
+    /// its running out was last told
+    pub cal_last: Option<crate::util::Date>,
+    pub cal_told: String,
 }
 
 pub struct Parts {
@@ -413,6 +445,8 @@ impl Taker {
             presign_hits: 0,
             journal: None,
             journal_cut: false,
+            journal_sync: None,
+            journal_syncs: Default::default(),
             errors: VecDeque::new(),
             error: String::new(),
             stop: Rc::new(Event::new()),
@@ -426,6 +460,9 @@ impl Taker {
             next_win: 0,
             flush_wait_s: 10.0,
             lookup_s: control::TEST_LOOKUP_S,
+            testing: false,
+            cal_last: crate::clock::calendar().last_day(),
+            cal_told: String::new(),
         };
         t.recover();
         let now = t.now();
@@ -515,7 +552,10 @@ impl Taker {
     /// The USDT this taker may still spend: the balance last read on-chain, less what that read could not have seen — an
     /// order placed, or filled, since just before the read began: its fills at their price once its word is final, its limit
     /// in full while not; any other order not final yet: its unfilled rest at its limit (resting, or its answer lost: it may
-    /// still take the money, whatever its age). None before a read. ``excluding``: the hash of an order not to count.
+    /// still take the money) — until a read begun GIVE_UP_MS past the order's signed expiry (at its window's start, or its
+    /// end: Predict matches nothing after it, so that read has all it ever took, however long its answer stays lost). A window
+    /// a day older than the read holds no order that may take anything: not looked at. None before a read. ``excluding``: the
+    /// hash of an order not to count.
     pub fn usd(&self, excluding: Option<&str>) -> Option<f64> {
         let usdt = self.usdt?;
         let since = self.balance_asked_ms - BALANCE_LAG_MS;
@@ -529,7 +569,8 @@ impl Taker {
                     continue;
                 }
                 let unseen = o.i("at") >= since || o.i("filled_ms") >= since;
-                spent += match (is_final(o.state()), unseen) {
+                let expired = o.i("expires") > 0 && since >= o.i("expires") * 1000 + GIVE_UP_MS;
+                spent += match (is_final(o.state()) || expired, unseen) {
                     (true, true) => o.f("filled") * crate::rules::order_avg(o),
                     (true, false) => 0.0,
                     (false, true) => o.f("shares") * o.f("limit"),
@@ -647,6 +688,10 @@ impl Taker {
         if !stop.is_empty() {
             return stop;
         }
+        let why = self.calendar_why(self.now());
+        if !why.is_empty() {
+            return why;
+        }
         if !self.ready() {
             return format!("真实交易未就绪：{}", self.not_ready_why());
         }
@@ -664,6 +709,22 @@ impl Taker {
             }
         }
         String::new()
+    }
+
+    /// Days the CME holiday calendar still covers from ``now`` (0 once its last listed day is over); None without one.
+    pub fn calendar_left(&self, now: i64) -> Option<i64> {
+        self.cal_last.map(|last| (last.0 + 1 - now.div_euclid(DAY_MS)).max(0))
+    }
+
+    /// Why no real order goes out for the calendar: its last listed day over, a holiday after it is not known (a day missing
+    /// trades a standing index). "" while it covers today.
+    pub fn calendar_why(&self, now: i64) -> String {
+        match (self.calendar_left(now), self.cal_last) {
+            (Some(0), Some(last)) => format!(
+                "CME 休市日历只排到 {last}，之后哪天休市不知道（错过一天就会在不动的指数上下单）：在设置文件补上之后的 CME_CLOSED_DAYS、CME_EARLY_DAYS 再重启"
+            ),
+            _ => String::new(),
+        }
     }
 
     /// No real order may be opened now by the operator's word or the service's stop.
@@ -763,6 +824,9 @@ impl Taker {
             }
             Ok(_) => {
                 self.journal_cut = false;
+                if let Some(sync) = &self.journal_sync {
+                    let _ = sync.send(()); // (on the disk itself a moment after the request leaves, a power cut or not)
+                }
                 true
             }
         }
@@ -815,7 +879,17 @@ impl Taker {
             let _ = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path);
         }
         match options.open(&path) {
-            Ok(f) => self.journal = Some(f),
+            Ok(f) => {
+                // the file and its folder's entry on the disk now (once, at the start), its lines after each order
+                let _ = f.sync_all();
+                if let Some(dir) = std::path::Path::new(&path).parent().filter(|d| !d.as_os_str().is_empty()) {
+                    if let Ok(d) = std::fs::File::open(dir) {
+                        let _ = d.sync_all();
+                    }
+                }
+                self.journal_sync = f.try_clone().ok().and_then(|copy| journal_syncer(copy, self.journal_syncs.clone()));
+                self.journal = Some(f);
+            }
             Err(e) => crate::warn!("规则吃单：订单日志打不开（{}），发单前改为等数据库写完", e.kind()),
         }
     }

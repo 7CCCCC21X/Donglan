@@ -1,7 +1,7 @@
 //! The orders after their answer: followed to Predict's final word (their rest withdrawn, the late fills taken), withdrawn at a
 //! pause or a stop; and the windows settled on Predict's result.
 use super::*;
-use crate::predict::{DOWN_WORDS, UP_WORDS, order_fill, order_final, order_price, predict_resolution};
+use crate::predict::{DOWN_WORDS, Resolution, UP_WORDS, order_fill, order_final, order_price, predict_resolution, won_index_set};
 use crate::rules::{cost, filled, in_flight, net};
 use crate::util::{DUST, g, round_to};
 
@@ -165,8 +165,9 @@ pub async fn withdraw_one(me: &Me, key: &str, hash: &str) {
             o.insert("error".into(), json!(clean(&error)));
             o.insert("next_ms".into(), json!(0));
         }
-        Ok((removed, _)) => {
-            if removed.contains(&id) {
+        Ok((removed, noop)) => {
+            // (noop: nothing left to withdraw — filled or expired already; either way off the book, as follow_order takes it)
+            if removed.contains(&id) || noop.contains(&id) {
                 o.insert("removed".into(), json!(now));
                 o.insert("left_ms".into(), json!(now));
                 o.insert("state".into(), json!("cancelling"));
@@ -330,6 +331,39 @@ pub fn take_fills(t: &mut Taker, key: &str, hash: &str, row: &Obj) {
     }
 }
 
+/// How often a window's settlement is read: every minute at first; still unsettled an hour past its end, every ten minutes;
+/// a day past it, every hour (a market Predict is slow to settle, or settles in words not understood, costs a read an hour).
+pub fn settle_every(since_end_ms: i64) -> i64 {
+    if since_end_ms < 3_600_000 {
+        SETTLE_EVERY_MS
+    } else if since_end_ms < DAY_MS {
+        10 * 60_000
+    } else {
+        3_600_000
+    }
+}
+
+/// What a share the record holds paid at the settlement: by the outcome it bought (its indexSet) — the winning outcome's
+/// name read only for a record without one (written before it was kept); a split pays half. None when it cannot be told.
+pub fn paid(rec: &Obj, res: &Resolution, won: Option<i64>) -> Option<f64> {
+    if res.split {
+        return Some(0.5);
+    }
+    let held = rec.i("index_set");
+    if let (true, Some(won)) = (held > 0, won) {
+        return Some(if won == held { 1.0 } else { 0.0 });
+    }
+    let name = res.name.trim().to_lowercase();
+    let up = if UP_WORDS.contains(&name.as_str()) {
+        1.0
+    } else if DOWN_WORDS.contains(&name.as_str()) {
+        0.0
+    } else {
+        return None;
+    };
+    Some(if rec.s("side") == "up" { up } else { 1.0 - up })
+}
+
 pub async fn settle(me: &Me) {
     let due: Vec<String> = {
         let t = me.borrow();
@@ -337,7 +371,9 @@ pub async fn settle(me: &Me) {
         t.recs
             .iter()
             .filter(|(_, r)| r.none("pnl") && !in_flight(r) && filled(r) > DUST)
-            .filter(|(_, r)| now >= r.i("end_ms") + SETTLE_AFTER_MS && now - r.i("settle_checked") >= SETTLE_EVERY_MS)
+            .filter(|(_, r)| {
+                now >= r.i("end_ms") + SETTLE_AFTER_MS && now - r.i("settle_checked") >= settle_every(now - r.i("end_ms"))
+            })
             .map(|(k, _)| k.clone())
             .collect()
     };
@@ -356,7 +392,7 @@ pub async fn settle(me: &Me) {
         };
         let market = api.market(&mid, false).await;
         let mut t = me.borrow_mut();
-        let resolution = match market {
+        let (res, won) = match market {
             Err(e) => {
                 if let Some(rec) = t.recs.get_mut(&key) {
                     rec.insert("settle_error".into(), json!(clean(&e)));
@@ -364,31 +400,33 @@ pub async fn settle(me: &Me) {
                 t.save_key(&key);
                 continue;
             }
-            Ok(m) => predict_resolution(&m),
-        };
-        let Some(res) = resolution else {
-            t.save_key(&key);
-            continue;
-        };
-        let name = res.name.to_lowercase();
-        let up = if res.split {
-            Some(0.5)
-        } else if UP_WORDS.contains(&name.as_str()) {
-            Some(1.0)
-        } else if DOWN_WORDS.contains(&name.as_str()) {
-            Some(0.0)
-        } else {
-            None
-        };
-        let Some(up) = up else {
-            if let Some(rec) = t.recs.get_mut(&key) {
-                rec.insert("settle_error".into(), json!(format!("结果名称认不出：{}", res.name)));
-            }
-            t.save_key(&key);
-            continue;
+            Ok(m) => match predict_resolution(&m) {
+                Some(res) => {
+                    let won = won_index_set(&m, &res);
+                    (res, won)
+                }
+                None => {
+                    t.save_key(&key);
+                    continue;
+                }
+            },
         };
         let Some(rec) = t.recs.get_mut(&key) else { continue };
-        let pay = if rec.s("side") == "up" { up } else { 1.0 - up };
+        let Some(pay) = paid(rec, &res, won) else {
+            let first = !rec.t("settle_alarmed");
+            rec.insert("settle_error".into(), json!(format!("结果名称认不出：{}", res.name)));
+            rec.insert("settle_alarmed".into(), json!(true));
+            let name = if rec.t("name") { rec.s("name") } else { rec.s("slug") };
+            t.save_key(&key);
+            if first {
+                t.alarm(&format!(
+                    "⚠️ 规则吃单：{name} 已结算，但认不出结果（{}），这一场的盈亏算不出、不计入今天的亏损停机线：请到 Predict 网站核对",
+                    res.name
+                ));
+            }
+            continue;
+        };
+        let up = if res.split || rec.s("side") == "up" { pay } else { 1.0 - pay };
         let pnl = net(rec) * pay - cost(rec);
         rec.insert(
             "result".into(),

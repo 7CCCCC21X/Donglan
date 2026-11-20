@@ -291,6 +291,15 @@ impl Taker {
                 LIVE_STOP_MS / 1000
             );
         }
+        if let (Some(left), Some(last)) = (self.calendar_left(now), self.cal_last) {
+            if left <= super::CALENDAR_WARN_DAYS {
+                head += &if left == 0 {
+                    format!("｜⛔ CME 休市日历只排到 {last}，不再下单：补上 CME_CLOSED_DAYS、CME_EARLY_DAYS 再重启")
+                } else {
+                    format!("｜⚠️ CME 休市日历只排到 {last}（还剩 {left} 天）")
+                };
+            }
+        }
         if s.max_day_usd != 0.0 {
             head += &format!(
                 "｜每天最多花 ${}（今天已花 ${}）",

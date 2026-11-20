@@ -312,6 +312,20 @@ impl Taker {
     /// The windows of the enabled rules from now to a day on; a window of a rule switched off is dropped, and so is one this
     /// close to its start (or, for a rule that buys in its course too, to its end). Old finished records removed.
     pub fn plan(&mut self, now: i64) {
+        // the holiday calendar running out: told once a day for its last CALENDAR_WARN_DAYS (then no real order goes out)
+        if let (Some(left), Some(last)) = (self.calendar_left(now), self.cal_last) {
+            let today = day_of(now);
+            if left <= CALENDAR_WARN_DAYS && self.cal_told != today && self.settings.mode == "on" {
+                self.cal_told = today;
+                self.alarm(&if left == 0 {
+                    format!("⛔ 规则吃单：{}", self.calendar_why(now))
+                } else {
+                    format!(
+                        "⚠️ 规则吃单：CME 休市日历只排到 {last}（还剩 {left} 天）。到期后不再下单：在设置文件补上之后的 CME_CLOSED_DAYS、CME_EARLY_DAYS（bash deploy/gcp/rt.sh edit）"
+                    )
+                });
+            }
+        }
         let mut want: IndexMap<String, (&'static str, i64)> = IndexMap::new();
         if self.settings.mode != "off" {
             for rule in RULES.iter() {

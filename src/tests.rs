@@ -66,8 +66,11 @@ pub struct FakePredict {
     pub book_ms: Cell<i64>,
     /// GET /orders/{hash}, one answer each in turn: "" as it stands, "empty" a 200 with no order in it, "timeout" lost
     pub order_reads: RefCell<std::collections::VecDeque<&'static str>>,
-    /// a cancel answered without naming the ids ("silent": carried out all the same; "ignored": not carried out)
+    /// a cancel answered without naming the ids ("silent": carried out all the same; "ignored": not carried out) or naming
+    /// them as nothing to do ("noop": filled or gone already)
     pub remove_mode: Cell<&'static str>,
+    /// the USDT allowance per exchange (wallet::EXCHANGES key); one not named has ``chain_allowed``
+    pub allowed_by: RefCell<HashMap<&'static str, u128>>,
 }
 
 impl FakePredict {
@@ -153,6 +156,9 @@ impl FakePredict {
                     }
                 }
             }
+            if mode == "noop" {
+                return Self::ok(json!({"removed": [], "noop": ids}));
+            }
             if !mode.is_empty() {
                 return Self::ok(json!({"removed": [], "noop": []}));
             }
@@ -183,7 +189,14 @@ impl FakePredict {
                 if sel == balance_of {
                     json!(word(self.chain_usdt.get()))
                 } else if sel == allowance {
-                    let a = self.chain_allowed.get();
+                    // (owner, spender): the spender's address is the last 20 bytes of the second word
+                    let spender = data.get(10 + 64 + 24..10 + 128).unwrap_or("").to_lowercase();
+                    let named = crate::wallet::addresses(56)
+                        .unwrap()
+                        .iter()
+                        .find(|(_, a)| a.to_lowercase().ends_with(&spender) && !spender.is_empty())
+                        .and_then(|(k, _)| self.allowed_by.borrow().get(k).copied());
+                    let a = named.unwrap_or(self.chain_allowed.get());
                     if a == u128::MAX { json!(format!("0x{}", "f".repeat(64))) } else { json!(word(a)) }
                 } else {
                     json!(word(0))
@@ -1848,5 +1861,296 @@ fn bench_side_tasks() {
         time("Telegram 消息排队（切段、入队）", 200, &mut || {
             let _ = crate::telegram::chunks(&text, crate::telegram::LIMIT);
         });
+    });
+}
+
+/// A real record of a finished window, its shares bought and its order final: ``index_set`` the outcome it bought.
+fn bought(t: &mut Taker, key: &str, side: &str, index_set: i64, end_ms: i64, mid: &str) {
+    let rec = json!({"slug": key, "name": key, "mode": "on", "rule": "gold_shut", "side": side, "index_set": index_set,
+        "market_id": mid, "start_ms": end_ms - 900_000, "end_ms": end_ms,
+        "orders": [{"hash": format!("0x{key}"), "id": "", "state": "final", "shares": 10.0, "filled": 10.0, "limit": 0.55,
+                    "avg": 0.55, "fee_bps": 0, "at": end_ms - 1_000_000}]});
+    t.recs.insert(key.into(), rec.as_object().cloned().unwrap());
+}
+
+/// A market settled: the outcome with ``won`` its indexSet marked WON, under the names given.
+fn settled(mid: &str, names: [&str; 2], won: i64) -> Obj {
+    let row = |i: i64, name: &str| {
+        json!({"name": name, "indexSet": i, "onChainId": format!("{i}{i}{i}"),
+                                         "status": if i == won { "WON" } else { "LOST" }})
+    };
+    json!({"id": mid, "status": "RESOLVED", "outcomes": [row(1, names[0]), row(2, names[1])]}).as_object().cloned().unwrap()
+}
+
+#[test]
+fn a_window_settles_on_the_outcome_it_bought_whatever_its_name() {
+    run(async {
+        let r = rig(start(), &[]);
+        let end = start() - 3_600_000;
+        {
+            let mut t = r.me.borrow_mut();
+            // "Up or Flat" / "Down": the order bought outcome 1 for Up (named by its partner), outcome 2 for Down
+            bought(&mut t, "up-won", "up", 1, end, "m1");
+            bought(&mut t, "down-lost", "down", 2, end, "m1");
+            bought(&mut t, "old-unnamed", "up", 0, end, "m1"); // (written before records kept the outcome)
+        }
+        r.api.markets.borrow_mut().insert("m1".into(), settled("m1", ["Up or Flat", "Down"], 1));
+        orders::settle(&r.me).await;
+        let t = r.me.borrow();
+        let (won, lost, old) = (&t.recs["up-won"], &t.recs["down-lost"], &t.recs["old-unnamed"]);
+        assert_eq!((won.f("pnl"), won.s("result").as_str()), (4.5, "up"), "{won:?}");
+        assert_eq!((lost.f("pnl"), lost.s("result").as_str()), (-5.5, "up"), "{lost:?}");
+        // a record without the outcome it bought, on a name not understood: told once, never settled on a guess
+        assert!(old.none("pnl") && old.t("settle_alarmed"), "{old:?}");
+        assert!(old.s("settle_error").contains("结果名称认不出：Up or Flat"));
+        // the day's loss counts the lost window (the loss stop sees it)
+        assert!((t.today_pnl() - (4.5 - 5.5)).abs() < 1e-9);
+    });
+}
+
+#[test]
+fn a_window_predict_is_slow_to_settle_is_read_less_and_less_often() {
+    run(async {
+        let r = rig(start(), &[]);
+        let reads = |r: &Rig| r.api.calls.borrow().iter().filter(|c| *c == "GET /markets/m2").count();
+        bought(&mut r.me.borrow_mut(), "slow", "up", 1, start() - 5 * 60_000, "m2");
+        r.api.markets.borrow_mut().insert("m2".into(), market_of("m2", "slow", "CLOSED")); // (not settled yet)
+        orders::settle(&r.me).await;
+        r.advance(taker::SETTLE_EVERY_MS);
+        orders::settle(&r.me).await;
+        assert_eq!(reads(&r), 2); // every minute while it is fresh
+        r.advance(2 * 3_600_000); // two hours past its end: every ten minutes
+        orders::settle(&r.me).await;
+        r.advance(5 * 60_000);
+        orders::settle(&r.me).await;
+        assert_eq!(reads(&r), 3);
+        r.advance(5 * 60_000);
+        orders::settle(&r.me).await;
+        assert_eq!(reads(&r), 4);
+        r.advance(crate::util::DAY_MS); // a day past it: every hour
+        orders::settle(&r.me).await;
+        r.advance(30 * 60_000);
+        orders::settle(&r.me).await;
+        assert_eq!(reads(&r), 5);
+        r.advance(30 * 60_000);
+        orders::settle(&r.me).await;
+        assert_eq!(reads(&r), 6);
+    });
+}
+
+#[test]
+fn an_order_past_its_expiry_holds_nothing_once_a_read_has_seen_it() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.me.borrow_mut().usdt = Some(100 * WEI);
+        *r.api.create_error.borrow_mut() = Some(RemoteError::new("网络错误 (TimeoutError: timed out)"));
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        let o = r.order(0);
+        assert_eq!(o.state(), "unknown"); // (its answer lost: it may be on the book)
+        let read_at = |r: &Rig, at: i64| {
+            let mut t = r.me.borrow_mut();
+            r.clock.set(at);
+            t.balance_asked_ms = at;
+            t.usd(None).unwrap()
+        };
+        let expiry = o.i("expires") * 1000;
+        // a read a minute past its expiry may not have what it matched just before: still aside
+        assert!((read_at(&r, expiry + 60_000) - 71.0).abs() < 1e-9);
+        // a read begun well past it has everything it ever took: nothing aside, however long its answer stays lost
+        assert!((read_at(&r, expiry + taker::GIVE_UP_MS + taker::BALANCE_LAG_MS + 1) - 100.0).abs() < 1e-9);
+        assert_eq!(r.order(0).state(), "unknown");
+    });
+}
+
+#[test]
+fn one_order_test_at_a_time() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.books.borrow_mut().insert(MID.into(), json!({"bids": [["0.40", "10"]], "asks": [["0.60", "10"]]}));
+        r.api.create_delay.set(0.05); // (the first one's order on its way when the second is asked)
+        let (a, b) = tokio::join!(control::order_test(&r.me), control::order_test(&r.me));
+        assert!(a.contains("1/4"), "{a}");
+        assert!(b.contains("挂单测试正在进行"), "{b}");
+        assert_eq!(r.created().len(), 1);
+        assert!(!r.me.borrow().testing);
+        let again = control::order_test(&r.me).await; // (done: the next one runs)
+        assert!(again.contains("1/4"), "{again}");
+        assert_eq!(r.created().len(), 2);
+    });
+}
+
+#[test]
+fn a_yes_tapped_twice_runs_its_command_once() {
+    run(async {
+        let fake = FakeTelegram::new(|_| Ok(br#"{"ok":true,"result":true}"#.to_vec()));
+        let tg = Rc::new(crate::telegram::Telegram::new("", &[], 42, true, true, "222:commands", fake.clone()));
+        let runs = Rc::new(Cell::new(0));
+        let counted = runs.clone();
+        *tg.handler.borrow_mut() = Some(Rc::new(move |_c: String, _a: String| {
+            counted.set(counted.get() + 1);
+            Box::pin(async {
+                crate::sync::sleep(0.02).await;
+                "做完了".to_string()
+            })
+        }));
+        let tap = |data: String| {
+            json!({"update_id": 1, "callback_query": {"id": "q", "data": data, "from": {"id": 42},
+                   "message": {"message_id": 77, "chat": {"id": 42}}}})
+        };
+        let now = crate::util::now_ms() / 1000;
+        tg.on_update(&tap(format!("y:{now}:/test")));
+        tg.on_update(&tap(format!("y:{now}:/test"))); // (tapped again before the card changed)
+        settle_tasks().await;
+        assert_eq!(runs.get(), 1);
+        assert!(
+            fake.calls.borrow().iter().any(|(m, p)| m == "answerCallbackQuery" && p["text"] == "已经确认过，正在执行或已执行完")
+        );
+        // the card's buttons replaced before the command ran (then the menu brought up to date again)
+        assert!(fake.methods().iter().filter(|m| *m == "editMessageText").count() >= 2);
+        // a new card on the same message (its own time): its yes runs
+        tg.on_update(&tap(format!("y:{}:/test", now - 1)));
+        settle_tasks().await;
+        assert_eq!(runs.get(), 2);
+    });
+}
+
+#[test]
+fn an_order_already_filled_when_the_pause_withdraws_it_is_not_withdrawn_twice() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.create_delay.set(0.02);
+        r.api.remove_mode.set("noop"); // (Predict: nothing to withdraw — it is filled)
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.me.borrow().stop.set(); // the service stops while the answer is on its way
+        r.sends().await;
+        let o = r.order(0);
+        assert_eq!(o.state(), "cancelling", "{o:?}");
+        assert!(o.t("removed"));
+        assert_eq!(*r.api.removed.borrow(), vec!["id1".to_string()]);
+        let told = orders::withdraw_all(&r.me, "服务停止").await;
+        assert_eq!(*r.api.removed.borrow(), vec!["id1".to_string()], "{told}"); // (asked once, not again)
+    });
+}
+
+#[test]
+fn the_record_keeps_the_shares_as_signed() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        {
+            let mut t = r.me.borrow_mut();
+            t.usdt = Some(1_000_000 * WEI);
+            t.settings.shares = vec![("gold".into(), 123_456), ("oil".into(), 50)]; // (past the settings' 100 000)
+        }
+        r.push(MID, book(&[("0.55", "200000")], &[]));
+        r.sends().await;
+        assert_eq!(r.taker_amount(0), 123_450 * WEI); // Predict's 5 significant digits
+        assert_eq!(r.order(0).f("shares"), 123_450.0); // ... and the record's, so a fill is read against it
+    });
+}
+
+#[test]
+fn the_check_asks_for_the_exchange_the_markets_settle_on() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        {
+            let t = r.me.borrow();
+            let mut w = t.track.get(&slug_of(start())).unwrap().borrow_mut();
+            w.market.as_mut().unwrap().insert("isNegRisk".into(), json!(true));
+        }
+        r.api.allowed_by.borrow_mut().insert("NEG_RISK_CTF_EXCHANGE", 0);
+        let text = control::self_check(&r.me).await;
+        assert!(text.contains("❌ 授权：多结果交易所 没有 USDT 额度"), "{text}");
+        assert!(!text.contains("标准交易所") && text.contains("结论：❌"), "{text}");
+        r.api.allowed_by.borrow_mut().clear();
+        let text = control::self_check(&r.me).await;
+        assert!(text.contains("✅ 授权：多结果交易所 USDT 额度已授权") && text.contains("结论：✅"), "{text}");
+    });
+}
+
+#[test]
+fn a_calendar_run_out_holds_every_real_order() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        let today = crate::util::Date(r.clock.get().div_euclid(crate::util::DAY_MS));
+        r.me.borrow_mut().cal_last = Some(today.add(10)); // ten days left: told, still trading
+        assert!(r.me.borrow().status().contains("还剩 11 天"), "{}", r.me.borrow().status());
+        let now = r.me.borrow().now();
+        r.me.borrow_mut().plan(now);
+        assert_eq!(r.me.borrow().cal_told, day_of(now));
+        assert_eq!(r.me.borrow().block(0.0, None), "");
+        let text = control::self_check(&r.me).await;
+        assert!(text.contains("⚠️ CME 休市日历只排到") && text.contains("结论：✅"), "{text}");
+        r.me.borrow_mut().cal_last = Some(today.add(-1)); // over: no real order
+        assert!(r.me.borrow().block(0.0, None).contains("CME 休市日历只排到"));
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        assert!(r.created().is_empty(), "{}", r.word());
+        let text = control::self_check(&r.me).await;
+        assert!(text.contains("❌ CME 休市日历只排到") && text.contains("结论：❌"), "{text}");
+    });
+}
+
+#[test]
+fn the_journal_is_made_durable_behind_the_order() {
+    run(async {
+        let (_dir, path) = store_at("journal-sync");
+        let r = rig_with(start() - 3_600_000, Store::open(&path).unwrap(), FakePredict::new(), &[]);
+        r.found().await;
+        let before = r.me.borrow().journal_syncs.load(std::sync::atomic::Ordering::SeqCst);
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        let mut synced = false;
+        for _ in 0..200 {
+            if r.me.borrow().journal_syncs.load(std::sync::atomic::Ordering::SeqCst) > before {
+                synced = true;
+                break;
+            }
+            crate::sync::sleep(0.005).await;
+        }
+        assert!(synced);
+    });
+}
+
+#[test]
+fn the_console_refuses_on_the_head_and_takes_no_flood() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        crate::server::serve(r.me.clone(), "127.0.0.1".into(), port, "secret-key-123".into()).await.unwrap();
+        let answer = |mut sock: TcpStream| async move {
+            let mut got = Vec::new();
+            let read = tokio::time::timeout(std::time::Duration::from_secs(2), sock.read_to_end(&mut got)).await;
+            (read.is_ok(), String::from_utf8_lossy(&got).to_string())
+        };
+        // a POST without the key: refused on its head — the body it promises is never waited for
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        sock.write_all(b"POST /pause HTTP/1.1\r\nX-RT: 1\r\nContent-Length: 60000\r\n\r\n").await.unwrap();
+        let (in_time, text) = answer(sock).await;
+        assert!(in_time && text.starts_with("HTTP/1.1 403"), "{text}");
+        assert!(r.me.borrow().paused.is_empty());
+        // as many idle connections as it serves at once: the next one is closed at once
+        let mut idle = vec![];
+        for _ in 0..crate::server::MAX_CONNECTIONS {
+            idle.push(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        }
+        crate::sync::sleep(0.05).await;
+        let (in_time, text) = answer(TcpStream::connect(("127.0.0.1", port)).await.unwrap()).await;
+        assert!(in_time && text.is_empty(), "{text}");
+        // one of them gone: served again
+        drop(idle.pop());
+        crate::sync::sleep(0.05).await;
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        sock.write_all(b"GET /healthz HTTP/1.1\r\n\r\n").await.unwrap();
+        let (in_time, text) = answer(sock).await;
+        assert!(in_time && text.starts_with("HTTP/1.1 "), "{text}");
     });
 }

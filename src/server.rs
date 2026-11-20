@@ -16,13 +16,18 @@
 //! browser. A server on another address than the machine itself is refused at the start without a key (Config).
 use crate::taker::{Me, control};
 use serde_json::{Value, json};
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 pub const PAGE: &str = include_str!("../web/console.html");
 pub const MAX_BODY: usize = 65_536;
+/// Requests served at once (more are closed at once), and the pause after a failed accept.
+pub const MAX_CONNECTIONS: usize = 32;
+pub const ACCEPT_PAUSE_MS: u64 = 100;
 
 pub struct Reply {
     pub status: u16,
@@ -90,6 +95,33 @@ fn same_key(given: &str, key: &str) -> bool {
     diff == 0 && a.len() == b.len()
 }
 
+/// Whether a request is refused on its head alone (every path but /healthz and the page): the key, the method, a POST's
+/// X-RT header — judged before its body is read, so nobody without the key gets the server to take one in.
+fn turned_away(key: &str, method: &str, query: &HashMap<String, String>, headers: &HashMap<String, String>) -> Option<Reply> {
+    if !key.is_empty() {
+        let given = query
+            .get("key")
+            .cloned()
+            .filter(|k| !k.is_empty())
+            .or_else(|| headers.get("x-status-key").cloned())
+            .unwrap_or_default();
+        if !same_key(&given, key) {
+            return Some(reply(403, TEXT, "need ?key=STATUS_KEY"));
+        }
+    }
+    if method != "GET" && method != "POST" {
+        return Some(reply(405, TEXT, "method not allowed"));
+    }
+    if method == "POST" && headers.get("x-rt").map(String::as_str) != Some("1") {
+        return Some(reply(403, TEXT, "POST needs the header X-RT: 1"));
+    }
+    None
+}
+
+fn open_path(method: &str, path: &str) -> bool {
+    path == "/healthz" || (matches!(path, "/" | "/console" | "/index.html") && method == "GET")
+}
+
 pub async fn route(
     me: &Me,
     key: &str,
@@ -103,19 +135,11 @@ pub async fn route(
         let ok = me.borrow().healthy();
         return reply(if ok { 200 } else { 503 }, TEXT, if ok { "ok" } else { "not running" });
     }
-    if matches!(path, "/" | "/console" | "/index.html") && method == "GET" {
+    if open_path(method, path) {
         return reply(200, "text/html; charset=utf-8", PAGE);
     }
-    if !key.is_empty() {
-        let given = query
-            .get("key")
-            .cloned()
-            .filter(|k| !k.is_empty())
-            .or_else(|| headers.get("x-status-key").cloned())
-            .unwrap_or_default();
-        if !same_key(&given, key) {
-            return reply(403, TEXT, "need ?key=STATUS_KEY");
-        }
+    if let Some(no) = turned_away(key, method, query, headers) {
+        return no;
     }
     if method == "GET" {
         return match path {
@@ -146,12 +170,6 @@ pub async fn route(
                 reply(if post_only { 405 } else { 404 }, TEXT, if api_like { "use POST" } else { "not found" })
             }
         };
-    }
-    if method != "POST" {
-        return reply(405, TEXT, "method not allowed");
-    }
-    if headers.get("x-rt").map(String::as_str) != Some("1") {
-        return reply(403, TEXT, "POST needs the header X-RT: 1");
     }
     match path {
         "/pause" => {
@@ -245,7 +263,8 @@ struct Request {
     body: Vec<u8>,
 }
 
-async fn read_request(sock: &mut tokio::net::TcpStream) -> Result<Request, String> {
+/// A request's line and headers (its body not read yet: ``body`` holds the bytes that came with the head).
+async fn read_head(sock: &mut tokio::net::TcpStream) -> Result<Request, String> {
     let mut buf = Vec::new();
     let end = loop {
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -271,38 +290,59 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Result<Request, Strin
             headers.insert(k.trim().to_lowercase(), v.trim().to_string());
         }
     }
-    let length: usize =
-        headers.get("content-length").map(|v| v.trim().parse().map_err(|_| "ValueError".to_string())).transpose()?.unwrap_or(0);
-    if length > MAX_BODY {
-        return Err("ValueError".into());
-    }
-    let mut body = buf[end + 4..].to_vec();
-    while body.len() < length {
-        let mut chunk = [0u8; 4096];
-        let n = sock.read(&mut chunk).await.map_err(|_| "ConnectionError".to_string())?;
-        if n == 0 {
-            return Err("IncompleteReadError".into());
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(length);
+    let body = buf[end + 4..].to_vec();
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     let path = path.split('#').next().unwrap_or("").to_string();
     Ok(Request { method, path: if path.is_empty() { "/".into() } else { path }, query: parse_query(query), headers, body })
 }
 
-async fn handle(me: Me, key: String, mut sock: tokio::net::TcpStream) {
-    let request = tokio::time::timeout(Duration::from_secs(5), read_request(&mut sock))
-        .await
-        .unwrap_or_else(|_| Err("TimeoutError".into()));
-    let (r, csv) = match request {
-        Ok(req) => {
-            let r = route(&me, &key, &req.method, &req.path, &req.query, &req.headers, &req.body).await;
-            let csv = r.kind.starts_with("text/csv");
-            (r, csv)
+/// The rest of a request's body (Content-Length, at most MAX_BODY).
+async fn read_body(sock: &mut tokio::net::TcpStream, req: &mut Request) -> Result<(), String> {
+    let length: usize = req
+        .headers
+        .get("content-length")
+        .map(|v| v.trim().parse().map_err(|_| "ValueError".to_string()))
+        .transpose()?
+        .unwrap_or(0);
+    if length > MAX_BODY {
+        return Err("ValueError".into());
+    }
+    while req.body.len() < length {
+        let mut chunk = [0u8; 4096];
+        let n = sock.read(&mut chunk).await.map_err(|_| "ConnectionError".to_string())?;
+        if n == 0 {
+            return Err("IncompleteReadError".into());
         }
-        Err(kind) => (reply(400, TEXT, format!("bad request: {kind}")), false),
+        req.body.extend_from_slice(&chunk[..n]);
+    }
+    req.body.truncate(length);
+    Ok(())
+}
+
+/// The request read (its head, then — the key and the header judged first — its body; five seconds for both) and routed.
+async fn answer(me: &Me, key: &str, sock: &mut tokio::net::TcpStream) -> Reply {
+    let began = std::time::Instant::now();
+    let limit = Duration::from_secs(5);
+    let mut req = match tokio::time::timeout(limit, read_head(sock)).await {
+        Ok(Ok(req)) => req,
+        Ok(Err(kind)) => return reply(400, TEXT, format!("bad request: {kind}")),
+        Err(_) => return reply(400, TEXT, "bad request: TimeoutError"),
     };
+    if !open_path(&req.method, &req.path) {
+        if let Some(no) = turned_away(key, &req.method, &req.query, &req.headers) {
+            return no;
+        }
+    }
+    match tokio::time::timeout(limit.saturating_sub(began.elapsed()), read_body(sock, &mut req)).await {
+        Ok(Ok(())) => route(me, key, &req.method, &req.path, &req.query, &req.headers, &req.body).await,
+        Ok(Err(kind)) => reply(400, TEXT, format!("bad request: {kind}")),
+        Err(_) => reply(400, TEXT, "bad request: TimeoutError"),
+    }
+}
+
+async fn handle(me: Me, key: String, mut sock: tokio::net::TcpStream) {
+    let r = answer(&me, &key, &mut sock).await;
+    let csv = r.kind.starts_with("text/csv");
     let data = r.body.into_bytes();
     let extra = if csv { "Content-Disposition: attachment; filename=\"ruletaker-records.csv\"\r\n" } else { "" };
     let head = format!(
@@ -316,6 +356,15 @@ async fn handle(me: Me, key: String, mut sock: tokio::net::TcpStream) {
     out.extend(data);
     let _ = sock.write_all(&out).await;
     let _ = sock.shutdown().await;
+}
+
+/// A request's place among the MAX_CONNECTIONS, given back however its task ends.
+struct Slot(Rc<Cell<usize>>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 /// The server, serving until the process ends (a port of 0: none).
@@ -333,10 +382,26 @@ pub async fn serve(me: Me, host: String, port: u16, key: String) -> Result<(), S
         crate::info!("控制台：http://{host}:{port}/  状态：http://{host}:{port}/status");
     }
     tokio::task::spawn_local(async move {
+        let open = Rc::new(Cell::new(0usize));
         loop {
-            let Ok((sock, _)) = listener.accept().await else { continue };
+            let sock = match listener.accept().await {
+                Ok((sock, _)) => sock,
+                Err(_) => {
+                    // (out of file handles, or the like: a breath before the next try — never a spin on the orders' thread)
+                    tokio::time::sleep(Duration::from_millis(ACCEPT_PAUSE_MS)).await;
+                    continue;
+                }
+            };
+            if open.get() >= MAX_CONNECTIONS {
+                continue; // (closed at once: the page asks again in two seconds)
+            }
             let _ = sock.set_nodelay(true);
-            tokio::task::spawn_local(handle(me.clone(), key.clone(), sock));
+            open.set(open.get() + 1);
+            let (me, key, slot) = (me.clone(), key.clone(), Slot(open.clone()));
+            tokio::task::spawn_local(async move {
+                let _slot = slot;
+                handle(me, key, sock).await;
+            });
         }
     });
     Ok(())

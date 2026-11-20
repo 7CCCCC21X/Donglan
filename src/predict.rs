@@ -841,6 +841,13 @@ pub fn predict_resolution(market: &Obj) -> Option<Resolution> {
     Some(Resolution { index: Some(index), name: names[index].clone(), split: false, how: "resolution" })
 }
 
+/// The indexSet of the outcome a market settled on, numbered as parse_market numbers its outcomes; None for a split.
+pub fn won_index_set(market: &Obj, res: &Resolution) -> Option<i64> {
+    let i = res.index?;
+    let row = *sorted_outcomes(market).get(i)?;
+    Some(if row.t("indexSet") { row.i("indexSet") } else { i as i64 + 1 })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Outcome {
     pub name: String,
