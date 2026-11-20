@@ -222,8 +222,8 @@ bash deploy/gcp/rt.sh env
 
 一个网页，两个标签：**控制台**和**复盘**。网页在虚拟机上只对本机开放（`127.0.0.1:8080`），不开任何公网端口；从浏览器看要走一条 SSH 通道：
 
-1. 在 Cloud Shell 里运行 `bash deploy/gcp/rt.sh console`（窗口保持开着）。
-2. 点 Cloud Shell 工具栏右上角的 **「网页预览」**（方框里一个眼睛的图标）→ **「在端口 8080 上预览」**。浏览器新开一页就是控制台。这个预览地址只有登录了你的 Google 账号才能打开。
+1. 在 Cloud Shell 里运行 `bash deploy/gcp/rt.sh console`（窗口保持开着），**等它显示“✅ 通道已接通”**——加固后走 Google 的 IAP 通道，要几秒到十几秒。在这之前点预览会看到“Unable to forward your request to a backend / Couldn't connect to a server on port 8080”，等接通后刷新那一页就好。
+2. 点 Cloud Shell 工具栏右上角的 **「网页预览」**（Web preview，方框里一个眼睛的图标）→ **「在端口 8080 上预览」**。浏览器新开一页就是控制台。这个预览地址只有登录了你的 Google 账号才能打开。
 3. 看完回到 Cloud Shell 按 `Ctrl+C` 关掉通道。
 
 通道开着时这个 Cloud Shell 标签页被占用，要运行别的命令点终端标签旁边的 **+** 开一个新的。Cloud Shell 端口 8080 被占用时换一个：`bash deploy/gcp/rt.sh console 8081`，预览时选“更改端口”填 8081。
