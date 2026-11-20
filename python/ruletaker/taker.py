@@ -77,6 +77,7 @@ FOLLOW_EVERY_MS = 1_000
 UNKNOWN_EVERY_MS = 10_000
 GIVE_UP_MS = 15 * 60_000
 REJECT_PAUSE_MS = 30_000
+RACE_WAIT_S = 30.0            # the status text and the CSV wait out the race's seconds this long at the most
 CONNECT_RETRY_MS = 2_000      # an order that got no connection (nothing sent): the window looks again this soon
 MAX_REJECTS = 5
 SETTLE_AFTER_MS = 120_000
@@ -1881,9 +1882,17 @@ class RuleTaker:
             return f"规则吃单改成：{MODES[want]}" + "".join(f"\n{x}" for x in (line, late) if x)
         return "？"
 
+    async def after_the_race(self) -> None:
+        """Waits out the race's seconds (RACE_WAIT_S at the most): what is worked out after it — the status text (milliseconds
+        over a long record), the CSV — holds the loop the orders go out on, never while an offer may be there to take."""
+        began = time.monotonic()
+        while (left := self.quiet_ms(self.now())) > 0 and time.monotonic() - began < RACE_WAIT_S:
+            await asyncio.sleep(min(left / 1000, 0.25))
+
     async def command(self, command: str, args: str) -> str:
         """The admin's Telegram commands."""
         if command in {"/status", "/rules", "/start"}:
+            await self.after_the_race()
             return self.status()
         if command == "/pause":
             return await self.control("pause", args or "Telegram /pause")

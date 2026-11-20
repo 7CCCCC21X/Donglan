@@ -119,7 +119,10 @@ pub async fn route(
     }
     if method == "GET" {
         return match path {
-            "/status" => reply(200, TEXT, me.borrow().status()),
+            "/status" => {
+                control::after_the_race(me).await; // (milliseconds of the one thread the orders use: never in the race)
+                reply(200, TEXT, me.borrow().status())
+            }
             "/status.json" => json_reply(200, me.borrow().summary()),
             "/api/state" => json_reply(200, me.borrow().state()),
             "/api/review" => {
@@ -134,6 +137,7 @@ pub async fn route(
                 json_reply(200, me.borrow_mut().review_data(days))
             }
             "/api/records.csv" => {
+                control::after_the_race(me).await;
                 reply(200, "text/csv; charset=utf-8", format!("\u{feff}{}", crate::review::records_csv(&me.borrow().recs)))
             }
             _ => {

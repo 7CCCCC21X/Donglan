@@ -112,6 +112,8 @@ class StatusServer:
             return 403, text, "need ?key=STATUS_KEY"
         if method == "GET":
             if path == "/status":
+                if hasattr(self.taker, "after_the_race"):
+                    await self.taker.after_the_race()  # (milliseconds of the loop the orders use: never in the race)
                 return 200, text, self.taker.status()
             if path == "/status.json":
                 return 200, js, json.dumps(self.taker.summary(), ensure_ascii=False, default=str)
@@ -123,6 +125,8 @@ class StatusServer:
                 return 200, js, json.dumps(self.taker.review_data(days), ensure_ascii=False, default=str)
             if path == "/api/records.csv":
                 from .review import records_csv
+                if hasattr(self.taker, "after_the_race"):
+                    await self.taker.after_the_race()
                 return 200, "text/csv; charset=utf-8", "﻿" + records_csv(self.taker.recs)  # (the BOM: Excel reads it as UTF-8)
             return (405 if path in {"/pause", "/resume", "/mode", "/api/control", "/api/settings"} else 404), text, "use POST" if path.startswith(("/pause", "/resume", "/mode", "/api/")) else "not found"
         if method != "POST":

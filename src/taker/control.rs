@@ -115,10 +115,29 @@ fn resume(me: &Me) -> String {
     }
 }
 
+/// Waits out the race's seconds (RACE_WAIT_S at the most): what is worked out after it — the status text (milliseconds over a
+/// long record), the CSV — holds the one thread the orders go out on, never while an offer may be there to take.
+pub async fn after_the_race(me: &Me) {
+    let began = mono();
+    loop {
+        let left = {
+            let t = me.borrow();
+            t.quiet_ms(t.now())
+        };
+        if left <= 0 || mono() - began >= RACE_WAIT_S {
+            return;
+        }
+        crate::sync::sleep((left as f64 / 1000.0).min(0.25)).await;
+    }
+}
+
 /// The admin's Telegram commands.
 pub async fn command(me: &Me, command: &str, args: &str) -> String {
     match command {
-        "/status" | "/rules" | "/start" => me.borrow().status(),
+        "/status" | "/rules" | "/start" => {
+            after_the_race(me).await;
+            me.borrow().status()
+        }
         "/pause" => control(me, "pause", if args.is_empty() { "Telegram /pause" } else { args }).await,
         "/resume" => control(me, "resume", "").await,
         "/mode" => control(me, "mode", args).await,

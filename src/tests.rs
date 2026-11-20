@@ -1548,3 +1548,68 @@ fn an_order_test_whose_cancel_answer_names_nothing_reads_the_order_itself() {
         }
     });
 }
+
+#[test]
+fn the_status_text_waits_out_the_race_seconds() {
+    run(async {
+        // the makers' moment (5 minutes before the start): the race's seconds — /status is worked out once they are over
+        let r = rig(start() - 300_000, &[("RULE_LEAD_MINUTES", "5")]);
+        r.found().await;
+        assert!(r.me.borrow().quiet_ms(start() - 300_000) > 0);
+        let me = r.me.clone();
+        let asked = tokio::task::spawn_local(async move { control::command(&me, "/status", "").await });
+        crate::sync::sleep(0.3).await;
+        assert!(!asked.is_finished(), "worked out in the race's seconds");
+        r.advance(taker::QUIET_AFTER_MS + 1_000); // the race's seconds over
+        let text = tokio::time::timeout(std::time::Duration::from_secs(2), asked).await.unwrap().unwrap();
+        assert!(text.contains("规则吃单"), "{text}");
+        // out of them: at once
+        let text = tokio::time::timeout(std::time::Duration::from_millis(100), control::command(&r.me, "/status", "")).await;
+        assert!(text.is_ok());
+    });
+}
+
+/// What the console, the review page and the Telegram bot cost the one thread that also sends the orders: each of them runs
+/// there between two frames, so a frame that arrives meanwhile waits this long at the most (600 windows on record).
+#[test]
+#[ignore]
+fn bench_side_tasks() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        history(&r, 600);
+        r.found().await;
+        let time = |name: &str, n: usize, f: &mut dyn FnMut()| {
+            let mut took: Vec<f64> = (0..n)
+                .map(|_| {
+                    let began = std::time::Instant::now();
+                    f();
+                    began.elapsed().as_secs_f64() * 1e6
+                })
+                .collect();
+            took.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "{name}：中位 {:.0} µs，p99 {:.0} µs，最慢 {:.0} µs",
+                took[took.len() / 2],
+                took[took.len() * 99 / 100],
+                took[took.len() - 1]
+            );
+        };
+        time("控制台刷新一次（/api/state，页面开着时每 3 秒）", 200, &mut || {
+            let _ = serde_json::to_string(&r.me.borrow().state()).unwrap();
+        });
+        time("状态文字（Telegram /status、rt.sh status）", 200, &mut || {
+            let _ = r.me.borrow().status();
+        });
+        time("复盘计算一次（全部记录；30 秒内用缓存，抢单那几秒不算）", 50, &mut || {
+            let t = r.me.borrow();
+            let _ = serde_json::to_string(&crate::review::review(&t.recs, &t.settings, t.now(), 0)).unwrap();
+        });
+        time("导出 CSV（全部记录）", 50, &mut || {
+            let _ = crate::review::records_csv(&r.me.borrow().recs);
+        });
+        let text = r.me.borrow().status();
+        time("Telegram 消息排队（切段、入队）", 200, &mut || {
+            let _ = crate::telegram::chunks(&text, crate::telegram::LIMIT);
+        });
+    });
+}

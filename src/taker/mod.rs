@@ -61,6 +61,7 @@ pub const QUIET_BEFORE_MS: i64 = 1_000;
 pub const QUIET_AFTER_MS: i64 = 15_000;
 pub const COURSE_QUIET_MS: i64 = 12_000;
 pub const RUSH_QUIET_MS: i64 = 3_000;
+pub const RACE_WAIT_S: f64 = 30.0; // the status text and the CSV wait out the race's seconds this long at the most
 pub const INDEX_FRESH_MS: i64 = 1_500;
 pub const STOP_MS: i64 = 15_000;
 pub const EXPIRY_BEFORE_S: i64 = 5;

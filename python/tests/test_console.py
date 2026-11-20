@@ -157,6 +157,18 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(taker.review_data(30)["computed_ms"], first["computed_ms"])
         self.assertIn("busy", taker.review_data(7))
 
+    def test_the_status_text_waits_out_the_race_seconds(self) -> None:
+        async def go() -> None:
+            taker, *_ = make_taker(START - 3_600_000)
+            taker.quiet_ms = lambda now: 5_000  # the race's seconds: /status is worked out once they are over
+            asked = asyncio.ensure_future(taker.command("/status", ""))
+            await asyncio.sleep(0.3)
+            self.assertFalse(asked.done())
+            taker.quiet_ms = lambda now: 0
+            self.assertIn("规则吃单", await asyncio.wait_for(asked, 2))
+            self.assertIn("规则吃单", await asyncio.wait_for(taker.command("/status", ""), 0.1))  # out of them: at once
+        run(go())
+
 
 if __name__ == "__main__":
     unittest.main()
