@@ -143,7 +143,10 @@ pub async fn command(me: &Me, command: &str, args: &str) -> String {
         "/mode" => control(me, "mode", args).await,
         "/check" | "/selfcheck" => self_check(me).await,
         "/test" => order_test(me).await,
-        _ => "命令：/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜/id".into(),
+        _ => {
+            "命令：/menu 按钮菜单｜/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜/id"
+                .into()
+        }
     }
 }
 
@@ -376,6 +379,14 @@ pub async fn self_check(me: &Me) -> String {
         }
     } else if s.mode != "off" {
         r.warn("推送：还没有已发布的规则场次要订阅（场次在开场前约 24 小时发布）");
+    }
+    if let Some(tg) = &t.telegram {
+        let (fine, text) = tg.health();
+        if fine {
+            r.ok(text);
+        } else {
+            r.warn(text);
+        }
     }
     if RULES.iter().any(|rule| t.live_cents(rule) > 0) {
         match &t.index {
@@ -858,6 +869,17 @@ pub async fn reset_settings(me: &Me, keys: Option<&[String]>) -> SaveResult {
 }
 
 impl Taker {
+    /// The Telegram menu card's head: what is in force now (microseconds: no status text worked out), and the mode.
+    pub fn menu_head(&self) -> (String, String) {
+        let paused = if self.paused.is_empty() { "没暂停".to_string() } else { format!("已暂停（{}）", self.paused) };
+        let stopped = if self.loss_stop_why().is_empty() { "" } else { "｜今日已到停机线" };
+        let usd = self.usd(None).map(|u| format!("｜可用 ${}", comma(u, 2))).unwrap_or_default();
+        (
+            format!("模式：{}｜{paused}｜今日已结算 {}{usd}{stopped}", mode_name(&self.settings.mode), money(self.today_pnl())),
+            self.settings.mode.clone(),
+        )
+    }
+
     /// Why the operator's order test may not go out now ("" when it may): the deploy's hard switch, the pause, the stop.
     pub fn test_gate(&self) -> String {
         if self.stop.is_set() {

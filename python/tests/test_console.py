@@ -265,8 +265,8 @@ class TelegramCommandsTest(unittest.TestCase):
             await asyncio.sleep(1.0)
             tg.stop()
             await asyncio.wait_for(task, 10)
-            self.assertEqual(calls[0][0], "setMyCommands")
-            self.assertEqual(calls[0][1], "CMD")
+            self.assertEqual([c[0] for c in calls[:3]], ["getMe", "getWebhookInfo", "setMyCommands"])  # (who the bot is, first)
+            self.assertTrue(all(c[1] == "CMD" for c in calls[:3]))
             sent = [(c[1], c[2]["chat_id"], c[2].get("message_thread_id"), c[2]["text"]) for c in calls if c[0] == "sendMessage"]
             self.assertTrue(any(tok == "CMD" and chat == 42 and "自检中" in text for tok, chat, _, text in sent))
             self.assertTrue(any(tok == "CMD" and chat == 42 and "规则吃单自检" in text for tok, chat, _, text in sent))
@@ -304,9 +304,126 @@ class TelegramIdFirstTest(unittest.TestCase):
             tg.stop()
             await asyncio.wait_for(task, 10)
             sent = [c[2]["text"] for c in calls if c[0] == "sendMessage"]
-            self.assertEqual(len(sent), 1)
+            self.assertEqual(len(sent), 2)
             self.assertIn("你的用户 ID：5", sent[0])
+            self.assertIn("只听管理员的命令。你的用户 ID 是 5", sent[1])  # (the /pause: not run, and why)
             self.assertEqual(taker.paused, "")
+        run(go())
+
+
+class TelegramMenuTest(unittest.TestCase):
+    def test_menu_buttons_and_their_yes(self) -> None:
+        import time as clock
+        from ruletaker.notify import CONFIRM_S, Telegram
+
+        async def go() -> None:
+            taker, *_ = make_taker(START - 3_600_000)
+            calls: list[tuple] = []
+
+            async def fake_call(method: str, payload: dict, timeout: float = 15, token: str = ""):
+                calls.append((method, payload))
+                return True
+            tg = Telegram("", (), admin=42, commands=True, handler=taker.command, command_token="CMD")
+            tg.call, tg.menu_head = fake_call, taker.menu_head
+
+            def last(method: str) -> dict:
+                return next((p for m, p in reversed(calls) if m == method), {})
+
+            async def tap(data: str, user: int = 42) -> None:
+                tg.on_update({"update_id": 1, "callback_query": {"id": "q1", "data": data, "from": {"id": user},
+                                                                 "message": {"message_id": 77, "chat": {"id": 42}}}})
+                await asyncio.sleep(0.05)
+                await tg.drain(1.0)
+            tg.on_update({"update_id": 1, "message": {"text": "/menu", "chat": {"id": 42}, "from": {"id": 42}}})
+            await tg.drain(1.0)
+            card = last("sendMessage")
+            self.assertIn("规则吃单菜单", card["text"])
+            keys = json.dumps(card["reply_markup"], ensure_ascii=False)
+            self.assertIn("✅ 真实吃单", keys)
+            self.assertIn("c:/pause", keys)
+            await tap("c:/pause")  # at once; its answer sent; the card brought up to date
+            self.assertTrue(taker.paused)
+            self.assertIn("已暂停", last("sendMessage")["text"])
+            self.assertEqual(last("editMessageText")["message_id"], 77)
+            await tap("c:/resume")  # starts real orders again: asked first
+            ask = last("editMessageText")
+            self.assertIn("确定要恢复开新单吗", ask["text"])
+            self.assertTrue(taker.paused)
+            await tap(f"y:{int(clock.time()) - CONFIRM_S - 5}:/resume")  # a "yes" older than a minute
+            self.assertTrue(taker.paused)
+            self.assertEqual(last("answerCallbackQuery")["text"], "确认已过期，请重新点一次")
+            await tap(ask["reply_markup"]["inline_keyboard"][0][0]["callback_data"])  # the "yes" in time
+            self.assertEqual(taker.paused, "")
+            await tap("c:/mode on")
+            self.assertIn("确定要切到真实吃单吗", last("editMessageText")["text"])
+            await tap("c:/pause", user=9)  # not the admin
+            self.assertEqual(taker.paused, "")
+            self.assertEqual(last("answerCallbackQuery")["text"], "这个机器人只听管理员的")
+            await tap("c:/mode paper")
+            self.assertEqual(taker.settings.mode, "paper")
+            await tap("c:/mode  on")  # made-up buttons: a disguised "live trading" or "resume" never gets past the "yes"
+            await tap("y:9999999999:/mode on")
+            self.assertEqual(taker.settings.mode, "paper")
+            await tap("c:/pause")
+            await tap("c:/resume ")
+            self.assertTrue(taker.paused)
+        run(go())
+
+    def test_says_why_the_bot_is_silent(self) -> None:
+        from ruletaker.notify import Telegram
+        from ruletaker.util import RemoteError
+
+        async def go() -> None:
+            self.assertIn("TELEGRAM_COMMANDS 不是 on", Telegram("", (), admin=42, commands=False, command_token="CMD").health()[1])
+
+            def bot(answers: dict) -> Telegram:
+                tg = Telegram("", (), admin=42, commands=True, command_token="CMD")
+
+                async def fake_call(method: str, payload: dict, timeout: float = 15, token: str = ""):
+                    got = answers.get(method, True)
+                    if isinstance(got, Exception):
+                        raise got
+                    if method == "getUpdates":
+                        await asyncio.sleep(0.01)
+                        return []
+                    return got
+                tg.call = fake_call
+                return tg
+
+            async def run_a_moment(tg: Telegram) -> tuple:
+                task = asyncio.create_task(tg.run())
+                await asyncio.sleep(0.1)
+                tg.stop()
+                await asyncio.wait_for(task, 10)
+                return tg.health()
+            fine, text = await run_a_moment(bot({"getMe": RemoteError("HTTP 401: Unauthorized")}))
+            self.assertFalse(fine)
+            self.assertIn("Token 不对", text)
+            fine, text = await run_a_moment(bot({"getMe": {"username": "rt_tokyo_bot"},
+                                                 "getWebhookInfo": {"url": "https://other.example.com/hook/secret"},
+                                                 "getUpdates": RemoteError("HTTP 409: Conflict: can't use getUpdates method while webhook is active")}))
+            self.assertIn("@rt_tokyo_bot", text)
+            self.assertIn("webhook（other.example.com）", text)
+            self.assertNotIn("secret", text)
+            # a command from someone not the admin (the admin's id mistyped): they are told their id; the self-check says it
+            tg = bot({})
+            tg.bot_name = "@rt_tokyo_bot"
+            tg.on_update({"update_id": 1, "message": {"text": "/status", "chat": {"id": 9}, "from": {"id": 9}}})
+            sent: list = []
+
+            async def record(method: str, payload: dict, timeout: float = 15, token: str = ""):
+                sent.append(payload)
+                return True
+            tg.call = record
+            await tg.drain(1.0)
+            self.assertIn("你的用户 ID 是 9", sent[-1]["text"])
+            self.assertIn("用户 9 发过 /status", tg.health()[1])
+            taker, *_ = make_taker(START - 3_600_000)
+            taker.telegram = tg
+            self.assertIn("Telegram：用户 9 发过", await taker.self_check())
+            nobody = Telegram("", (), admin=0, commands=True, command_token="CMD")
+            nobody.bot_name = "@rt_tokyo_bot"
+            self.assertIn("ADMIN_USER_ID 没填", nobody.health()[1])
         run(go())
 
 

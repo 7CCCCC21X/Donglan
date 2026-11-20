@@ -127,6 +127,8 @@ async fn run_service(config: Config, env: Env) -> i32 {
             let me = me2.clone();
             Box::pin(async move { taker::control::command(&me, &command, &args).await })
         }));
+        let me3 = me.clone();
+        *telegram.menu_head.borrow_mut() = Some(Rc::new(move || me3.borrow().menu_head()));
     }
     let stop = me.borrow().stop.clone();
     {

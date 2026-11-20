@@ -941,6 +941,177 @@ fn telegram_commands_and_id() {
     });
 }
 
+/// Telegram's side for the tests: every call recorded (its method and body), answered by ``answer`` from the method's name.
+struct FakeTelegram {
+    calls: RefCell<Vec<(String, Value)>>,
+    answer: Box<dyn Fn(&str) -> Res<Vec<u8>>>,
+}
+
+impl FakeTelegram {
+    fn new(answer: impl Fn(&str) -> Res<Vec<u8>> + 'static) -> Rc<FakeTelegram> {
+        Rc::new(FakeTelegram { calls: RefCell::new(vec![]), answer: Box::new(answer) })
+    }
+
+    fn methods(&self) -> Vec<String> {
+        self.calls.borrow().iter().map(|(m, _)| m.clone()).collect()
+    }
+
+    fn last(&self, method: &str) -> Value {
+        self.calls.borrow().iter().rev().find(|(m, _)| m == method).map(|(_, b)| b.clone()).unwrap_or_default()
+    }
+}
+
+impl Transport for FakeTelegram {
+    fn request(&self, req: Req) -> LocalBoxFuture<'_, Res<Vec<u8>>> {
+        Box::pin(async move {
+            let method = req.url.rsplit('/').next().unwrap_or("").to_string();
+            let body: Value =
+                serde_json::from_slice(req.payload.as_deref().map(Vec::as_slice).unwrap_or(b"{}")).unwrap_or_default();
+            self.calls.borrow_mut().push((method.clone(), body));
+            (self.answer)(&method)
+        })
+    }
+}
+
+async fn settle_tasks() {
+    crate::sync::sleep(0.05).await; // (a command's own awaits: the withdrawal, the wait for the disk)
+}
+
+#[test]
+fn telegram_menu_buttons_and_their_yes() {
+    run(async {
+        let fake = FakeTelegram::new(|_| Ok(br#"{"ok":true,"result":true}"#.to_vec()));
+        let tg = Rc::new(crate::telegram::Telegram::new("", &[], 42, true, true, "222:commands", fake.clone()));
+        let r = rig(start() - 3_600_000, &[]);
+        let me = r.me.clone();
+        *tg.handler.borrow_mut() = Some(Rc::new(move |c: String, a: String| {
+            let me = me.clone();
+            Box::pin(async move { control::command(&me, &c, &a).await })
+        }));
+        let me = r.me.clone();
+        *tg.menu_head.borrow_mut() = Some(Rc::new(move || me.borrow().menu_head()));
+        let tap = |data: &str, user: i64| {
+            json!({"update_id": 1, "callback_query": {"id": "q1", "data": data, "from": {"id": user},
+                   "message": {"message_id": 77, "chat": {"id": 42}}}})
+        };
+        // /menu: a card with the buttons, the mode in force ticked
+        tg.on_update(&json!({"update_id": 1, "message": {"text": "/menu", "chat": {"id": 42}, "from": {"id": 42}}}));
+        tg.drain(1.0).await;
+        let card = fake.last("sendMessage");
+        assert!(card["text"].as_str().unwrap().contains("规则吃单菜单"), "{card}");
+        let keys = card["reply_markup"]["inline_keyboard"].to_string();
+        assert!(keys.contains("✅ 真实吃单") && keys.contains("c:/pause") && keys.contains("c:/test"), "{keys}");
+        // pause: done at once, its answer sent, the card brought up to date
+        tg.on_update(&tap("c:/pause", 42));
+        settle_tasks().await;
+        tg.drain(1.0).await;
+        assert!(!r.me.borrow().paused.is_empty());
+        assert!(fake.methods().contains(&"answerCallbackQuery".to_string()));
+        assert!(fake.last("sendMessage")["text"].as_str().unwrap().contains("已暂停"));
+        assert_eq!(fake.last("editMessageText")["message_id"], 77);
+        // resume starts real orders again: asked first, nothing done yet
+        tg.on_update(&tap("c:/resume", 42));
+        settle_tasks().await;
+        let ask = fake.last("editMessageText");
+        assert!(ask["text"].as_str().unwrap().contains("确定要恢复开新单吗"), "{ask}");
+        assert!(!r.me.borrow().paused.is_empty());
+        // a "yes" older than a minute: not taken
+        let old = crate::util::now_ms() / 1000 - crate::telegram::CONFIRM_S - 5;
+        tg.on_update(&tap(&format!("y:{old}:/resume"), 42));
+        settle_tasks().await;
+        assert!(!r.me.borrow().paused.is_empty());
+        assert_eq!(fake.last("answerCallbackQuery")["text"], "确认已过期，请重新点一次");
+        // the "yes" in time: resumed
+        let yes = ask["reply_markup"]["inline_keyboard"][0][0]["callback_data"].as_str().unwrap().to_string();
+        tg.on_update(&tap(&yes, 42));
+        settle_tasks().await;
+        assert!(r.me.borrow().paused.is_empty());
+        // live trading and the order test ask too; someone not the admin, or a made-up button, does nothing
+        tg.on_update(&tap("c:/mode on", 42));
+        settle_tasks().await;
+        assert!(fake.last("editMessageText")["text"].as_str().unwrap().contains("确定要切到真实吃单吗"));
+        tg.on_update(&tap("c:/pause", 9));
+        settle_tasks().await;
+        assert!(r.me.borrow().paused.is_empty());
+        assert_eq!(fake.last("answerCallbackQuery")["text"], "这个机器人只听管理员的");
+        // made-up buttons: a disguised "live trading" or "resume" (an extra space) never gets past the "yes"
+        tg.on_update(&tap("c:/mode paper", 42));
+        settle_tasks().await;
+        assert_eq!(r.me.borrow().settings.mode, "paper");
+        tg.on_update(&tap("c:/mode  on", 42));
+        tg.on_update(&tap("y:9999999999:/mode on", 42));
+        settle_tasks().await;
+        assert_eq!(r.me.borrow().settings.mode, "paper");
+        tg.on_update(&tap("c:/pause", 42));
+        settle_tasks().await;
+        tg.on_update(&tap("c:/resume ", 42));
+        settle_tasks().await;
+        assert!(!r.me.borrow().paused.is_empty());
+    });
+}
+
+#[test]
+fn telegram_says_why_the_bot_is_silent() {
+    run(async {
+        let ok = || Ok(br#"{"ok":true,"result":true}"#.to_vec());
+        // commands off: notifications only
+        let fake = FakeTelegram::new(move |_| ok());
+        let tg = Rc::new(crate::telegram::Telegram::new("", &[], 42, false, true, "222:x", fake.clone()));
+        assert!(tg.health().1.contains("TELEGRAM_COMMANDS 不是 on"), "{}", tg.health().1);
+        // a wrong token: getMe refused — told, and logged
+        let fake = FakeTelegram::new(|m| {
+            if m == "getMe" {
+                Err(RemoteError::new("HTTP 401: Unauthorized"))
+            } else {
+                Ok(br#"{"ok":true,"result":[]}"#.to_vec())
+            }
+        });
+        let tg = Rc::new(crate::telegram::Telegram::new("", &[], 42, true, true, "222:x", fake.clone()));
+        let task = tokio::task::spawn_local(tg.clone().run());
+        crate::sync::sleep(0.05).await;
+        let (fine, text) = tg.health();
+        assert!(!fine && text.contains("Token 不对"), "{text}");
+        tg.stop();
+        let _ = task.await;
+        // the token in another program's hands: a webhook set on it
+        let fake = FakeTelegram::new(|m| match m {
+            "getMe" => Ok(br#"{"ok":true,"result":{"username":"rt_tokyo_bot"}}"#.to_vec()),
+            "getWebhookInfo" => Ok(br#"{"ok":true,"result":{"url":"https://other.example.com/hook/secret"}}"#.to_vec()),
+            "getUpdates" => Err(RemoteError::new("HTTP 409: Conflict: can't use getUpdates method while webhook is active")),
+            _ => Ok(br#"{"ok":true,"result":true}"#.to_vec()),
+        });
+        let tg = Rc::new(crate::telegram::Telegram::new("", &[], 42, true, true, "222:x", fake.clone()));
+        let task = tokio::task::spawn_local(tg.clone().run());
+        crate::sync::sleep(0.05).await;
+        let text = tg.health().1;
+        assert!(text.contains("@rt_tokyo_bot") && text.contains("webhook（other.example.com）"), "{text}");
+        assert!(!text.contains("secret"));
+        tg.stop();
+        let _ = task.await;
+        // a command from someone not the admin (the admin's id mistyped): they are told their id; the self-check says it
+        let fake = FakeTelegram::new(move |m| match m {
+            "getMe" => Ok(br#"{"ok":true,"result":{"username":"rt_tokyo_bot"}}"#.to_vec()),
+            _ => Ok(br#"{"ok":true,"result":true}"#.to_vec()),
+        });
+        let tg = Rc::new(crate::telegram::Telegram::new("", &[], 42, true, true, "222:x", fake.clone()));
+        *tg.bot_name.borrow_mut() = "@rt_tokyo_bot".into();
+        tg.on_update(&json!({"update_id": 1, "message": {"text": "/status", "chat": {"id": 9}, "from": {"id": 9}}}));
+        tg.drain(1.0).await;
+        assert!(fake.last("sendMessage")["text"].as_str().unwrap().contains("你的用户 ID 是 9"));
+        let text = tg.health().1;
+        assert!(text.contains("用户 9 发过 /status") && text.contains("ADMIN_USER_ID 是 42"), "{text}");
+        // ... and the self-check shows the line
+        let r = rig(start() - 3_600_000, &[]);
+        r.me.borrow_mut().telegram = Some(tg.clone());
+        let check = control::self_check(&r.me).await;
+        assert!(check.contains("Telegram：用户 9 发过"), "{check}");
+        // no admin id yet: only /id answered, and said so
+        let tg = Rc::new(crate::telegram::Telegram::new("", &[], 0, true, true, "222:x", fake.clone()));
+        *tg.bot_name.borrow_mut() = "@rt_tokyo_bot".into();
+        assert!(tg.health().1.contains("ADMIN_USER_ID 没填"));
+    });
+}
+
 #[test]
 fn the_loop_runs_reads_fills_and_stops_cleanly() {
     run(async {

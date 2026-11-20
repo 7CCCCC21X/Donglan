@@ -1904,7 +1904,7 @@ class RuleTaker:
             return await self.self_check()
         if command == "/test":
             return await self.order_test()
-        return "命令：/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜/id"
+        return "命令：/menu 按钮菜单｜/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜/id"
 
     # -- the self-check and the order test (Telegram /check /test, the control page's buttons, rt.sh check / test) --
     async def self_check(self) -> str:
@@ -2012,6 +2012,9 @@ class RuleTaker:
                 (no if s.mode != "off" else warn)(f"推送没连上：{self.stream.error or '连接中'}（推送断开时靠 REST 轮流读，慢很多）")
         elif s.mode != "off":
             warn("推送：还没有已发布的规则场次要订阅（场次在开场前约 24 小时发布）")
+        if self.telegram is not None and hasattr(self.telegram, "health"):
+            fine, line = self.telegram.health()
+            (ok if fine else warn)(line)
         if any(self.live_cents(r) > 0 for r in RULES):
             feed = self.index
             if feed is None or feed.ws is None:
@@ -2245,6 +2248,14 @@ class RuleTaker:
         if late:
             raise NotOnDisk(f"{reply}\n{late}")
         return reply
+
+    def menu_head(self) -> tuple[str, str]:
+        """The Telegram menu card's head: what is in force now (no status text worked out), and the mode."""
+        paused = f"已暂停（{self.paused}）" if self.paused else "没暂停"
+        usd = self.usd()
+        return (f"模式：{MODES.get(self.settings.mode, self.settings.mode)}｜{paused}｜今日已结算 {money(self.today_pnl())}"
+                + (f"｜可用 ${usd:,.2f}" if usd is not None else "") + ("｜今日已到停机线" if self.loss_stop_why() else ""),
+                self.settings.mode)
 
     def test_gate(self) -> str:
         """Why the operator's order test may not go out now ("" when it may): the deploy's hard switch, the pause, the stop."""
