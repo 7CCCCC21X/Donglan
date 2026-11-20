@@ -7,6 +7,8 @@
 #   bash deploy/gcp/rt.sh update          代码更新后：重新上传代码、编译、跑测试、重启（设置不动）
 #   RT_IMPL=python bash deploy/gcp/rt.sh update   换回 Python 版（备用）；RT_IMPL=rust 再换回 Rust 版（记录、设置都通用）
 #   bash deploy/gcp/rt.sh env [文件]      上传新的设置文件（默认 ./ruletaker.env）并重启
+#   bash deploy/gcp/rt.sh edit            直接在虚拟机上改设置文件（nano），检查无误才重启——私钥不用再留在 Cloud Shell
+#   bash deploy/gcp/rt.sh audit           私钥安全体检（只读）：私钥只在该在的地方、权限、加固、谁能登录
 #   bash deploy/gcp/rt.sh console         打开网页控制台和复盘页（通过 Cloud Shell 的“网页预览”，不开公网端口）
 #   bash deploy/gcp/rt.sh status          看状态（就是 huice 的 /rules）
 #   bash deploy/gcp/rt.sh logs            看实时日志（Ctrl+C 退出）
@@ -129,7 +131,8 @@ RUN_ON_VM='if [ "$(cat /opt/ruletaker/IMPL 2>/dev/null || echo rust)" = python ]
 
 remind_env() {  # the settings file left in this shell holds the private key: said once it is on the VM
   if [ -n "${ENV_UPLOADED:-}" ] && [ -f "$ENV_UPLOADED" ]; then
-    echo "提醒：$ENV_UPLOADED 还留在这里（里面有私钥）。虚拟机上已经有一份，这里不再需要的话删掉：shred -u \"$ENV_UPLOADED\""
+    echo "提醒：$ENV_UPLOADED 还留在这里（里面有私钥）。虚拟机上已经有一份，删掉它：shred -u \"$ENV_UPLOADED\""
+    echo "      以后改设置直接在虚拟机上改：bash deploy/gcp/rt.sh edit（不用再在这里放私钥）"
   fi
 }
 
@@ -204,6 +207,43 @@ case "$cmd" in
   update)
     upload_code "$VM" "$ZONE"
     setup
+    ;;
+  edit)
+    # The settings file edited where it lives (root's, on the VM): the key need not be kept in Cloud Shell to change a setting.
+    # Checked before the restart: a setting that does not parse leaves the running service as it is.
+    ssh_to "$VM" "$ZONE" --command "sudo nano /etc/ruletaker/ruletaker.env; \
+      if sudo -u ruletaker \$($RUN_ON_VM) plan --env /etc/ruletaker/ruletaker.env >/dev/null; then \
+        sudo systemctl restart ruletaker && echo '已保存，服务已重启'; \
+      else echo '!! 设置文件有误（见上面），服务没有重启、还在按原来的设置运行：再运行 bash deploy/gcp/rt.sh edit 改正'; fi" -- -t
+    ;;
+  audit)
+    # Read-only: what holds the key, who can read it, what reaches the machine. The key is never shown, here or there.
+    echo "== 私钥安全体检（只读，什么都不改；私钥本身不会显示）=="
+    echo "-- Cloud Shell 这边 --"
+    left="$(grep -lsE '^[[:space:]]*(export[[:space:]]+)?PREDICT_PRIVATE_KEY[[:space:]]*=[[:space:]]*[\"'"'"']?[0-9a-fA-Fx]{64}' \
+      "$ROOT"/*.env "$ROOT"/.env "$ROOT"/python/*.env "$HOME"/*.env 2>/dev/null || true)"
+    if [ -n "$left" ]; then
+      echo "⚠️ 这些文件里还有私钥：$(echo $left)——虚拟机上已有一份，删掉：shred -u 文件名（以后改设置用 rt.sh edit）"
+    else
+      echo "✅ Cloud Shell 里没有留着私钥的设置文件"
+    fi
+    if grep -qsiE 'PRIVATE_KEY[[:space:]]*=[[:space:]]*[\"'"'"']?(0x)?[0-9a-f]{64}' "$HOME/.bash_history"; then
+      echo "⚠️ 命令历史 ~/.bash_history 里有私钥（在命令行里打过）：history -c && shred -u ~/.bash_history"
+    else
+      echo "✅ 命令历史里没有私钥"
+    fi
+    echo "-- Google Cloud 项目 $PROJECT --"
+    sa="$(gcloud compute instances describe "$VM" "${G[@]}" "${Z[@]}" --format='value(serviceAccounts[].email)' 2>/dev/null || true)"
+    if [ -z "$sa" ]; then echo "✅ 虚拟机不带服务账号（进了机器也拿不到操作项目的令牌）"; else echo "⚠️ 虚拟机带着服务账号 $sa"; fi
+    if [ ${#IAP[@]} -gt 0 ]; then
+      echo "✅ 已加固（lockdown）：公网连不进这台机器，SSH 只走 Google 登录的 IAP 通道"
+    else
+      echo "⚠️ 还没加固：运行 bash deploy/gcp/rt.sh lockdown（封掉所有入站连接）"
+    fi
+    who="$(gcloud projects get-iam-policy "$PROJECT" --flatten='bindings[].members' --format='value(bindings.members)' 2>/dev/null \
+      | grep -E '^(user|group|domain):|allUsers|allAuthenticatedUsers' | sort -u | tr '\n' ' ' || true)"
+    echo "项目里有权限的人（都能 SSH 进机器读到私钥，应该只有你自己）：${who:-（读不到：账号没有查看权限）}"
+    ssh_to "$VM" "$ZONE" --command "sudo bash -s" < "$ROOT/deploy/gcp/vm-audit.sh"
     ;;
   env)
     upload_env "${1:-}"

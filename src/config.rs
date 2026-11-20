@@ -218,7 +218,7 @@ pub fn allowed(value: Option<&str>) -> bool {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub rules: RuleSettings,
     pub trading_allowed: bool,
@@ -278,6 +278,14 @@ impl Default for Config {
             region: String::new(),
             log_level: "INFO".into(),
         }
+    }
+}
+
+/// Printed without its secrets — the private key, the API key, the Telegram tokens, the page's key: a ``{:?}`` anywhere (a log
+/// line, a panic, a test's message) shows only whether each is set.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Config {{ {} }}", self.secrets_line())
     }
 }
 
@@ -381,6 +389,7 @@ impl Config {
     }
 
     /// Which secrets are set (never their values): the deploy's first log line.
+    /// (Also what a ``{:?}`` of the whole configuration shows: see the Debug below.)
     pub fn secrets_line(&self) -> String {
         format!(
             "secrets configured: predict_api_key={} own_rule_key={} predict_private_key={} predict_account={} telegram_token={} \
@@ -439,5 +448,31 @@ mod tests {
         assert!(Config::from_env(&env(&[("STATUS_HOST", "0.0.0.0"), ("STATUS_KEY", "short")])).is_err());
         assert!(Config::from_env(&env(&[("STATUS_PORT", "70000")])).unwrap_err().contains("STATUS_PORT 应在 0～65535 之间"));
         assert!(!allowed(Some("")) && allowed(None) && allowed(Some("ON")));
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn a_printed_configuration_never_shows_a_secret() {
+        let key = format!("0x{}", "ab12".repeat(16));
+        let env: Env = [
+            ("RULE_TAKER", "paper"),
+            ("PREDICT_PRIVATE_KEY", key.as_str()),
+            ("PREDICT_API_KEY", "api-key-secret-123"),
+            ("TELEGRAM_BOT_TOKEN", "123456:telegram-secret-token"),
+            ("STATUS_KEY", "status-secret-key"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let config = Config::from_env(&env).unwrap();
+        let shown = format!("{config:?} {config:#?}");
+        for secret in [&key[2..], "api-key-secret-123", "telegram-secret-token", "status-secret-key"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        assert!(shown.contains("predict_private_key=True"), "{shown}");
     }
 }

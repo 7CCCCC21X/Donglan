@@ -174,6 +174,8 @@ bash deploy/gcp/rt.sh env
 | `bash deploy/gcp/rt.sh mode paper` | 运行中切换模式（off / paper / on），**不会高于**设置文件里的 `RULE_TAKER` |
 | `bash deploy/gcp/rt.sh update` | 代码更新后：`git pull` 再运行它，重新上传、跑测试、重启（设置不动） |
 | `bash deploy/gcp/rt.sh env` | 上传改好的 `ruletaker.env` 并重启 |
+| `bash deploy/gcp/rt.sh edit` | 直接在虚拟机上改设置文件（nano，`Ctrl+O` 回车保存、`Ctrl+X` 退出），检查无误才重启——私钥不用留在 Cloud Shell |
+| `bash deploy/gcp/rt.sh audit` | 私钥安全体检（只读）：私钥只在该在的文件里、权限、日志、加固、谁能登录（私钥本身不会显示） |
 | `bash deploy/gcp/rt.sh restart` / `stop` / `start` | 重启 / 停止 / 启动服务 |
 | `bash deploy/gcp/rt.sh ssh` | 登录虚拟机 |
 | `bash deploy/gcp/rt.sh probe asia-east2-a` | 在别的区域临时开一台小机器量延迟，量完自动删除 |
@@ -356,12 +358,12 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 
 | 位置 | 保护 |
 |---|---|
-| Cloud Shell 里的 `ruletaker.env`（填设置时） | Cloud Shell 的个人磁盘，只有你的 Google 账号进得去；部署完删掉（脚本会提醒） |
+| Cloud Shell 里的 `ruletaker.env`（填设置时） | Cloud Shell 的个人磁盘，只有你的 Google 账号进得去；部署完删掉（`shred -u ruletaker.env`，脚本会提醒），以后改设置用 `rt.sh edit` 直接在虚拟机上改 |
 | 传到虚拟机的路上 | SSH 加密通道 |
 | 虚拟机上的 `/etc/ruletaker/ruletaker.env` | root 所有、权限 640，只有 root 和服务自己的用户读得到；磁盘由 Google 默认加密 |
 | 服务进程的内存 | 专用的、不能登录的用户运行；不写 core dump |
 
-**不会出现在**：GitHub（`.gitignore` 排除了 `ruletaker.env`）、日志（只写“有没有设置”）、网页控制台（看不到也改不了）、Telegram 消息、虚拟机的元数据、测延迟用的临时机器（`rt.sh probe` 只带 API Key 过去）。
+**不会出现在**：GitHub（`.gitignore` 排除了 `ruletaker.env`）、日志（只写“有没有设置”；程序里的配置对象打印出来也只显示“有没有设置”，测试里核对过）、服务进程的环境变量和命令行（服务自己读设置文件）、网页控制台（看不到也改不了）、Telegram 消息、虚拟机的元数据、测延迟用的临时机器（`rt.sh probe` 只带 API Key 过去）。
 
 **谁能拿到**：能登录你 Google 账号的人（能 SSH 进机器、能读磁盘），和能往这个 GitHub 仓库推代码的人（`rt.sh update` 会把仓库里的代码装到机器上运行）。真正的锁是这两个账号。
 
@@ -373,6 +375,8 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 - **依赖锁定并校验哈希**：Rust 版的每个依赖包按 `Cargo.lock` 锁定版本，cargo 下载时逐个核对 SHA-256（`--locked`：锁文件和代码对不上就拒绝编译）；编译器来自 Ubuntu 官方源（有签名的软件包，不从网上下载安装脚本）。Python 版（备用）的每个包按 `python/requirements.lock` 的 SHA-256 校验，只装现成的 wheel。
 - Shielded VM（安全启动、vTPM、完整性监控）；Ubuntu 默认自动装安全更新。
 - 网页控制台的所有修改操作要专用请求头（别的网站的页面发不出来）；私钥、Key 不能在网页或 Telegram 里改；Telegram 只认 `ADMIN_USER_ID`，而且改不了价格和份数。
+
+**随时体检**：`bash deploy/gcp/rt.sh audit`（只读）。逐项打 ✅ / ⚠️：Cloud Shell 里有没有留着私钥的文件、命令历史里有没有私钥；虚拟机有没有服务账号、有没有加固、项目里有哪些人有权限；虚拟机上设置文件的权限、`/tmp` 有没有残留、**私钥是不是只在 `/etc/ruletaker/ruletaker.env` 一个文件里**（搜 `/etc`、记录目录、程序目录、各用户目录、`/tmp`、`/var/log`）、系统日志里有没有、是不是在进程的环境变量里、服务是不是专用用户运行、不写 core dump、只在本机监听、有没有交换分区、SSH 是否只认密钥、自动安全更新、哪些账号能 sudo。私钥在虚拟机上当作搜索条件用（放在只有 root 能读的临时文件里，用完删掉），从不显示、也不传回 Cloud Shell。
 
 ### 需要你自己做的（按重要程度）
 

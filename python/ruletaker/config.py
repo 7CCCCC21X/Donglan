@@ -131,9 +131,9 @@ def allowed(value: str | None) -> bool:
 class Config:
     rules: RuleSettings
     trading_allowed: bool = True
-    api_key: str = ""                 # RULE_API_KEY, else PREDICT_API_KEY
+    api_key: str = dataclasses.field(default="", repr=False)  # RULE_API_KEY, else PREDICT_API_KEY (secrets: never in a repr)
     own_key: bool = False             # the key is RULE_API_KEY (one of the taker's own)
-    private_key: str = ""
+    private_key: str = dataclasses.field(default="", repr=False)
     account: str = ""
     chain_id: int = 56
     rpc_url: str = ""
@@ -141,15 +141,15 @@ class Config:
     rate_per_min: float = 220.0
     max_daily_loss_usd: float = 0.0
     state_db: str = "data/ruletaker.sqlite3"
-    telegram_token: str = ""
-    telegram_command_token: str = ""  # TELEGRAM_COMMAND_TOKEN: a bot of this service's own for the commands (the notifications may stay on TELEGRAM_BOT_TOKEN)
+    telegram_token: str = dataclasses.field(default="", repr=False)
+    telegram_command_token: str = dataclasses.field(default="", repr=False)  # TELEGRAM_COMMAND_TOKEN: a bot of this service's own for the commands (the notifications may stay on TELEGRAM_BOT_TOKEN)
     telegram_chats: tuple = ()        # ((chat id, thread id or 0), ...)
     admin_user_id: int = 0
     telegram_commands: bool = False
     notify: bool = True
     status_host: str = "127.0.0.1"
     status_port: int = 8080
-    status_key: str = ""
+    status_key: str = dataclasses.field(default="", repr=False)
     ws_connections: int = 1
     binance_fapi: str = "https://fapi.binance.com"
     binance_ws: str = "wss://fstream.binance.com/market"

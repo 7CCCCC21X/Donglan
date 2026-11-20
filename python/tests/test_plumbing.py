@@ -124,6 +124,18 @@ class FakeConn:
         pass
 
 
+class SecretsTest(unittest.TestCase):
+    def test_a_printed_configuration_never_shows_a_secret(self) -> None:
+        from ruletaker.config import Config
+        key = "0x" + "ab12" * 16
+        config = Config.from_env({"RULE_TAKER": "paper", "PREDICT_PRIVATE_KEY": key, "PREDICT_API_KEY": "api-key-secret-123",
+                                  "TELEGRAM_BOT_TOKEN": "123456:telegram-secret-token", "STATUS_KEY": "status-secret-key"})
+        shown = repr(config) + str(config) + config.secrets_line()
+        for secret in (key[2:], "api-key-secret-123", "telegram-secret-token", "status-secret-key"):
+            self.assertNotIn(secret, shown)
+        self.assertIn("predict_private_key=True", config.secrets_line())
+
+
 class HttpTest(unittest.TestCase):
     def setUp(self) -> None:
         self.saved = nethttp.HTTPS_CONNECTION
