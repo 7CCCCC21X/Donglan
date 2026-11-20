@@ -43,6 +43,51 @@ def load_env_file(path: str | os.PathLike, into: dict | None = None) -> dict:
     return out
 
 
+# The name the private key is kept under when it is kept encrypted on the VM (deploy/gcp/vm-key.sh, bash deploy/gcp/rt.sh key):
+# systemd decrypts it for the service alone (LoadCredentialEncrypted= in deploy/gcp/ruletaker.service) into a directory of the
+# service's own in memory — $CREDENTIALS_DIRECTORY, read by its user only, gone when it stops.
+KEY_CREDENTIAL = "predict_private_key"
+
+
+@dataclasses.dataclass(frozen=True)
+class Stored:
+    """What systemd handed the service: whether it runs with a credentials directory at all (the VM's unit gives it one), and
+    the private key kept there ("" none). The key never in a repr."""
+    store: bool = False
+    key: str = dataclasses.field(default="", repr=False)
+
+    @classmethod
+    def from_systemd(cls) -> "Stored":
+        """From $CREDENTIALS_DIRECTORY (unset outside systemd)."""
+        return cls.from_dir(os.environ.get("CREDENTIALS_DIRECTORY"))
+
+    @classmethod
+    def from_dir(cls, folder: str | None) -> "Stored":
+        """From a credentials directory (None: not run by systemd). A key that is there but cannot be read is an error
+        (ValueError), never "no key"."""
+        if not folder:
+            return cls()
+        path = os.path.join(folder, KEY_CREDENTIAL)
+        try:
+            with open(path, encoding="utf-8") as f:
+                return cls(True, f.read().strip())
+        except FileNotFoundError:
+            return cls(True, "")
+        except (OSError, UnicodeDecodeError) as error:
+            raise ValueError(f"读不到加密保存的私钥（{path}：{error}）") from None
+
+
+def key_of(raw: str) -> str | None:
+    """A private key as the wallet takes it: "0x" and 64 hex digits (the 0x may be left off); "" stays "" (none); None: not a
+    key."""
+    k = str(raw).strip()
+    if not k:
+        return ""
+    if not k.startswith("0x"):
+        k = "0x" + k
+    return k if len(k) == 66 and all(c in "0123456789abcdefABCDEF" for c in k[2:]) else None
+
+
 @dataclasses.dataclass(frozen=True)
 class RuleSettings:
     """RULE_TAKER off | paper (只记录，不下单) | on (真实吃单); each market on or off by itself with the most shares bought a window;
@@ -134,6 +179,9 @@ class Config:
     api_key: str = dataclasses.field(default="", repr=False)  # RULE_API_KEY, else PREDICT_API_KEY (secrets: never in a repr)
     own_key: bool = False             # the key is RULE_API_KEY (one of the taker's own)
     private_key: str = dataclasses.field(default="", repr=False)
+    key_kept: str = ""                # where the key came from: "stored" (kept encrypted on this machine), "settings" (the
+                                      # settings file: plain text), "both" (the same key in both: the plain copy is to go), "" (none)
+    key_store: bool = False           # run with systemd's credentials directory (the VM's unit): the key could be kept encrypted here
     account: str = ""
     chain_id: int = 56
     rpc_url: str = ""
@@ -163,6 +211,14 @@ class Config:
 
     @classmethod
     def from_env(cls, e: Mapping | None = None) -> "Config":
+        """The settings alone (no key kept encrypted: a test, a laptop)."""
+        return cls.load(e, Stored())
+
+    @classmethod
+    def load(cls, e: Mapping | None, stored: Stored) -> "Config":
+        """The settings, and the private key kept encrypted on this machine if there is one. The settings file's
+        PREDICT_PRIVATE_KEY is used only when none is kept; the same key in both is that key (its plain copy reported, to go);
+        two different keys are refused — never one of them picked behind the user's back."""
         e = dict(os.environ if e is None else e)
         rules = RuleSettings.parse(e)
         CALENDAR.configure(parse_dates(e.get("CME_EARLY_DAYS", DEFAULT_CME_EARLY), "CME_EARLY_DAYS"),
@@ -170,11 +226,17 @@ class Config:
         own = str(e.get("RULE_API_KEY", "")).strip()
         shared = str(e.get("PREDICT_API_KEY", "")).strip()
         key = own or shared
-        private_key = str(e.get("PREDICT_PRIVATE_KEY", "")).strip()
-        if private_key and not private_key.startswith("0x"):
-            private_key = "0x" + private_key
-        if private_key and (len(private_key) != 66 or any(c not in "0123456789abcdefABCDEF" for c in private_key[2:])):
+        plain = key_of(e.get("PREDICT_PRIVATE_KEY", ""))
+        if plain is None:
             raise ValueError("PREDICT_PRIVATE_KEY 应为 64 位十六进制（0x 可省）")
+        kept = key_of(stored.key)
+        if kept is None:
+            raise ValueError("加密保存的私钥不是 64 位十六进制：运行 bash deploy/gcp/rt.sh key 重新设定")
+        if kept and plain and kept.lower() != plain.lower():
+            raise ValueError("设置文件里的 PREDICT_PRIVATE_KEY 和加密保存的私钥不是同一把：要换成设置文件里这把，运行 "
+                             "bash deploy/gcp/rt.sh edit 存一次（会把它收进加密保存）；不换就删掉设置文件里那一行")
+        private_key = kept or plain
+        key_kept = ("both" if plain else "stored") if kept else ("settings" if plain else "")
         account = str(e.get("PREDICT_ACCOUNT", "")).strip()
         if account and (not account.startswith("0x") or len(account) != 42):
             raise ValueError("PREDICT_ACCOUNT 应为 0x 开头的 42 位地址（网站账户设置里的充值地址），用普通钱包交易就留空")
@@ -202,7 +264,7 @@ class Config:
             rules=rules,
             trading_allowed=allowed(e.get("LIVE_TRADING_ALLOWED")),
             api_key=key, own_key=bool(own) and own != shared,
-            private_key=private_key, account=account,
+            private_key=private_key, key_kept=key_kept, key_store=stored.store, account=account,
             chain_id=int(bounded(e, "PREDICT_CHAIN_ID", 56, 1, 10 ** 9)),
             rpc_url=str(e.get("BSC_RPC_URL", "")).strip().rstrip("/"),
             fee_bps=int(bounded(e, "PREDICT_FEE_BPS", 200, 0, 1000)),
@@ -230,4 +292,4 @@ class Config:
                 f"predict_private_key={bool(self.private_key)} predict_account={bool(self.account)} "
                 f"telegram_token={bool(self.telegram_token)} telegram_command_token={bool(self.telegram_command_token)} "
                 f"telegram_commands={self.telegram_commands} status_key={bool(self.status_key)} mode={self.rules.mode} "
-                f"trading_allowed={self.trading_allowed}")
+                f"trading_allowed={self.trading_allowed} private_key_kept={self.key_kept or 'none'}")

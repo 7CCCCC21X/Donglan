@@ -854,6 +854,32 @@ fn self_check_all_good_then_a_region_that_may_not_trade() {
 }
 
 #[test]
+fn self_check_says_where_the_key_is_kept() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        // not run by systemd (a laptop, a test): nothing to keep it in, nothing said
+        let text = control::self_check(&r.me).await;
+        assert!(!text.contains("私钥："), "{text}");
+        for (kept, want) in [
+            ("stored", "✅ 私钥：加密保存在这台机器上"),
+            ("both", "⚠️ 私钥：已加密保存，但设置文件里还留着同一把的明文"),
+            ("settings", "⚠️ 私钥：在设置文件里是明文"),
+        ] {
+            {
+                let mut t = r.me.borrow_mut();
+                t.config.key_kept = kept;
+                t.config.key_store = true;
+            }
+            let text = control::self_check(&r.me).await;
+            assert!(text.contains(want), "{kept}: {text}");
+            // (a warning, never a reason not to trade)
+            assert!(text.contains("结论：✅ 可以真实吃单"), "{kept}: {text}");
+        }
+    });
+}
+
+#[test]
 fn order_test_rests_far_under_the_market_and_is_withdrawn() {
     run(async {
         let r = rig(start() - 3_600_000, &[]);

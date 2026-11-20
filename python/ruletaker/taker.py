@@ -2151,8 +2151,10 @@ class RuleTaker:
             ok(f"CME 休市日历排到 {self.cal_last.isoformat()}")
         else:
             warn("CME 休市日历是空的（CME_CLOSED_DAYS、CME_EARLY_DAYS 都没写）：节假日也会照常下单")
+        # where the key is kept: encrypted on this machine (deploy/gcp/vm-key.sh), or plain in the settings file
+        kept, store = self.config.key_kept, self.config.key_store
         if self.wallet is None:
-            (no if live else warn)("没有设置 PREDICT_PRIVATE_KEY：只能 off / paper")
+            (no if live else warn)("没有设置 PREDICT_PRIVATE_KEY：只能 off / paper" + ("（设定私钥：bash deploy/gcp/rt.sh key）" if store else ""))
         else:
             try:
                 await self.api.ensure_auth()
@@ -2172,6 +2174,13 @@ class RuleTaker:
                     no("账户：链上核对还没完成")
             else:
                 ok(f"账户：普通钱包 {self.wallet.maker[:6]}…{self.wallet.maker[-4:]}")
+            if kept == "stored":
+                ok("私钥：加密保存在这台机器上，只在服务自己的内存里解开（设置文件里没有明文）")
+            elif kept == "both":
+                warn("私钥：已加密保存，但设置文件里还留着同一把的明文：运行 bash deploy/gcp/rt.sh update（或 edit 存一次）就会收走")
+            elif store:
+                warn("私钥：在设置文件里是明文：运行 bash deploy/gcp/rt.sh update 改成加密保存（只有这台机器能解开）")
+            # (not run by systemd: a laptop, a test — nothing to keep it in)
             await self.refresh_balance()
             if self.usdt is None:
                 no(f"余额没读到：{self.balance_error or '链上节点没回答'}")

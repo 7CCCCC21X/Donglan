@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs ON the VM as root (rt.sh deploy / update / env call it): puts the uploaded settings file in place, builds the service
-# and (re)starts it.
+# Runs ON the VM as root (rt.sh deploy / update / env call it): puts the uploaded settings file in place, builds the service,
+# keeps the private key encrypted instead of in the settings file (vm-key.sh) and (re)starts it.
 #
 #   RT_IMPL=rust (the default): the Rust version — Ubuntu's own Rust toolchain (rustc-1.xx / cargo-1.xx from the Ubuntu
 #     archive, signed like every Ubuntu package), the crates exactly as Cargo.lock pins them (each checked against its sha256
@@ -39,6 +39,13 @@ apt_install() {  # apt_install PACKAGE... (the package lists read once a run; a 
   apt-get -o DPkg::Lock::Timeout=300 install -y -qq "$@" >/dev/null
 }
 
+# The TPM's libraries, for systemd to seal the private key to this machine's virtual TPM as well (vm-key.sh): Ubuntu ships
+# them as suggestions only. None to be had (another release's names): the key is sealed with the machine's own key alone.
+if [ -e /dev/tpmrm0 ] && [ -z "$(ldconfig -p 2>/dev/null | grep 'libtss2-tcti-device\.so\.0' || true)" ]; then
+  apt_install libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-rc0t64 libtss2-tcti-device0t64 2>/dev/null \
+    || echo "（TPM 的库没装上：私钥只用本机密钥加密）"
+fi
+
 if [ "$IMPL" = "rust" ]; then
   # The newest of Ubuntu's own versioned Rust toolchains this release offers (Cargo.toml asks for 1.85 or later).
   CARGO=""
@@ -71,7 +78,6 @@ if [ "$IMPL" = "rust" ]; then
   echo "$out" | grep -E "test result" | tail -1
   install -m 755 "$APP/target/release/ruletaker" "$APP/bin/ruletaker.new"
   mv -f "$APP/bin/ruletaker.new" "$APP/bin/ruletaker"
-  RUN=("$APP/bin/ruletaker")
   rm -f /etc/systemd/system/ruletaker.service.d/python.conf
 else
   dpkg -s python3-venv >/dev/null 2>&1 || apt_install python3 python3-venv python3-pip
@@ -82,7 +88,6 @@ else
   "$APP/python/venv/bin/pip" install -q --require-hashes --only-binary :all: -r "$APP/python/requirements.lock"
   echo "== 离线测试 =="
   (cd "$APP/python" && "$APP/python/venv/bin/python" -m unittest discover -s tests -q)
-  RUN=(env PYTHONPATH="$APP/python" "$APP/python/venv/bin/python" -m ruletaker)
   install -d -m 755 /etc/systemd/system/ruletaker.service.d
   install -m 644 "$APP/deploy/gcp/ruletaker-python.conf" /etc/systemd/system/ruletaker.service.d/python.conf
 fi
@@ -93,12 +98,16 @@ if [ ! -f /etc/ruletaker/ruletaker.env ]; then
   exit 1
 fi
 
-echo "== 设置自检 =="
-sudo -u ruletaker "${RUN[@]}" plan --env /etc/ruletaker/ruletaker.env   # (a setting that does not parse stops here)
-
+# The unit first (it opens a key kept encrypted), then the key out of the settings file into encrypted keeping — proved to
+# open before anything is changed; anything wrong leaves it where it was — then the settings checked the way the service
+# will read them (its user, its key), and only then the restart.
 install -m 644 "$APP/deploy/gcp/ruletaker.service" /etc/systemd/system/ruletaker.service
 systemctl daemon-reload
 systemctl enable ruletaker >/dev/null 2>&1
+bash "$APP/deploy/gcp/vm-key.sh" move || echo "（私钥照旧在设置文件里，服务照常运行；原因见上面）"
+bash "$APP/deploy/gcp/vm-key.sh" status
+echo "== 设置自检 =="
+bash "$APP/deploy/gcp/vm-key.sh" run plan --env /etc/ruletaker/ruletaker.env   # (a setting that does not parse stops here)
 systemctl restart ruletaker
 sleep 3
 systemctl --no-pager --lines=15 status ruletaker || true

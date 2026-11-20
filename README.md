@@ -150,7 +150,7 @@ bash deploy/gcp/rt.sh status    # 状态，就是 huice 的 /rules
 bash deploy/gcp/rt.sh env
 ```
 
-4. 部署完把 Cloud Shell 里的 `ruletaker.env` 删掉（里面有私钥，脚本也会提醒）：`shred -u ruletaker.env`。以后改设置用 `bash deploy/gcp/rt.sh ssh` 登录虚拟机，`sudo nano /etc/ruletaker/ruletaker.env`，再 `sudo systemctl restart ruletaker`；规则价格、份数这些直接在网页控制台里改更方便。
+4. 部署完把 Cloud Shell 里的 `ruletaker.env` 删掉（里面有私钥，脚本也会提醒）：`shred -u ruletaker.env`。虚拟机上，私钥已经自动从设置文件收走、加密保存（见“[私钥加密保存](#私钥加密保存)”）。以后改设置用 `bash deploy/gcp/rt.sh edit`，换私钥用 `bash deploy/gcp/rt.sh key`；规则价格、份数这些直接在网页控制台里改更方便。
 5. 运行一次安全加固：`bash deploy/gcp/rt.sh lockdown`（见“[安全](#安全)”）。
 
 ### 费用
@@ -175,8 +175,9 @@ bash deploy/gcp/rt.sh env
 | `bash deploy/gcp/rt.sh mode paper` | 运行中切换模式（off / paper / on），**不会高于**设置文件里的 `RULE_TAKER` |
 | `bash deploy/gcp/rt.sh update` | 代码更新后：`git pull` 再运行它，重新上传、跑测试、重启（设置不动） |
 | `bash deploy/gcp/rt.sh env` | 上传改好的 `ruletaker.env` 并重启 |
-| `bash deploy/gcp/rt.sh edit` | 直接在虚拟机上改设置文件（nano，`Ctrl+O` 回车保存、`Ctrl+X` 退出），检查无误才重启——私钥不用留在 Cloud Shell |
-| `bash deploy/gcp/rt.sh audit` | 私钥安全体检（只读）：私钥只在该在的文件里、权限、日志、加固、谁能登录（私钥本身不会显示） |
+| `bash deploy/gcp/rt.sh edit` | 直接在虚拟机上改设置文件（nano，`Ctrl+O` 回车保存、`Ctrl+X` 退出），检查无误才重启——私钥不用留在 Cloud Shell。设置文件里**看不到私钥**（加密保存着）；照老习惯贴进去一行 `PREDICT_PRIVATE_KEY=…`，保存后也会被收进加密保存、从文件里删掉 |
+| `bash deploy/gcp/rt.sh key` | **换私钥**：在 Cloud Shell 里粘贴（屏幕不显示、不进命令历史），先在链上核对它是不是 `PREDICT_ACCOUNT` 的控制钥匙，对了才在虚拟机上加密保存、重启服务；不对什么都不改 |
+| `bash deploy/gcp/rt.sh audit` | 私钥安全体检（只读）：私钥是不是加密保存、明文还在不在任何文件里、权限、日志、加固、谁能登录（私钥本身不会显示） |
 | `bash deploy/gcp/rt.sh restart` / `stop` / `start` | 重启 / 停止 / 启动服务 |
 | `bash deploy/gcp/rt.sh ssh` | 登录虚拟机 |
 | `bash deploy/gcp/rt.sh probe asia-southeast1-b` | 在别的区域临时开一台小机器量推送延迟和读盘口，量完自动删除（只带 API Key，从虚拟机读）；怎么比见“为什么是东京、怎么确认” |
@@ -189,7 +190,7 @@ bash deploy/gcp/rt.sh env
 
 1. 在 Telegram 里找 **@BotFather**，发 `/newbot`，起个名字（例如“规则吃单东京”）和用户名（必须以 `bot` 结尾），它会回一串 Token（`123456:ABC…` 这样的）。
 2. 点开新机器人的对话，按 **Start**（机器人不能主动给没和它说过话的人发消息）。
-3. 设置文件里填三行（在虚拟机上直接改：`bash deploy/gcp/rt.sh edit`，私钥不用经过 Cloud Shell）：
+3. 设置文件里填三行（在虚拟机上直接改：`bash deploy/gcp/rt.sh edit`）：
 
    ```
    TELEGRAM_COMMAND_TOKEN=新机器人的 Token
@@ -395,7 +396,7 @@ shred -u ruletaker.env
 | `RULE_TAKER` | `off` | off / paper（只记录）/ on（真实吃单） |
 | `LIVE_TRADING_ALLOWED` | 不设 = 允许 | 硬开关：只有不设或写 `on` / `1` / `true` / `yes` 才允许真实下单 |
 | `RULE_API_KEY` / `PREDICT_API_KEY` | | Predict API Key（专用的那把填 `RULE_API_KEY`） |
-| `PREDICT_PRIVATE_KEY` / `PREDICT_ACCOUNT` | | 签名私钥 / 网站账户的充值地址（普通钱包留空） |
+| `PREDICT_PRIVATE_KEY` / `PREDICT_ACCOUNT` | | 签名私钥 / 网站账户的充值地址（普通钱包留空）。私钥第一次部署时照常填；到了虚拟机上会自动收走、加密保存，以后换用 `rt.sh key` |
 | `PREDICT_CHAIN_ID` / `BSC_RPC_URL` | 56 / 公共节点 | 链和节点 |
 | `RULE_*_CENTS`、`RULE_*_LIVE_CENTS` | 见上表 | 每条规则的盘前 / 盘中最高价，0 = 不做 |
 | `RULE_GOLD` / `RULE_OIL` | on | 两个市场各自的总开关 |
@@ -425,14 +426,32 @@ shred -u ruletaker.env
 
 | 位置 | 保护 |
 |---|---|
-| Cloud Shell 里的 `ruletaker.env`（填设置时） | Cloud Shell 的个人磁盘，只有你的 Google 账号进得去；部署完删掉（`shred -u ruletaker.env`，脚本会提醒），以后改设置用 `rt.sh edit` 直接在虚拟机上改 |
+| Cloud Shell 里的 `ruletaker.env`（第一次部署时） | Cloud Shell 的个人磁盘，只有你的 Google 账号进得去；部署完删掉（`shred -u ruletaker.env`，脚本会提醒）。以后换私钥用 `rt.sh key`，不用再写进文件 |
 | 传到虚拟机的路上 | SSH 加密通道 |
-| 虚拟机上的 `/etc/ruletaker/ruletaker.env` | root 所有、权限 640，只有 root 和服务自己的用户读得到；磁盘由 Google 默认加密 |
-| 服务进程的内存 | 专用的、不能登录的用户运行；不写 core dump |
+| 虚拟机上的设置文件 `/etc/ruletaker/ruletaker.env` | **没有私钥**：部署时自动收走，原来那行换成一句说明；文件原来的内容被覆盖掉 |
+| 虚拟机上的 `/etc/credstore.encrypted/predict_private_key` | **加密的**：用这台机器自己的密钥加这台机器的虚拟 TPM 封起来，只有 root 能读这个文件，拷到别的机器上解不开；磁盘本身也由 Google 默认加密 |
+| 服务运行时 | systemd 替服务解开，放在只属于这个服务的内存目录里（只有服务自己的用户能读，不进磁盘、不进交换分区，服务停了就没）；专用的、不能登录的用户运行；不写 core dump |
 
-**不会出现在**：GitHub（`.gitignore` 排除了 `ruletaker.env`）、日志（只写“有没有设置”；程序里的配置对象打印出来也只显示“有没有设置”，测试里核对过）、服务进程的环境变量和命令行（服务自己读设置文件）、网页控制台（看不到也改不了）、Telegram 消息、虚拟机的元数据、测延迟用的临时机器（`rt.sh probe` 只带 API Key 过去）。
+**不会出现在**：GitHub（`.gitignore` 排除了 `ruletaker.env`）、虚拟机的设置文件（`rt.sh edit` 打开看不到）、日志（只写“有没有设置”；程序里的配置对象打印出来也只显示“有没有设置”，测试里核对过）、服务进程的环境变量和命令行、网页控制台（看不到也改不了）、Telegram 消息、虚拟机的元数据、测延迟用的临时机器（`rt.sh probe` 只带 API Key 过去）。
 
 **谁能拿到**：能登录你 Google 账号的人（能 SSH 进机器、能读磁盘），和能往这个 GitHub 仓库推代码的人（`rt.sh update` 会把仓库里的代码装到机器上运行）。真正的锁是这两个账号。
+
+### 私钥加密保存
+
+**打开设置文件看不到私钥**：`rt.sh update` / `deploy` / `env` 时，虚拟机上的 `vm-key.sh` 把设置文件里的 `PREDICT_PRIVATE_KEY` 收走：
+
+1. 用 systemd 自带的 `systemd-creds` 加密，封进这台机器自己的密钥（`/var/lib/systemd/credential.secret`，只有 root 能读）和这台机器的**虚拟 TPM**（Shielded VM 自带）；存成 `/etc/credstore.encrypted/predict_private_key`（root 专属、权限 600）。
+2. **先证明能用才动手**：让 systemd 按服务启动时的方式（服务的用户、服务的设备限制）把它解开，交给程序算出签名地址，和原来那把的地址对上了，才换。对不上、或这台机器没有 TPM 能用，就退回只用本机密钥；再不行就什么都不改，私钥照旧在设置文件里、服务照常跑，并说明原因。
+3. 设置文件里所有写着私钥的行（包括注释掉的旧行）删掉，换成一句说明；文件原来的内容被覆盖，不是只改个名字。
+4. 服务启动时，systemd 替它解开，放进只属于这个服务的内存目录；程序从那里读，不经过设置文件、环境变量和命令行。
+
+**换私钥**：`bash deploy/gcp/rt.sh key`，在 Cloud Shell 里粘贴（不显示、不进命令历史、不写进任何文件），经 SSH 通道传过去；先在链上核对它是不是 `PREDICT_ACCOUNT` 的控制钥匙，对了才加密保存、删掉设置文件里的旧私钥、重启服务。照老习惯用 `rt.sh edit` 把私钥贴进设置文件也行，保存后一样会被收进加密保存。Telegram `/check`、`rt.sh check` 会写“私钥：加密保存在这台机器上”；还在设置文件里是明文的话写 ⚠️ 并告诉你怎么改。
+
+**它防住的**：截图、录屏、旁人看到屏幕（`rt.sh edit` 打开的文件里没有私钥）；设置文件被复制、备份、误发出去；磁盘快照或磁盘被拷到别的机器上（用上了 TPM 时，没有这台机器的 TPM 解不开；用的是哪种，`rt.sh update` 和 `rt.sh audit` 都会写）。
+
+**它防不住的**（实话）：已经拿到这台机器 root 的人。服务要自己下单，就得在运行时用到私钥，root 能做服务能做的一切。所以真正的锁仍然是你的 Google 账号（见下面“需要你自己做的”），以及钱包里只放够用的钱。
+
+**要知道的**：私钥和这台虚拟机绑在一起。删掉重建虚拟机、从快照另起一台，都解不开原来那份：用新的设置文件 `rt.sh deploy` / `env`，或者 `rt.sh key` 再设一次。万一服务因为解不开私钥起不来，`rt.sh status` 会直接说，照提示 `rt.sh key` 重设即可。改成加密保存之前拍过的磁盘快照里，还是旧的明文设置文件：拍过就删掉（没拍过不用管）。
 
 ### 脚本已经替你做的
 
@@ -444,7 +463,7 @@ shred -u ruletaker.env
 - Shielded VM（安全启动、vTPM、完整性监控）；Ubuntu 默认自动装安全更新。
 - 网页控制台的所有修改操作要专用请求头（别的网站的页面发不出来）；私钥、Key 不能在网页或 Telegram 里改；Telegram 只认 `ADMIN_USER_ID`，而且改不了价格和份数。
 
-**随时体检**：`bash deploy/gcp/rt.sh audit`（只读）。逐项打 ✅ / ⚠️：Cloud Shell 里有没有留着私钥的文件、命令历史里有没有私钥；虚拟机有没有服务账号、有没有加固、项目里有哪些人有权限；虚拟机上设置文件的权限、**同一个设置名是不是写了不止一行**（服务只认第一行：换私钥时要改原来那一行，不能在下面另加一行）、`/tmp` 有没有残留、**私钥是不是只在 `/etc/ruletaker/ruletaker.env` 一个文件里**（搜 `/etc`、记录目录、程序目录、各用户目录、`/tmp`、`/var/log`）、系统日志里有没有、是不是在进程的环境变量里、服务是不是专用用户运行、不写 core dump、只在本机监听、有没有交换分区、SSH 是否只认密钥、自动安全更新、哪些账号能 sudo。私钥在虚拟机上当作搜索条件用（放在只有 root 能读的临时文件里，用完删掉），从不显示、也不传回 Cloud Shell。
+**随时体检**：`bash deploy/gcp/rt.sh audit`（只读）。逐项打 ✅ / ⚠️：Cloud Shell 里有没有留着私钥的文件、命令历史里有没有私钥；虚拟机有没有服务账号、有没有加固、项目里有哪些人有权限；虚拟机上设置文件的权限、**同一个设置名是不是写了不止一行**（服务只认第一行）、`/tmp` 有没有残留、**私钥是不是加密保存着、用的是不是 TPM、这台机器解不解得开**、**明文还在不在任何文件里**（设置文件、`/etc`、记录目录、程序目录、各用户目录、`/tmp`、`/var/log`，注释掉的旧行也算）、系统日志里有没有、是不是在进程的环境变量里、服务是不是从 systemd 拿到了它、服务是不是专用用户运行、不写 core dump、只在本机监听、有没有交换分区、SSH 是否只认密钥、自动安全更新、哪些账号能 sudo。私钥在虚拟机上当作搜索条件用（放在只有 root 能读的临时文件里，用完覆盖删掉），从不显示、也不传回 Cloud Shell。
 
 ### 需要你自己做的（按重要程度）
 
@@ -456,7 +475,7 @@ shred -u ruletaker.env
 6. Google Cloud **设预算提醒**（结算 → 预算和提醒）：云账号被盗最常见的后果是被拿去开一堆机器挖矿。
 7. **怀疑私钥泄露时**：马上在 Predict 网站把钱提到别的地址 → `bash deploy/gcp/rt.sh stop` → 换一个新账户。导出的私钥没法“改密码”，只能弃用。
 
-没有做的：把私钥放进硬件密钥（KMS / HSM）里签名——每签一张单要多一次网络往返，和抢单的目标冲突；Secret Manager 对一个人的项目和现在的做法保护程度相同（都取决于 Google 账号）。加固脚本（`lockdown`）和上面的流程用假的 gcloud 模拟验证过顺序和回滚，没有在真实的 Google Cloud 项目上跑过。
+没有做的：把私钥放进硬件密钥（KMS / HSM）里签名——每签一张单要多一次网络往返，和抢单的目标冲突；Secret Manager 对一个人的项目和现在的做法保护程度相同（都取决于 Google 账号），还多一个开机时要连的服务；开机输口令解锁——机器重启、服务崩溃自动重启时就没人输口令了，抢单会停。加固脚本（`lockdown`）和上面的流程用假的 gcloud 模拟验证过顺序和回滚，没有在真实的 Google Cloud 项目上跑过。
 
 ---
 

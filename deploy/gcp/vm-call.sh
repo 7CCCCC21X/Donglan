@@ -69,7 +69,14 @@ call() {  # call METHOD PATH [JSON] [SECONDS]: the answer in BODY, the HTTP stat
 
 said() {  # what went wrong, in words (never silent)
   case "$CODE" in
-    000|"") echo "❌ 连不上服务的控制台（127.0.0.1:${port}）：服务没在运行，或 STATUS_PORT 设成了 0。看原因：sudo systemctl status ruletaker" ;;
+    000|"")
+      # (243: systemd could not open the key kept encrypted — the service never got as far as starting)
+      if [ "$(systemctl show -p ExecMainStatus --value ruletaker 2>/dev/null)" = 243 ]; then
+        echo "❌ 服务起不来：systemd 解不开加密保存的私钥（换了虚拟机、或这台机器的虚拟 TPM 重置过）。重新设定私钥：bash deploy/gcp/rt.sh key"
+      else
+        echo "❌ 连不上服务的控制台（127.0.0.1:${port}）：服务没在运行，或 STATUS_PORT 设成了 0。看原因：sudo systemctl status ruletaker"
+      fi
+      ;;
     403) echo "❌ 控制台拒绝了（403）：STATUS_KEY 和服务正在用的对不上——改过设置文件但服务没重启？（sudo systemctl restart ruletaker）" ;;
     *) echo "❌ 控制台答复 HTTP ${CODE}：${BODY}" ;;
   esac
@@ -115,9 +122,12 @@ case "${1:-}" in
       echo "（服务没在运行：改用命令行自检）"
       if [ -n "${RT_RUN:-}" ]; then
         $RT_RUN check --env "$F" < /dev/null
+      elif [ -f /opt/ruletaker/deploy/gcp/vm-key.sh ]; then
+        # the way the service runs: its user, and its key if it is kept encrypted
+        bash /opt/ruletaker/deploy/gcp/vm-key.sh run check --env "$F"
       else
         # shellcheck disable=SC2046
-        sudo -u ruletaker $(run_cli) check --env "$F" < /dev/null
+        (cd / && sudo -u ruletaker $(run_cli) check --env "$F" < /dev/null)
       fi
     else
       said

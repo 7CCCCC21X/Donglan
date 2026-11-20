@@ -61,6 +61,50 @@ pub fn load_env_file(path: &str, into: &mut Env) {
     }
 }
 
+/// The name the private key is kept under when it is kept encrypted on the VM (deploy/gcp/vm-key.sh, bash deploy/gcp/rt.sh key):
+/// systemd decrypts it for the service alone (LoadCredentialEncrypted= in deploy/gcp/ruletaker.service) into a directory of
+/// the service's own in memory — $CREDENTIALS_DIRECTORY, read by its user only, gone when it stops.
+pub const KEY_CREDENTIAL: &str = "predict_private_key";
+
+/// What systemd handed the service: whether it runs with a credentials directory at all (the VM's unit gives it one), and the
+/// private key kept there ("" none). No Debug: never printed.
+#[derive(Clone, Default)]
+pub struct Stored {
+    pub store: bool,
+    pub key: String,
+}
+
+impl Stored {
+    /// From $CREDENTIALS_DIRECTORY (unset outside systemd).
+    pub fn from_systemd() -> Result<Stored, String> {
+        Stored::from_dir(std::env::var_os("CREDENTIALS_DIRECTORY"))
+    }
+
+    /// From a credentials directory (None: not run by systemd). A key that is there but cannot be read is an error, never
+    /// "no key".
+    pub fn from_dir(dir: Option<std::ffi::OsString>) -> Result<Stored, String> {
+        let Some(dir) = dir.filter(|d| !d.is_empty()) else {
+            return Ok(Stored::default());
+        };
+        let path = std::path::Path::new(&dir).join(KEY_CREDENTIAL);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Stored { store: true, key: text.trim().to_string() }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Stored { store: true, key: String::new() }),
+            Err(e) => Err(format!("读不到加密保存的私钥（{}：{e}）", path.display())),
+        }
+    }
+}
+
+/// A private key as the wallet takes it: "0x" and 64 hex digits (the 0x may be left off); "" stays "" (none).
+pub fn key_of(raw: &str) -> Option<String> {
+    let k = raw.trim();
+    if k.is_empty() {
+        return Some(String::new());
+    }
+    let k = if k.starts_with("0x") { k.to_string() } else { format!("0x{k}") };
+    (k.len() == 66 && k[2..].bytes().all(|c| c.is_ascii_hexdigit())).then_some(k)
+}
+
 fn get<'a>(e: &'a Env, name: &str, default: &'a str) -> &'a str {
     e.get(name).map(String::as_str).unwrap_or(default)
 }
@@ -225,6 +269,11 @@ pub struct Config {
     pub api_key: String,
     pub own_key: bool,
     pub private_key: String,
+    /// where the private key came from: "stored" (kept encrypted on this machine), "settings" (the settings file: plain text),
+    /// "both" (the same key in both: the plain copy is to go), "" (none)
+    pub key_kept: &'static str,
+    /// run with systemd's credentials directory (the VM's unit): the key could be kept encrypted here
+    pub key_store: bool,
     pub account: String,
     pub chain_id: i64,
     pub rpc_url: String,
@@ -259,6 +308,8 @@ impl Default for Config {
             api_key: String::new(),
             own_key: false,
             private_key: String::new(),
+            key_kept: "",
+            key_store: false,
             account: String::new(),
             chain_id: 56,
             rpc_url: String::new(),
@@ -298,7 +349,15 @@ impl Config {
         self.rules.mode == "on"
     }
 
+    /// The settings alone (no key kept encrypted: a test, a laptop).
     pub fn from_env(e: &Env) -> Result<Config, String> {
+        Config::load(e, &Stored::default())
+    }
+
+    /// The settings, and the private key kept encrypted on this machine if there is one. The settings file's
+    /// PREDICT_PRIVATE_KEY is used only when none is kept; the same key in both is that key (its plain copy reported, to go);
+    /// two different keys are refused — never one of them picked behind the user's back.
+    pub fn load(e: &Env, stored: &Stored) -> Result<Config, String> {
         let rules = RuleSettings::parse(e, None)?;
         clock::configure(
             Some(parse_dates(get(e, "CME_EARLY_DAYS", DEFAULT_CME_EARLY), "CME_EARLY_DAYS")?),
@@ -307,13 +366,19 @@ impl Config {
         let own = get(e, "RULE_API_KEY", "").trim().to_string();
         let shared = get(e, "PREDICT_API_KEY", "").trim().to_string();
         let key = if own.is_empty() { shared.clone() } else { own.clone() };
-        let mut private_key = get(e, "PREDICT_PRIVATE_KEY", "").trim().to_string();
-        if !private_key.is_empty() && !private_key.starts_with("0x") {
-            private_key = format!("0x{private_key}");
-        }
-        if !private_key.is_empty() && (private_key.len() != 66 || !private_key[2..].bytes().all(|c| c.is_ascii_hexdigit())) {
-            return Err("PREDICT_PRIVATE_KEY 应为 64 位十六进制（0x 可省）".into());
-        }
+        let plain = key_of(get(e, "PREDICT_PRIVATE_KEY", "")).ok_or("PREDICT_PRIVATE_KEY 应为 64 位十六进制（0x 可省）")?;
+        let kept = key_of(&stored.key).ok_or("加密保存的私钥不是 64 位十六进制：运行 bash deploy/gcp/rt.sh key 重新设定")?;
+        let (private_key, key_kept) = match (kept.is_empty(), plain.is_empty()) {
+            (true, true) => (String::new(), ""),
+            (false, true) => (kept, "stored"),
+            (true, false) => (plain, "settings"),
+            (false, false) if kept.eq_ignore_ascii_case(&plain) => (kept, "both"),
+            _ => {
+                return Err("设置文件里的 PREDICT_PRIVATE_KEY 和加密保存的私钥不是同一把：要换成设置文件里这把，运行 \
+                            bash deploy/gcp/rt.sh edit 存一次（会把它收进加密保存）；不换就删掉设置文件里那一行"
+                    .into());
+            }
+        };
         let account = get(e, "PREDICT_ACCOUNT", "").trim().to_string();
         if !account.is_empty() && (!account.starts_with("0x") || account.len() != 42) {
             return Err("PREDICT_ACCOUNT 应为 0x 开头的 42 位地址（网站账户设置里的充值地址），用普通钱包交易就留空".into());
@@ -362,6 +427,8 @@ impl Config {
             own_key: !own.is_empty() && own != shared,
             api_key: key,
             private_key,
+            key_kept,
+            key_store: stored.store,
             account,
             chain_id: bounded(e, "PREDICT_CHAIN_ID", 56.0, 1.0, 1e9, true)? as i64,
             rpc_url: get(e, "BSC_RPC_URL", "").trim().trim_end_matches('/').to_string(),
@@ -398,7 +465,7 @@ impl Config {
     pub fn secrets_line(&self) -> String {
         format!(
             "secrets configured: predict_api_key={} own_rule_key={} predict_private_key={} predict_account={} telegram_token={} \
-             telegram_command_token={} telegram_commands={} status_key={} mode={} trading_allowed={}",
+             telegram_command_token={} telegram_commands={} status_key={} mode={} trading_allowed={} private_key_kept={}",
             py_bool(!self.api_key.is_empty()),
             py_bool(self.own_key),
             py_bool(!self.private_key.is_empty()),
@@ -408,7 +475,8 @@ impl Config {
             py_bool(self.telegram_commands),
             py_bool(!self.status_key.is_empty()),
             self.rules.mode,
-            py_bool(self.trading_allowed)
+            py_bool(self.trading_allowed),
+            if self.key_kept.is_empty() { "none" } else { self.key_kept }
         )
     }
 }
@@ -479,5 +547,67 @@ mod secret_tests {
             assert!(!shown.contains(secret), "{shown}");
         }
         assert!(shown.contains("predict_private_key=True"), "{shown}");
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    const A: &str = "a4c123b1612dd272d1371c17149d439536b3216fdaeeb975729fae923d5a4fd1";
+
+    fn load(pairs: &[(&str, &str)], store: bool, key: &str) -> Result<Config, String> {
+        let e: Env = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        Config::load(&e, &Stored { store, key: key.to_string() })
+    }
+
+    #[test]
+    fn the_key_kept_encrypted_is_used_and_two_different_keys_are_refused() {
+        let a = format!("0x{A}");
+        // kept encrypted alone: used (0x added; a line break left by whoever wrote it taken off)
+        let c = load(&[("RULE_TAKER", "on"), ("PREDICT_API_KEY", "k")], true, &format!("{A}\n")).unwrap();
+        assert_eq!((c.private_key.as_str(), c.key_kept, c.key_store), (a.as_str(), "stored", true));
+        // the settings file's alone: not run by systemd (a laptop) ...
+        let c = load(&[("PREDICT_PRIVATE_KEY", A)], false, "").unwrap();
+        assert_eq!((c.private_key.as_str(), c.key_kept, c.key_store), (a.as_str(), "settings", false));
+        // ... or on the VM with none kept yet
+        let c = load(&[("PREDICT_PRIVATE_KEY", A)], true, "").unwrap();
+        assert_eq!((c.key_kept, c.key_store), ("settings", true));
+        // the same key in both (letter case and the 0x aside): that key, the plain copy reported
+        let c = load(&[("PREDICT_PRIVATE_KEY", &A.to_uppercase())], true, &a).unwrap();
+        assert_eq!((c.private_key.as_str(), c.key_kept), (a.as_str(), "both"));
+        // two different keys: refused, whichever way round
+        let other = "1".repeat(64);
+        assert!(load(&[("PREDICT_PRIVATE_KEY", &other)], true, A).unwrap_err().contains("不是同一把"));
+        assert!(load(&[("PREDICT_PRIVATE_KEY", A)], true, &other).unwrap_err().contains("不是同一把"));
+        // a kept "key" that is none: refused, and said to be the kept one
+        assert!(load(&[], true, "0x12").unwrap_err().contains("加密保存的私钥"));
+        assert!(load(&[("PREDICT_PRIVATE_KEY", "0x12")], true, A).unwrap_err().contains("PREDICT_PRIVATE_KEY 应为"));
+        // none anywhere: on refused as before, paper fine
+        assert!(load(&[("RULE_TAKER", "on"), ("PREDICT_API_KEY", "k")], true, "").unwrap_err().contains("PREDICT_PRIVATE_KEY"));
+        let c = load(&[("RULE_TAKER", "paper"), ("PREDICT_API_KEY", "k")], true, "").unwrap();
+        assert_eq!((c.private_key.as_str(), c.key_kept), ("", ""));
+        assert!(c.secrets_line().ends_with("private_key_kept=none"), "{}", c.secrets_line());
+        let c = load(&[], true, A).unwrap();
+        assert!(c.secrets_line().ends_with("private_key_kept=stored"));
+        assert!(!format!("{c:?}").contains(A));
+    }
+
+    #[test]
+    fn systemd_s_directory_is_read_and_an_unreadable_key_is_no_silent_none() {
+        assert!(!Stored::from_dir(None).unwrap().store);
+        assert!(!Stored::from_dir(Some("".into())).unwrap().store);
+        let dir = std::env::temp_dir().join(format!("rt-creds-{}-{}", std::process::id(), crate::util::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Stored::from_dir(Some(dir.clone().into_os_string())).unwrap();
+        assert!(s.store && s.key.is_empty(), "a directory without the key: none kept");
+        std::fs::write(dir.join(KEY_CREDENTIAL), format!("0x{A}\n")).unwrap();
+        let s = Stored::from_dir(Some(dir.clone().into_os_string())).unwrap();
+        assert_eq!(s.key, format!("0x{A}"));
+        std::fs::remove_file(dir.join(KEY_CREDENTIAL)).unwrap();
+        std::fs::create_dir(dir.join(KEY_CREDENTIAL)).unwrap();
+        let e = Stored::from_dir(Some(dir.clone().into_os_string())).err().expect("an unreadable key is an error");
+        assert!(e.contains("读不到加密保存的私钥"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

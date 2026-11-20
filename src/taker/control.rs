@@ -365,7 +365,13 @@ pub async fn self_check(me: &Me) -> String {
             r.no(format!("今天已到过日亏损停机线 {}：今天不再开新单（/resume 从现在的盈亏起再给一个额度）", money(f)));
         }
     }
+    // where the key is kept: encrypted on this machine (deploy/gcp/vm-key.sh), or plain in the settings file
+    let (kept, store) = {
+        let t = me.borrow();
+        (t.config.key_kept, t.config.key_store)
+    };
     match &wallet {
+        None if store => r.either(live, "没有设置 PREDICT_PRIVATE_KEY：只能 off / paper（设定私钥：bash deploy/gcp/rt.sh key）"),
         None => r.either(live, "没有设置 PREDICT_PRIVATE_KEY：只能 off / paper"),
         Some(wallet) => {
             match api.ensure_auth().await {
@@ -397,6 +403,16 @@ pub async fn self_check(me: &Me) -> String {
                 }
             } else {
                 r.ok(format!("账户：普通钱包 {}", short(&wallet.maker)));
+            }
+            match kept {
+                "stored" => r.ok("私钥：加密保存在这台机器上，只在服务自己的内存里解开（设置文件里没有明文）"),
+                "both" => r.warn(
+                    "私钥：已加密保存，但设置文件里还留着同一把的明文：运行 bash deploy/gcp/rt.sh update（或 edit 存一次）就会收走",
+                ),
+                _ if store => {
+                    r.warn("私钥：在设置文件里是明文：运行 bash deploy/gcp/rt.sh update 改成加密保存（只有这台机器能解开）")
+                }
+                _ => {} // (not run by systemd: a laptop, a test — nothing to keep it in)
             }
             super::flow::refresh_balance(me).await;
             {

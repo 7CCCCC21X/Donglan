@@ -9,6 +9,8 @@
 #   RT_IMPL=python bash deploy/gcp/rt.sh update   换回 Python 版（备用）；RT_IMPL=rust 再换回 Rust 版（记录、设置都通用）
 #   bash deploy/gcp/rt.sh env [文件]      上传新的设置文件（默认 ./ruletaker.env）并重启
 #   bash deploy/gcp/rt.sh edit            直接在虚拟机上改设置文件（nano），检查无误才重启——私钥不用再留在 Cloud Shell
+#   bash deploy/gcp/rt.sh key             换私钥：在这里粘贴（不显示），先核对它是不是 PREDICT_ACCOUNT 的控制钥匙，对了才在虚拟机上
+#                                         加密保存、重启服务（私钥不在设置文件里：update / env / edit 会把设置文件里的明文自动收走）
 #   bash deploy/gcp/rt.sh audit           私钥安全体检（只读）：私钥只在该在的地方、权限、加固、谁能登录
 #   bash deploy/gcp/rt.sh console         打开网页控制台和复盘页（通过 Cloud Shell 的“网页预览”，不开公网端口）
 #   bash deploy/gcp/rt.sh status          看状态（就是 huice 的 /rules）
@@ -139,9 +141,9 @@ RUN_ON_VM='if [ "$(cat /opt/ruletaker/IMPL 2>/dev/null || echo rust)" = python ]
 
 
 remind_env() {  # the settings file left in this shell holds the private key: said once it is on the VM
-  if [ -n "${ENV_UPLOADED:-}" ] && [ -f "$ENV_UPLOADED" ]; then
-    echo "提醒：$ENV_UPLOADED 还留在这里（里面有私钥）。虚拟机上已经有一份，删掉它：shred -u \"$ENV_UPLOADED\""
-    echo "      以后改设置直接在虚拟机上改：bash deploy/gcp/rt.sh edit（不用再在这里放私钥）"
+  if [ -n "${ENV_UPLOADED:-}" ] && [ -f "$ENV_UPLOADED" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?PREDICT_PRIVATE_KEY[[:space:]]*=[[:space:]]*["'"'"']?(0x)?[0-9a-fA-F]{64}' "$ENV_UPLOADED"; then
+    echo "提醒：$ENV_UPLOADED 还留在这里（里面有私钥）。虚拟机上已经加密保存了一份，删掉这里的：shred -u \"$ENV_UPLOADED\""
+    echo "      以后改设置直接在虚拟机上改：bash deploy/gcp/rt.sh edit；换私钥：bash deploy/gcp/rt.sh key（都不用在这里放私钥）"
   fi
 }
 
@@ -242,11 +244,31 @@ case "$cmd" in
     ;;
   edit)
     # The settings file edited where it lives (root's, on the VM): the key need not be kept in Cloud Shell to change a setting.
-    # Checked before the restart: a setting that does not parse leaves the running service as it is.
+    # Afterwards (vm-key.sh apply): a key pasted into it kept encrypted and taken out again, the settings checked the way the
+    # service reads them, and only then the restart — a setting that does not parse leaves the running service as it is.
+    # (A VM still on the version before: checked and restarted as before.)
     ssh_to "$VM" "$ZONE" --command "sudo nano /etc/ruletaker/ruletaker.env; \
-      if sudo -u ruletaker \$($RUN_ON_VM) plan --env /etc/ruletaker/ruletaker.env >/dev/null; then \
+      if [ -f /opt/ruletaker/deploy/gcp/vm-key.sh ]; then sudo bash /opt/ruletaker/deploy/gcp/vm-key.sh apply; \
+      elif sudo -u ruletaker \$($RUN_ON_VM) plan --env /etc/ruletaker/ruletaker.env >/dev/null; then \
         sudo systemctl restart ruletaker && echo '已保存，服务已重启'; \
       else echo '!! 设置文件有误（见上面），服务没有重启、还在按原来的设置运行：再运行 bash deploy/gcp/rt.sh edit 改正'; fi" -- -t
+    ;;
+  key)
+    # A new private key: pasted here without being shown (not echoed, not in the shell's history, never on a command line),
+    # carried over the SSH channel's standard input to vm-key.sh on the VM — which checks it (its address, and on chain whether
+    # it controls PREDICT_ACCOUNT) before anything changes, keeps it encrypted, takes any plain copy out of the settings file
+    # and restarts the service on it.
+    ssh_to "$VM" "$ZONE" --command "test -f /opt/ruletaker/deploy/gcp/vm-key.sh" \
+      || die "虚拟机上的版本还不会加密保存私钥：先运行 bash deploy/gcp/rt.sh update（它会顺便把设置文件里的私钥收进加密保存）"
+    echo "换私钥：粘贴新的私钥（64 位十六进制，0x 可省）后按回车。屏幕上不会显示，也不会进命令历史。"
+    echo "（先核对它在链上是不是 PREDICT_ACCOUNT 的控制钥匙，不对就什么都不改；对了才加密保存、重启服务——别在抢单前后几分钟做）"
+    newkey=""
+    IFS= read -r -s -p "新私钥：" newkey || true
+    echo
+    newkey="${newkey//[[:space:]]/}"
+    [[ "$newkey" =~ ^(0x)?[0-9a-fA-F]{64}$ ]] || { newkey=""; die "这不是 64 位十六进制的私钥：什么都没改"; }
+    printf '%s\n' "$newkey" | ssh_to "$VM" "$ZONE" --command "sudo bash /opt/ruletaker/deploy/gcp/vm-key.sh set"
+    newkey=""
     ;;
   audit)
     # Read-only: what holds the key, who can read it, what reaches the machine. The key is never shown, here or there.
@@ -364,7 +386,8 @@ case "$cmd" in
   check|test)  # the running service's own self-check (or order test); the command-line check when the service is not running
     vm_call control "$cmd"
     ;;
-  latency) remote "sudo -u ruletaker \$($RUN_ON_VM) latency --env /etc/ruletaker/ruletaker.env" ;;
+  # (RULE_TAKER=off: a measurement needs no private key, and is not handed one)
+  latency) remote "cd / && sudo -u ruletaker env RULE_TAKER=off \$($RUN_ON_VM) latency --env /etc/ruletaker/ruletaker.env" ;;
   restart|stop|start) remote "sudo systemctl $cmd ruletaker && sudo systemctl --no-pager --lines=5 status ruletaker || true" ;;
   ssh) ssh_to "$VM" "$ZONE" ;;
   probe)
@@ -397,6 +420,6 @@ case "$cmd" in
     [ "$ok" = "yes" ] && gcloud compute instances delete "$VM" "${G[@]}" "${Z[@]}" --quiet
     ;;
   *)
-    sed -n '2,25p' "$0"
+    awk 'NR > 1 { if (!/^#/) exit; print }' "$0"   # (the comment at the top: the commands)
     ;;
 esac

@@ -20,7 +20,7 @@ import urllib.parse
 from typing import Any
 
 from . import VERSION
-from .config import Config, load_env_file
+from .config import Config, Stored, key_of, load_env_file
 from .util import LOG, bj, clean_error
 
 
@@ -421,15 +421,70 @@ def plan(config: Config, days: int = 2) -> int:
     return 0
 
 
+async def key_command(env: dict, from_stdin: bool) -> int:
+    """``key``: a private key's signing address, never the key itself — the one on standard input (--stdin), else the one systemd
+    hands the service (kept encrypted on this machine: deploy/gcp/vm-key.sh). With a settings file naming a PREDICT_ACCOUNT,
+    whether the key controls that account, on chain. The address alone on the first line (a script reads it); exit 0 (it does,
+    or no account to check), 1 (it does not), 2 (no key, or not a key), 3 (the chain could not be read)."""
+    from .predict import RPC_URLS, Chain
+    from .wallet import Wallet
+    if from_stdin:
+        raw = sys.stdin.readline()
+    else:
+        try:
+            raw = Stored.from_systemd().key
+        except ValueError as error:
+            print(f"❌ {error}", file=sys.stderr)
+            return 2
+    key = key_of(raw)
+    if not key:
+        print("❌ 这不是私钥：应为 64 位十六进制（0x 可省）" if key is None else
+              "❌ 没有私钥" + ("（标准输入是空的）" if from_stdin else "（这台机器上没有加密保存的私钥）"), file=sys.stderr)
+        return 2
+
+    def setting(name: str) -> str:
+        return str(env.get(name, "")).strip()
+    try:
+        chain_id = int(setting("PREDICT_CHAIN_ID") or 56)
+    except ValueError:
+        chain_id = 56
+    try:
+        wallet = Wallet(key, chain_id, setting("PREDICT_ACCOUNT"))
+    except Exception as error:
+        print(f"❌ {clean_error(error) or error}", file=sys.stderr)
+        return 2
+    print(wallet.signer, flush=True)
+    if not wallet.predict_account:
+        return 0
+    chain = Chain(setting("BSC_RPC_URL").rstrip("/") or RPC_URLS.get(chain_id, RPC_URLS[56]), wallet)
+    try:
+        owner = await chain.account_owner(wallet.predict_account)
+    except Exception as error:
+        print(f"⚠️ 链上核对没做成：{clean_error(error)}")
+        return 3
+    if owner.lower() == wallet.signer.lower():
+        print(f"✅ 是 Predict 账户 {wallet.predict_account} 的控制钥匙（链上核对）")
+        return 0
+    print(f"❌ 不是 Predict 账户 {wallet.predict_account} 的控制钥匙（链上记录的是 {owner}）")
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m ruletaker", description="规则吃单 · 独立服务")
-    parser.add_argument("command", nargs="?", default="run", choices=["run", "latency", "check", "plan"])
-    parser.add_argument("--env", default=None, help="环境变量文件（默认 /etc/ruletaker/ruletaker.env 或 ./.env）")
+    parser.add_argument("command", nargs="?", default="run", choices=["run", "latency", "check", "plan", "key"],
+                        help="key：只读，私钥的签名地址（从不显示私钥本身）——--stdin 从标准输入读一把，否则用这台机器加密保存的那把；"
+                             "给了 --env 且设了 PREDICT_ACCOUNT，再在链上核对它是不是这个 Predict 账户的控制钥匙")
+    parser.add_argument("--env", default=None, help="环境变量文件（默认 /etc/ruletaker/ruletaker.env 或 ./.env；key 只在给了时才读）")
     parser.add_argument("--no-order-probe", action="store_true", help="check 时不向下单接口发空订单")
+    parser.add_argument("--stdin", action="store_true", help="key 时从标准输入读私钥")
     args = parser.parse_args(argv)
+    if args.command == "key":
+        # (the settings only when named: the key alone needs none)
+        return asyncio.run(key_command(load_env(args.env) if args.env else {}, args.stdin))
     try:
         env = load_env(args.env)
-        config = Config.from_env(env)
+        # the private key kept encrypted on this machine, as systemd hands it to the service (none outside systemd)
+        config = Config.load(env, Stored.from_systemd())
     except ValueError as error:
         print(f"设置有误：{error}", file=sys.stderr)
         return 2

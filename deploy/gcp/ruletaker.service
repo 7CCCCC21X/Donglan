@@ -12,6 +12,11 @@ Environment=STATE_DB=/var/lib/ruletaker/ruletaker.sqlite3
 # The service reads its settings file itself (inline comments allowed); the process environment above wins over it.
 # (The Rust version; rt.sh python puts the Python version in instead: ruletaker.service.d/python.conf.)
 ExecStart=/opt/ruletaker/bin/ruletaker run --env /etc/ruletaker/ruletaker.env
+# The private key, kept encrypted on this machine (deploy/gcp/vm-key.sh: /etc/credstore.encrypted/predict_private_key, sealed
+# with the machine's own key and its virtual TPM): systemd opens it for this service alone, into a directory of the service's
+# own in memory ($CREDENTIALS_DIRECTORY: read by its user only, gone when it stops). None kept: nothing is loaded, and the
+# settings file's PREDICT_PRIVATE_KEY is used as before.
+LoadCredentialEncrypted=predict_private_key
 Restart=always
 RestartSec=3
 # On a stop: the orders on their way get their answers (25 s at the most) and the resting rest is withdrawn, the records are

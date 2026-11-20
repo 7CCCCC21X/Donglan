@@ -707,24 +707,92 @@ fn plan(config: &Config, days: i64) -> i32 {
 }
 
 fn usage() -> &'static str {
-    "用法：ruletaker [run | latency | check | plan] [--env 文件] [--no-order-probe]\n\
+    "用法：ruletaker [run | latency | check | plan | key] [--env 文件] [--no-order-probe] [--stdin]\n\
      \x20 run      运行服务（默认）\n\
      \x20 latency  只读：量这台机器到 Predict 的网络延迟\n\
      \x20 check    只读：设置、登录、账户、余额、授权、下单接口是否对这个区域开放\n\
      \x20 plan     不联网：接下来两天的规则场次\n\
-     \x20 --env    环境变量文件（默认 /etc/ruletaker/ruletaker.env 或 ./.env）"
+     \x20 key      只读：私钥的签名地址（从不显示私钥本身）——--stdin 从标准输入读一把，否则用这台机器加密保存的那把；\n\
+     \x20          给了 --env 且设了 PREDICT_ACCOUNT，再在链上核对它是不是这个 Predict 账户的控制钥匙\n\
+     \x20 --env    环境变量文件（默认 /etc/ruletaker/ruletaker.env 或 ./.env；key 只在给了时才读）"
+}
+
+/// `ruletaker key`: a private key's signing address, never the key itself — the one on standard input (--stdin), else the one
+/// systemd hands the service (kept encrypted on this machine: deploy/gcp/vm-key.sh). With a settings file naming a
+/// PREDICT_ACCOUNT, whether the key controls that account, on chain. The address alone on the first line (a script reads it);
+/// exit 0 (it does, or no account to check), 1 (it does not), 2 (no key, or not a key), 3 (the chain could not be read).
+async fn key_command(env: Env, from_stdin: bool) -> i32 {
+    let raw = if from_stdin {
+        let mut line = String::new();
+        if let Err(e) = std::io::stdin().read_line(&mut line) {
+            eprintln!("❌ 标准输入读不了：{e}");
+            return 2;
+        }
+        line
+    } else {
+        match config::Stored::from_systemd() {
+            Ok(stored) => stored.key,
+            Err(e) => {
+                eprintln!("❌ {e}");
+                return 2;
+            }
+        }
+    };
+    let key = match config::key_of(&raw) {
+        Some(k) if !k.is_empty() => k,
+        Some(_) => {
+            eprintln!("❌ 没有私钥{}", if from_stdin { "（标准输入是空的）" } else { "（这台机器上没有加密保存的私钥）" });
+            return 2;
+        }
+        None => {
+            eprintln!("❌ 这不是私钥：应为 64 位十六进制（0x 可省）");
+            return 2;
+        }
+    };
+    let setting = |name: &str| env.get(name).map(|v| v.trim().to_string()).unwrap_or_default();
+    let chain_id: i64 = setting("PREDICT_CHAIN_ID").parse().unwrap_or(56);
+    let wallet = match wallet::Wallet::new(&key, chain_id, &setting("PREDICT_ACCOUNT")) {
+        Ok(w) => Rc::new(w),
+        Err(e) => {
+            eprintln!("❌ {e}");
+            return 2;
+        }
+    };
+    println!("{}", wallet.signer);
+    if wallet.predict_account.is_empty() {
+        return 0;
+    }
+    let rpc = setting("BSC_RPC_URL");
+    let rpc = if rpc.is_empty() { predict::rpc_url(chain_id).to_string() } else { rpc.trim_end_matches('/').to_string() };
+    let chain = predict::Chain::new(&rpc, wallet.clone(), Rc::new(predict::Live));
+    match chain.account_owner(&wallet.predict_account).await {
+        Ok(owner) if owner.eq_ignore_ascii_case(&wallet.signer) => {
+            println!("✅ 是 Predict 账户 {} 的控制钥匙（链上核对）", wallet.predict_account);
+            0
+        }
+        Ok(owner) => {
+            println!("❌ 不是 Predict 账户 {} 的控制钥匙（链上记录的是 {owner}）", wallet.predict_account);
+            1
+        }
+        Err(e) => {
+            println!("⚠️ 链上核对没做成：{}", clean_error(&e));
+            3
+        }
+    }
 }
 
 fn main() {
     let mut command = "run".to_string();
     let mut env_file: Option<String> = None;
     let mut probe = true;
+    let mut from_stdin = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "run" | "latency" | "check" | "plan" => command = arg,
+            "run" | "latency" | "check" | "plan" | "key" => command = arg,
             "--env" => env_file = args.next(),
             "--no-order-probe" => probe = false,
+            "--stdin" => from_stdin = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 return;
@@ -740,8 +808,16 @@ fn main() {
             }
         }
     }
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
+    let local = tokio::task::LocalSet::new();
+    if command == "key" {
+        // (the settings only when named: the key alone needs none)
+        let env = if env_file.is_some() { load_env(env_file.as_deref()) } else { Env::new() };
+        std::process::exit(local.block_on(&runtime, key_command(env, from_stdin)));
+    }
     let env = load_env(env_file.as_deref());
-    let config = match Config::from_env(&env) {
+    // the private key kept encrypted on this machine, as systemd hands it to the service (none outside systemd)
+    let config = match config::Stored::from_systemd().and_then(|stored| Config::load(&env, &stored)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("设置有误：{e}");
@@ -752,8 +828,6 @@ fn main() {
     if command == "plan" {
         std::process::exit(plan(&config, 2));
     }
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
-    let local = tokio::task::LocalSet::new();
     let code = local.block_on(&runtime, async move {
         match command.as_str() {
             "latency" => latency(config, 10).await,

@@ -175,6 +175,24 @@ if __name__ == "__main__":
 
 
 class SelfCheckTest(unittest.TestCase):
+    def test_self_check_says_where_the_key_is_kept(self) -> None:
+        import dataclasses
+        from test_taker import found
+
+        async def go() -> None:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            # not run by systemd (a laptop, a test): nothing to keep it in, nothing said
+            self.assertNotIn("私钥：", await taker.self_check())
+            for kept, want in (("stored", "✅ 私钥：加密保存在这台机器上"),
+                               ("both", "⚠️ 私钥：已加密保存，但设置文件里还留着同一把的明文"),
+                               ("settings", "⚠️ 私钥：在设置文件里是明文")):
+                taker.config = dataclasses.replace(taker.config, key_kept=kept, key_store=True)
+                text = await taker.self_check()
+                self.assertIn(want, text, kept)
+                self.assertIn("结论：✅ 可以真实吃单", text, kept)  # (a warning, never a reason not to trade)
+        run(go())
+
     def test_self_check_all_good_then_a_region_that_may_not_trade(self) -> None:
         from fakes import book, market_of
         from test_taker import MID, SLUG, found
