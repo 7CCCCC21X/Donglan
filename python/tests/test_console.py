@@ -369,6 +369,60 @@ class TelegramMenuTest(unittest.TestCase):
             self.assertTrue(taker.paused)
         run(go())
 
+    def test_settings_and_review(self) -> None:
+        from ruletaker.notify import Telegram
+
+        async def go() -> None:
+            taker, *_ = make_taker(START - 3_600_000)
+            calls: list[tuple] = []
+
+            async def fake_call(method: str, payload: dict, timeout: float = 15, token: str = ""):
+                calls.append((method, payload))
+                return True
+            tg = Telegram("", (), admin=42, commands=True, handler=taker.command, command_token="CMD")
+            tg.call, tg.settings_view = fake_call, taker.settings_view
+
+            def last(method: str) -> dict:
+                return next((p for m, p in reversed(calls) if m == method), {})
+
+            async def tap(data: str) -> None:
+                tg.on_update({"update_id": 1, "callback_query": {"id": "q1", "data": data, "from": {"id": 42},
+                                                                 "message": {"message_id": 78, "chat": {"id": 42}}}})
+                await asyncio.sleep(0.05)
+                await tg.drain(1.0)
+            tg.on_update({"update_id": 1, "message": {"text": "/settings", "chat": {"id": 42}, "from": {"id": 42}}})
+            await tg.drain(1.0)
+            self.assertIn("⚙️ 设置", last("sendMessage")["text"])
+            self.assertIn("f:RULE_MAX_DAILY_LOSS_USD", json.dumps(last("sendMessage")["reply_markup"]))
+            await tap("f:RULE_MAX_DAILY_LOSS_USD")  # a field: what it does, a button a preset
+            self.assertIn("今日亏损停机线", last("editMessageText")["text"])
+            self.assertIn("现在：不限", last("editMessageText")["text"])
+            self.assertIn("s:RULE_MAX_DAILY_LOSS_USD:50", json.dumps(last("editMessageText")["reply_markup"]))
+            await tap("s:RULE_MAX_DAILY_LOSS_USD:50")  # in force, said, ticked
+            self.assertEqual(taker.loss_cap, 50)
+            self.assertIn("✅ 已保存", last("sendMessage")["text"])
+            self.assertIn("✅ $50", json.dumps(last("editMessageText")["reply_markup"], ensure_ascii=False))
+            await tap("s:RULE_MAX_DAILY_LOSS_USD:999999")  # made-up buttons: nothing changes
+            await tap("s:PREDICT_PRIVATE_KEY:0x00")
+            self.assertEqual(taker.loss_cap, 50)
+            self.assertEqual(last("answerCallbackQuery")["text"], "这个按钮已经过时，重新打开设置")
+            await tap("r:RULE_MAX_DAILY_LOSS_USD")  # back to the settings file's value
+            self.assertEqual(taker.loss_cap, 0)
+            self.assertIn("✅", await taker.command("/set", "RULE_GOLD_SHARES 120"))  # typed: any value the file would take
+            self.assertEqual(taker.settings.shares_of("gold"), 120)
+            self.assertIn("❌ 没改", await taker.command("/set", "NOPE 1"))
+            self.assertIn("用法", await taker.command("/set", "RULE_GOLD_SHARES"))
+            self.assertIn("✅", await taker.command("/reset", "RULE_GOLD_SHARES"))
+            self.assertIn("RULE_GOLD_SHARES", await taker.command("/settings", ""))
+            await tap("v:30")  # the review
+            self.assertIn("📈 复盘（近 30 天", last("sendMessage")["text"])
+            taker.recs["a"] = rec("xau-updown-15m-1", "on", START - 86_400_000, 50, 0.56, 21.2)
+            text = await taker.command("/review", "all")
+            self.assertIn("📈 复盘（全部", text)
+            self.assertIn("按规则：", text)
+            self.assertIn("+$21.20", text)
+        run(go())
+
     def test_says_why_the_bot_is_silent(self) -> None:
         from ruletaker.notify import Telegram
         from ruletaker.util import RemoteError

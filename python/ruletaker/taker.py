@@ -146,6 +146,53 @@ def placed_or_not(error: BaseException) -> str:
     return "unknown"
 
 
+def settings_text(view: list) -> str:
+    """/settings as text (where no buttons can be shown): each field's value and its name for /set."""
+    lines = ["⚙️ 设置（改：/set 设置名 数值；回到设置文件的值：/reset 设置名）"]
+    for group in view:
+        lines.append(group["group"])
+        lines += [f"· {f['label']}：{f['value']}（{f['key']}）" + (" •" if f.get("saved") else "") for f in group["fields"]]
+    return "\n".join(lines)
+
+
+def review_text(data: dict, days: int) -> str:
+    """The review page's numbers as a message: the totals, each rule, the last days, the last windows."""
+    if data.get("busy"):
+        return f"📈 {data['busy']}"
+    lines = [f"📈 复盘（{'全部' if not days else f'近 {days} 天'}，按开场时间算）"]
+    shown_any = False
+    for mode, name in (("on", "真实"), ("paper", "只记录")):
+        t = (data.get("totals") or {}).get(mode) or {}
+        if not t.get("windows"):
+            continue
+        shown_any = True
+        roi = f"，收益率 {t['roi'] * 100:+.1f}%" if t.get("roi") is not None else ""
+        still = f"；还有 {t['open']} 场没结算" if t.get("open") else ""
+        lines.append(f"{name}：买了 {t['windows']} 场 {fmt(t['shares'])} 份，花 ${t['cost']:.2f}；已结算 {t['settled']} 场（赢 {t['wins']} 输 "
+                     f"{t['losses']}），盈亏 {money(t['pnl'])}{roi}{still}")
+    if not shown_any:
+        lines.append("这段时间还没有买到过（真实和只记录都没有）")
+    rules = [r for r in data.get("rules") or [] if r.get("windows")]
+    if rules:
+        lines.append("按规则：")
+        lines += [f"· {r['name']}（{'真实' if r['mode'] == 'on' else '只记录'}）：{r['windows']} 场，赢 {r['wins']} 输 {r['losses']}，"
+                  f"盈亏 {money(r['pnl'])}" for r in rules]
+    daily = list(reversed((data.get("daily") or {}).get("on") or []))[:7]
+    if daily:
+        lines.append("最近几天（真实）：")
+        lines += [f"  {d['day']}：{d['windows']} 场 {money(d['pnl'])}（累计 {money(d['cum'])}）" for d in daily]
+    recent = (data.get("recent") or [])[:5]
+    if recent:
+        lines.append("最近几场：")
+        for r in recent:
+            result = {"up": "涨", "down": "跌", "split": "平"}.get(r.get("result") or "", "待结算")
+            pnl = f" {money(r['pnl'])}" if r.get("pnl") is not None else ""
+            lines.append(f"  {bj(int(r.get('start_ms') or 0))} {r.get('window') or ''}{'（只记录）' if r.get('mode') == 'paper' else ''} "
+                         f"买{'涨' if r.get('side') == 'up' else '跌'} {fmt(r.get('shares') or 0)} 份 均价 {float(r.get('avg') or 0) * 100:.1f}¢ → {result}{pnl}")
+    lines.append("其他天数：/review 7、/review all；图表和 CSV 在网页控制台")
+    return "\n".join(lines)
+
+
 class RuleTaker:
     def __init__(self, config: Config, store: Any, *, api: Any = None, wallet: Any = None, chain: Any = None, stream: Any = None,
                  index: Any = None, telegram: Any = None, clock: Any = None, base_env: dict | None = None):
@@ -1882,6 +1929,30 @@ class RuleTaker:
             return f"规则吃单改成：{MODES[want]}" + "".join(f"\n{x}" for x in (line, late) if x)
         return "？"
 
+    async def set_command(self, args: str) -> str:
+        """/set KEY VALUE: one setting changed, as the control page changes it (checked whole, in force at once, kept on disk)."""
+        key, _, value = args.strip().partition(" ")
+        if not key or not value.strip():
+            return "用法：/set 设置名 数值（例：/set RULE_MAX_DAILY_LOSS_USD 30）；设置名在 /settings 里点一项就能看到"
+        try:
+            return "✅ " + await self.save_settings({key.upper(): value.strip()})
+        except NotOnDisk as late:
+            return f"⚠️ {late}"
+        except ValueError as error:
+            return f"❌ 没改：{error}"
+
+    async def reset_command(self, args: str) -> str:
+        """/reset KEY: one setting back to the settings file's value."""
+        key = args.strip().upper()
+        if key not in console.FIELDS:
+            return "用法：/reset 设置名（回到设置文件里的值；设置名在 /settings 里点一项就能看到）"
+        try:
+            return "✅ " + await self.reset_settings([key])
+        except NotOnDisk as late:
+            return f"⚠️ {late}"
+        except ValueError as error:
+            return f"❌ 没改：{error}"
+
     async def after_the_race(self) -> None:
         """Waits out the race's seconds (RACE_WAIT_S at the most): what is worked out after it — the status text (milliseconds
         over a long record), the CSV — holds the loop the orders go out on, never while an offer may be there to take."""
@@ -1902,9 +1973,20 @@ class RuleTaker:
             return await self.control("mode", args)
         if command in {"/check", "/selfcheck"}:
             return await self.self_check()
+        if command == "/set":
+            return await self.set_command(args)
+        if command == "/reset":
+            return await self.reset_command(args)
+        if command == "/review":
+            arg = args.strip().lower()
+            days = 30 if not arg else 0 if arg in {"all", "全部"} else max(0, min(3650, int(arg))) if arg.isdigit() else 30
+            return review_text(self.review_data(days), days)
+        if command == "/settings":
+            return settings_text(self.settings_view())
         if command == "/test":
             return await self.order_test()
-        return "命令：/menu 按钮菜单｜/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜/id"
+        return ("命令：/menu 按钮菜单｜/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜"
+                "/settings 设置｜/set 设置名 数值｜/review 复盘｜/id")
 
     # -- the self-check and the order test (Telegram /check /test, the control page's buttons, rt.sh check / test) --
     async def self_check(self) -> str:

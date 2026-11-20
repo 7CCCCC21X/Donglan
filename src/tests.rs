@@ -1051,6 +1051,72 @@ fn telegram_menu_buttons_and_their_yes() {
 }
 
 #[test]
+fn telegram_settings_and_review() {
+    run(async {
+        let fake = FakeTelegram::new(|_| Ok(br#"{"ok":true,"result":true}"#.to_vec()));
+        let tg = Rc::new(crate::telegram::Telegram::new("", &[], 42, true, true, "222:commands", fake.clone()));
+        let r = rig(start() - 3_600_000, &[]);
+        let me = r.me.clone();
+        *tg.handler.borrow_mut() = Some(Rc::new(move |c: String, a: String| {
+            let me = me.clone();
+            Box::pin(async move { control::command(&me, &c, &a).await })
+        }));
+        let me = r.me.clone();
+        *tg.settings_view.borrow_mut() = Some(Rc::new(move || me.borrow().settings_view()));
+        let tap = |data: &str| {
+            json!({"update_id": 1, "callback_query": {"id": "q1", "data": data, "from": {"id": 42},
+                   "message": {"message_id": 78, "chat": {"id": 42}}}})
+        };
+        // /settings: a card, a button a field
+        tg.on_update(&json!({"update_id": 1, "message": {"text": "/settings", "chat": {"id": 42}, "from": {"id": 42}}}));
+        tg.drain(1.0).await;
+        let card = fake.last("sendMessage");
+        assert!(card["text"].as_str().unwrap().contains("⚙️ 设置"), "{card}");
+        assert!(card["reply_markup"].to_string().contains("f:RULE_MAX_DAILY_LOSS_USD"));
+        // a field: what it does, a button a preset
+        tg.on_update(&tap("f:RULE_MAX_DAILY_LOSS_USD"));
+        settle_tasks().await;
+        let field = fake.last("editMessageText");
+        assert!(
+            field["text"].as_str().unwrap().contains("今日亏损停机线") && field["text"].as_str().unwrap().contains("现在：不限")
+        );
+        assert!(field["reply_markup"].to_string().contains("s:RULE_MAX_DAILY_LOSS_USD:50"));
+        // a preset: in force, said, the card shows it ticked
+        tg.on_update(&tap("s:RULE_MAX_DAILY_LOSS_USD:50"));
+        settle_tasks().await;
+        tg.drain(1.0).await;
+        assert_eq!(r.me.borrow().loss_cap, 50.0);
+        assert!(fake.last("sendMessage")["text"].as_str().unwrap().contains("✅ 已保存"));
+        assert!(fake.last("editMessageText")["reply_markup"].to_string().contains("✅ $50"));
+        // made-up buttons: a value no button offers, a field the page has not — nothing changes
+        tg.on_update(&tap("s:RULE_MAX_DAILY_LOSS_USD:999999"));
+        tg.on_update(&tap("s:PREDICT_PRIVATE_KEY:0x00"));
+        settle_tasks().await;
+        assert_eq!(r.me.borrow().loss_cap, 50.0);
+        assert_eq!(fake.last("answerCallbackQuery")["text"], "这个按钮已经过时，重新打开设置");
+        // back to the settings file's value
+        tg.on_update(&tap("r:RULE_MAX_DAILY_LOSS_USD"));
+        settle_tasks().await;
+        assert_eq!(r.me.borrow().loss_cap, 0.0);
+        // typed: any value the settings file would take
+        assert!(control::command(&r.me, "/set", "RULE_GOLD_SHARES 120").await.contains("✅"));
+        assert_eq!(r.me.borrow().settings.shares_of("gold"), 120);
+        assert!(control::command(&r.me, "/set", "NOPE 1").await.contains("❌ 没改"));
+        assert!(control::command(&r.me, "/set", "RULE_GOLD_SHARES").await.contains("用法"));
+        assert!(control::command(&r.me, "/reset", "RULE_GOLD_SHARES").await.contains("✅"));
+        assert!(control::command(&r.me, "/settings", "").await.contains("RULE_GOLD_SHARES"));
+        // the review
+        tg.on_update(&tap("v:30"));
+        settle_tasks().await;
+        tg.drain(1.0).await;
+        assert!(fake.last("sendMessage")["text"].as_str().unwrap().contains("📈 复盘（近 30 天"));
+        history(&r, 30);
+        let text = control::command(&r.me, "/review", "all").await;
+        assert!(text.contains("📈 复盘（全部") && text.contains("按规则："), "{text}");
+    });
+}
+
+#[test]
 fn telegram_says_why_the_bot_is_silent() {
     run(async {
         let ok = || Ok(br#"{"ok":true,"result":true}"#.to_vec());

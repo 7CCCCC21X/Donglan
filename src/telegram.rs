@@ -20,8 +20,10 @@ use std::rc::Rc;
 pub const API: &str = "https://api.telegram.org";
 pub const LIMIT: usize = 3900;
 pub const CONFIRM_S: i64 = 60;
-pub const COMMANDS: [(&str, &str); 9] = [
-    ("menu", "菜单：按钮操作（状态、自检、暂停、恢复、切换模式、挂单测试）"),
+pub const COMMANDS: [(&str, &str); 11] = [
+    ("menu", "菜单：按钮操作（状态、自检、暂停、恢复、切换模式、挂单测试、设置、复盘）"),
+    ("settings", "设置：点一项改价格、份数、每天上限、停机线（/set 设置名 数值 改成任意值）"),
+    ("review", "复盘：近 30 天的场次、胜负、盈亏（/review 7、/review all）"),
     ("status", "状态（模式、下一场、抢单记录、今天的盈亏）"),
     ("rules", "同 /status（和 Railway 机器人的 /rules 一样的内容）"),
     ("check", "自检：登录、账户、余额、授权、下单接口、推送"),
@@ -36,6 +38,54 @@ pub type Handler = Rc<dyn Fn(String, String) -> LocalBoxFuture<'static, String>>
 pub type Chat = (i64, i64);
 /// A message waiting to go: the chat, the text, the bot's token, its buttons.
 pub type Outgoing = (Chat, String, String, Option<Value>);
+/// The control page's settings (console::view): the groups and their fields, each with its value, presets and help.
+pub type SettingsView = Rc<dyn Fn() -> Value>;
+
+/// The settings' fields, every group's in turn.
+fn fields(view: &Value) -> Vec<Value> {
+    view.as_array()
+        .map(|gs| gs.iter().flat_map(|g| g["fields"].as_array().cloned().unwrap_or_default()).collect())
+        .unwrap_or_default()
+}
+
+/// The values a field's buttons offer (a choice's option, a number's or a text's preset).
+fn preset_values(field: &Value) -> Vec<String> {
+    field["presets"]
+        .as_array()
+        .map(|ps| {
+            ps.iter()
+                .map(|p| match p {
+                    Value::Array(o) => o.first().map(crate::util::py_str).unwrap_or_default(),
+                    other => crate::util::py_str(other),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A field's value as the control page shows it: a choice by its option's name, 0 as "不做" / "不限", with its unit.
+fn shown(field: &Value, value: &str) -> String {
+    if field.s("kind") == "choice" {
+        let named = field["presets"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p[0].as_str() == Some(value)).and_then(|p| p[1].as_str().map(String::from)));
+        return named.unwrap_or_else(|| value.to_string());
+    }
+    if value.is_empty() {
+        return "（空）".into();
+    }
+    let zero = field.s("zero");
+    if value == "0" && !zero.is_empty() {
+        return zero;
+    }
+    match field.s("unit").as_str() {
+        "$" => format!("${value}"),
+        "" => value.to_string(),
+        "¢" => format!("{value}¢"),
+        unit => format!("{value} {unit}"),
+    }
+}
+
 /// The menu card's head (a line or two of what is in force) and the mode in force.
 pub type MenuHead = Rc<dyn Fn() -> (String, String)>;
 
@@ -124,6 +174,7 @@ pub struct Telegram {
     pub chats: Vec<Chat>,
     pub handler: RefCell<Option<Handler>>,
     pub menu_head: RefCell<Option<MenuHead>>,
+    pub settings_view: RefCell<Option<SettingsView>>,
     pub enabled: bool,
     pub queue: RefCell<VecDeque<Outgoing>>,
     wake: Event,
@@ -166,6 +217,7 @@ impl Telegram {
             chats,
             handler: RefCell::new(None),
             menu_head: RefCell::new(None),
+            settings_view: RefCell::new(None),
             queue: RefCell::new(VecDeque::new()),
             wake: Event::new(),
             sent: Cell::new(0),
@@ -264,9 +316,61 @@ impl Telegram {
                 b(tick("paper", "只记录"), "c:/mode paper"),
                 b(tick("on", "真实吃单"), "c:/mode on")
             ],
+            [b("⚙️ 设置".into(), "g:"), b("📈 复盘".into(), "v:30")],
             [b("🧪 挂单测试".into(), "c:/test"), b("🔄 刷新".into(), "m:")],
         ]);
         (format!("📋 规则吃单菜单\n{head}"), json!({"inline_keyboard": keyboard}))
+    }
+
+    fn view(&self) -> Value {
+        let view = self.settings_view.borrow().clone();
+        view.map(|f| f()).unwrap_or(Value::Null)
+    }
+
+    /// The settings: one button a field (its group, its name, its value); "•" marks a value saved here or on the page.
+    pub fn settings_card(&self) -> (String, Value) {
+        let view = self.view();
+        let mut rows = vec![];
+        for group in view.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+            for f in group["fields"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+                let mark = if f.t("saved") { "• " } else { "" };
+                rows.push(json!([{"text": format!("{mark}{}·{}：{}", group.s("group"), f.s("label"), shown(f, &f.s("value"))),
+                                  "callback_data": format!("f:{}", f.s("key"))}]));
+            }
+        }
+        rows.push(json!([{"text": "← 菜单", "callback_data": "m:"}]));
+        (
+            "⚙️ 设置：点一项看说明、换一个值（当场生效）。• = 在这里或网页上改过的（不是设置文件里的值）".into(),
+            json!({"inline_keyboard": rows}),
+        )
+    }
+
+    /// One field: its value, what it does, a button for each preset (the one in force ticked), back to the settings file's.
+    pub fn field_card(&self, key: &str) -> Option<(String, Value)> {
+        let field = fields(&self.view()).into_iter().find(|f| f.s("key") == key)?;
+        let value = field.s("value");
+        let buttons: Vec<Value> = preset_values(&field)
+            .into_iter()
+            .map(|v| {
+                let label = shown(&field, &v);
+                json!({"text": if v == value { format!("✅ {label}") } else { label }, "callback_data": format!("s:{key}:{v}")})
+            })
+            .collect();
+        let mut rows: Vec<Value> = buttons.chunks(3).map(|c| Value::Array(c.to_vec())).collect();
+        let mut last = vec![];
+        if field.t("saved") {
+            last.push(json!({"text": "恢复设置文件的值", "callback_data": format!("r:{key}")}));
+        }
+        last.push(json!({"text": "← 设置", "callback_data": "g:"}));
+        rows.push(Value::Array(last));
+        let text = format!(
+            "⚙️ {}\n现在：{}（{}）\n{}\n别的数值：发 /set {key} 数值",
+            field.s("label"),
+            shown(&field, &value),
+            if field.t("saved") { "在这里或网页上改过的" } else { "设置文件里的" },
+            field.s("help")
+        );
+        Some((text, json!({"inline_keyboard": rows})))
     }
 
     /// The self-check's Telegram line: (fine, text) — not fine says what keeps the bot from answering, and what to do.
@@ -521,6 +625,10 @@ impl Telegram {
             self.send_card((chat, thread), self.menu_card());
             return;
         }
+        if command == "/settings" && self.settings_view.borrow().is_some() {
+            self.send_card((chat, thread), self.settings_card());
+            return;
+        }
         let Some(handler) = self.handler.borrow().clone() else { return };
         // each command in a task of its own: a self-check of a few seconds holds no other command (nor the polling) up
         let me = self.clone();
@@ -558,6 +666,60 @@ impl Telegram {
             }
             me.admin_seen.set(true);
             let (kind, rest) = data.split_once(':').unwrap_or((data.as_str(), ""));
+            // the settings and the review: a field's card, a preset saved (one of the field's own), back to the file's value
+            match kind {
+                "g" => {
+                    me.answer_button(&id, "").await;
+                    me.edit_card(chat, message_id, me.settings_card()).await;
+                    return;
+                }
+                "f" => {
+                    me.answer_button(&id, "").await;
+                    let card = me.field_card(rest).unwrap_or_else(|| me.settings_card());
+                    me.edit_card(chat, message_id, card).await;
+                    return;
+                }
+                "s" | "r" => {
+                    let (key, value) = rest.split_once(':').unwrap_or((rest, ""));
+                    let field = fields(&me.view()).into_iter().find(|f| f.s("key") == key);
+                    let fine = match (&field, kind) {
+                        (Some(f), "s") => preset_values(f).iter().any(|v| v == value),
+                        (Some(f), _) => f.t("saved"),
+                        _ => false,
+                    };
+                    if !fine {
+                        me.answer_button(&id, "这个按钮已经过时，重新打开设置").await;
+                        me.edit_card(chat, message_id, me.settings_card()).await;
+                        return;
+                    }
+                    me.answer_button(&id, "收到").await;
+                    let (command, args) =
+                        if kind == "s" { ("/set", format!("{key} {value}")) } else { ("/reset", key.to_string()) };
+                    let handler = me.handler.borrow().clone();
+                    if let Some(handler) = handler {
+                        let reply = handler(command.to_string(), args).await;
+                        if !reply.is_empty() {
+                            me.reply(&reply, (chat, thread));
+                        }
+                    }
+                    let card = me.field_card(key).unwrap_or_else(|| me.settings_card());
+                    me.edit_card(chat, message_id, card).await;
+                    return;
+                }
+                "v" => {
+                    let days = if matches!(rest, "7" | "30" | "90" | "all") { rest } else { "30" };
+                    me.answer_button(&id, "收到").await;
+                    let handler = me.handler.borrow().clone();
+                    if let Some(handler) = handler {
+                        let reply = handler("/review".to_string(), days.to_string()).await;
+                        if !reply.is_empty() {
+                            me.reply(&reply, (chat, thread));
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
             let cmd = match kind {
                 "c" if button_command(rest) && needs_yes(rest) => {
                     me.answer_button(&id, "").await;

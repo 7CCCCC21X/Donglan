@@ -129,6 +129,8 @@ async fn run_service(config: Config, env: Env) -> i32 {
         }));
         let me3 = me.clone();
         *telegram.menu_head.borrow_mut() = Some(Rc::new(move || me3.borrow().menu_head()));
+        let me4 = me.clone();
+        *telegram.settings_view.borrow_mut() = Some(Rc::new(move || me4.borrow().settings_view()));
     }
     let stop = me.borrow().stop.clone();
     {

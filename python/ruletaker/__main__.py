@@ -80,6 +80,7 @@ async def run_service(config: Config, env: dict | None = None) -> int:
     taker.region = region
     telegram = make_telegram(config, taker.command)
     telegram.menu_head = taker.menu_head
+    telegram.settings_view = taker.settings_view
     taker.telegram = telegram
     status = StatusServer(taker, config.status_host, config.status_port, config.status_key)
     loop = asyncio.get_running_loop()

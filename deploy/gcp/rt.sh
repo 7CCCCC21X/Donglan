@@ -286,40 +286,58 @@ case "$cmd" in
     LOCAL="${1:-8080}"
     REMOTE_PORT="$(ssh_to "$VM" "$ZONE" --command "sudo grep -E '^STATUS_PORT=' /etc/ruletaker/ruletaker.env | tail -1 | cut -d= -f2-" 2>/dev/null | tr -d '[:space:]')"
     REMOTE_PORT="${REMOTE_PORT:-8080}"
-    echo "接通控制台通道：Cloud Shell 端口 $LOCAL → 虚拟机 $VM 的 127.0.0.1:$REMOTE_PORT（${IAP[*]:+走 Google 的 IAP 通道，}要几秒，先别点网页预览）…"
-    ssh_to "$VM" "$ZONE" -- -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L "$LOCAL:127.0.0.1:$REMOTE_PORT" &
-    tunnel=$!
+    tunnel=""
     trap 'kill_tree "$tunnel"; echo; echo "通道已关闭"; exit 0' INT TERM
-    # Told ready only once the page itself answers through it (the service's /healthz: no key needed)
-    state="down"
-    silent=0
-    for _ in $(seq 1 60); do
-      kill -0 "$tunnel" 2>/dev/null || { state="gone"; break; }
-      code=0
-      curl -s -o /dev/null --max-time 3 "http://127.0.0.1:$LOCAL/healthz" || code=$?
-      if [ "$code" = 0 ]; then state="up"; break; fi
-      if [ "$code" = 52 ] || [ "$code" = 56 ]; then  # (the tunnel is up, nothing answers behind it: a few tries, a restart's room)
-        silent=$((silent + 1))
-        if [ "$silent" -ge 10 ]; then state="noservice"; break; fi
+    open_tunnel() {  # the tunnel up and the page answering through it: 0; why not: 1 (said)
+      ssh_to "$VM" "$ZONE" -- -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+        -L "$LOCAL:127.0.0.1:$REMOTE_PORT" &
+      tunnel=$!
+      # Told ready only once the page itself answers through it (the service's /healthz: no key needed)
+      local state="down" silent=0 code
+      for _ in $(seq 1 60); do
+        kill -0 "$tunnel" 2>/dev/null || { state="gone"; break; }
+        code=0
+        curl -s -o /dev/null --max-time 3 "http://127.0.0.1:$LOCAL/healthz" || code=$?
+        if [ "$code" = 0 ]; then state="up"; break; fi
+        if [ "$code" = 52 ] || [ "$code" = 56 ]; then  # (the tunnel is up, nothing answers behind it: a few tries, a restart's room)
+          silent=$((silent + 1))
+          if [ "$silent" -ge 10 ]; then state="noservice"; break; fi
+        fi
+        sleep 1
+      done
+      case "$state" in
+        up) return 0 ;;
+        noservice) kill_tree "$tunnel"; echo "⚠️ 通道接通了，但虚拟机上的服务没有回应（bash deploy/gcp/rt.sh status 或 logs 看看）" ;;
+        gone) echo "⚠️ 通道没接通（原因见上面 gcloud / ssh 的报错；端口 $LOCAL 被占用的话换一个：bash deploy/gcp/rt.sh console 8081）" ;;
+        *) kill_tree "$tunnel"; echo "⚠️ 60 秒内通道没接通（原因见上面的报错）" ;;
+      esac
+      return 1
+    }
+    echo "接通控制台通道：Cloud Shell 端口 $LOCAL → 虚拟机 $VM 的 127.0.0.1:$REMOTE_PORT（${IAP[*]:+走 Google 的 IAP 通道，}要几秒，先别点网页预览）…"
+    first=1
+    fails=0
+    while true; do
+      if open_tunnel; then
+        fails=0
+        if [ "$first" = 1 ]; then
+          first=0
+          echo "✅ 通道已接通。现在点 Cloud Shell 工具栏右上角的「网页预览」（Web preview，方框里一个眼睛的图标）→「在端口 $LOCAL 上预览」，浏览器会打开控制台和复盘页。"
+          echo "这个窗口保持打开，看完按 Ctrl+C 关掉通道（要运行别的命令，点终端标签旁边的 + 开一个新的）。断了会自动重连。"
+          echo "（这个页面跟着 Cloud Shell 走：Cloud Shell 闲置太久会被 Google 收回，通道也就没了，回来再运行一次这个命令。随时能用的是 Telegram 机器人的 /menu。）"
+        else
+          echo "✅ $(date +%H:%M:%S) 已重新接通，刷新网页就好"
+        fi
+        wait "$tunnel" || true
+        echo "⚠️ $(date +%H:%M:%S) 通道断了，自动重连…"
+      else
+        fails=$((fails + 1))
+        if [ "$fails" -ge 5 ]; then
+          die "连续 $fails 次接不通，先停下：bash deploy/gcp/rt.sh status 看服务在不在运行，或稍后再试"
+        fi
+        echo "   $((fails * 5)) 秒后再试（第 $fails 次）…"
       fi
-      sleep 1
+      sleep $((fails * 5 + 2))
     done
-    case "$state" in
-      up) ;;
-      noservice)
-        kill_tree "$tunnel"
-        die "通道接通了，但虚拟机上的服务没有回应：bash deploy/gcp/rt.sh status 或 bash deploy/gcp/rt.sh logs 看看服务是不是在运行" ;;
-      gone)
-        die "通道没接通（原因见上面 gcloud / ssh 的报错）。端口 $LOCAL 被占用的话换一个：bash deploy/gcp/rt.sh console 8081" ;;
-      *)
-        kill_tree "$tunnel"
-        die "60 秒内通道没接通（原因见上面的报错）；再试一次，或换个端口：bash deploy/gcp/rt.sh console 8081" ;;
-    esac
-    echo "✅ 通道已接通。现在点 Cloud Shell 工具栏右上角的「网页预览」（Web preview，方框里一个眼睛的图标）→「在端口 $LOCAL 上预览」，浏览器会打开控制台和复盘页。"
-    echo "（用自己电脑上的 gcloud 也行：gcloud compute ssh $VM --zone $ZONE ${IAP[*]+${IAP[*]} }-- -N -L $LOCAL:127.0.0.1:$REMOTE_PORT，然后打开 http://localhost:$LOCAL）"
-    echo "这个窗口保持打开，看完按 Ctrl+C 关掉通道（要运行别的命令，点终端标签旁边的 + 开一个新的）。"
-    wait "$tunnel" || true
-    echo "通道断开了（Cloud Shell 超时或网络断开）：再运行 bash deploy/gcp/rt.sh console"
     ;;
   status) status_call GET /status ;;
   json) status_call GET /status.json ;;

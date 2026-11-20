@@ -115,6 +115,126 @@ fn resume(me: &Me) -> String {
     }
 }
 
+/// /set KEY VALUE: one setting changed, as the control page changes it (checked whole, in force at once, kept on disk).
+async fn set_command(me: &Me, args: &str) -> String {
+    let args = args.trim();
+    let (key, value) = args.split_once(char::is_whitespace).map(|(k, v)| (k.trim(), v.trim())).unwrap_or((args, ""));
+    if key.is_empty() || value.is_empty() {
+        return "用法：/set 设置名 数值（例：/set RULE_MAX_DAILY_LOSS_USD 30）；设置名在 /settings 里点一项就能看到".into();
+    }
+    let mut values = serde_json::Map::new();
+    values.insert(key.to_uppercase(), json!(value));
+    match save_settings(me, &values).await {
+        SaveResult::Done(m) => format!("✅ {m}"),
+        SaveResult::NotOnDisk(m) => format!("⚠️ {m}"),
+        SaveResult::Refused(m) => format!("❌ 没改：{m}"),
+    }
+}
+
+/// /reset KEY: one setting back to the settings file's value.
+async fn reset_command(me: &Me, args: &str) -> String {
+    let key = args.trim().to_uppercase();
+    if console::field(&key).is_none() {
+        return "用法：/reset 设置名（回到设置文件里的值；设置名在 /settings 里点一项就能看到）".into();
+    }
+    match reset_settings(me, Some(&[key])).await {
+        SaveResult::Done(m) => format!("✅ {m}"),
+        SaveResult::NotOnDisk(m) => format!("⚠️ {m}"),
+        SaveResult::Refused(m) => format!("❌ 没改：{m}"),
+    }
+}
+
+/// /settings as text (where no buttons can be shown): each field's value and its name for /set.
+fn settings_text(view: &Value) -> String {
+    let mut lines = vec!["⚙️ 设置（改：/set 设置名 数值；回到设置文件的值：/reset 设置名）".to_string()];
+    for group in view.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        lines.push(group.s("group"));
+        for f in group["fields"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+            lines.push(format!("· {}：{}（{}）{}", f.s("label"), f.s("value"), f.s("key"), if f.t("saved") { " •" } else { "" }));
+        }
+    }
+    lines.join("\n")
+}
+
+/// The review page's numbers as a message: the totals, each rule, the last days, the last windows.
+pub fn review_text(data: &Value, days: i64) -> String {
+    if data.t("busy") {
+        return format!("📈 {}", data.s("busy"));
+    }
+    let span = if days == 0 { "全部".to_string() } else { format!("近 {days} 天") };
+    let mut lines = vec![format!("📈 复盘（{span}，按开场时间算）")];
+    let mut any = false;
+    for (mode, name) in [("on", "真实"), ("paper", "只记录")] {
+        let t = &data["totals"][mode];
+        if t.i("windows") == 0 {
+            continue;
+        }
+        any = true;
+        let roi = t.get("roi").and_then(Value::as_f64).map(|r| format!("，收益率 {:+.1}%", r * 100.0)).unwrap_or_default();
+        let open = if t.i("open") > 0 { format!("；还有 {} 场没结算", t.i("open")) } else { String::new() };
+        lines.push(format!(
+            "{name}：买了 {} 场 {} 份，花 ${:.2}；已结算 {} 场（赢 {} 输 {}），盈亏 {}{roi}{open}",
+            t.i("windows"),
+            g(t.f("shares")),
+            t.f("cost"),
+            t.i("settled"),
+            t.i("wins"),
+            t.i("losses"),
+            money(t.f("pnl"))
+        ));
+    }
+    if !any {
+        lines.push("这段时间还没有买到过（真实和只记录都没有）".into());
+    }
+    let rules: Vec<&Value> =
+        data["rules"].as_array().map(|r| r.iter().filter(|r| r.i("windows") > 0).collect()).unwrap_or_default();
+    if !rules.is_empty() {
+        lines.push("按规则：".into());
+        for r in rules {
+            lines.push(format!(
+                "· {}（{}）：{} 场，赢 {} 输 {}，盈亏 {}",
+                r.s("name"),
+                if r.s("mode") == "on" { "真实" } else { "只记录" },
+                r.i("windows"),
+                r.i("wins"),
+                r.i("losses"),
+                money(r.f("pnl"))
+            ));
+        }
+    }
+    let daily: Vec<&Value> = data["daily"]["on"].as_array().map(|d| d.iter().rev().take(7).collect()).unwrap_or_default();
+    if !daily.is_empty() {
+        lines.push("最近几天（真实）：".into());
+        for d in daily {
+            lines.push(format!("  {}：{} 场 {}（累计 {}）", d.s("day"), d.i("windows"), money(d.f("pnl")), money(d.f("cum"))));
+        }
+    }
+    let recent: Vec<&Value> = data["recent"].as_array().map(|r| r.iter().take(5).collect()).unwrap_or_default();
+    if !recent.is_empty() {
+        lines.push("最近几场：".into());
+        for r in recent {
+            let result = match r.s("result").as_str() {
+                "up" => "涨",
+                "down" => "跌",
+                "split" => "平",
+                _ => "待结算",
+            };
+            let pnl = if r.none("pnl") { String::new() } else { format!(" {}", money(r.f("pnl"))) };
+            lines.push(format!(
+                "  {} {}{} 买{} {} 份 均价 {:.1}¢ → {result}{pnl}",
+                bj(r.i("start_ms"), true),
+                r.s("window"),
+                if r.s("mode") == "paper" { "（只记录）" } else { "" },
+                if r.s("side") == "up" { "涨" } else { "跌" },
+                g(r.f("shares")),
+                r.f("avg") * 100.0
+            ));
+        }
+    }
+    lines.push("其他天数：/review 7、/review all；图表和 CSV 在网页控制台".into());
+    lines.join("\n")
+}
+
 /// Waits out the race's seconds (RACE_WAIT_S at the most): what is worked out after it — the status text (milliseconds over a
 /// long record), the CSV — holds the one thread the orders go out on, never while an offer may be there to take.
 pub async fn after_the_race(me: &Me) {
@@ -142,9 +262,21 @@ pub async fn command(me: &Me, command: &str, args: &str) -> String {
         "/resume" => control(me, "resume", "").await,
         "/mode" => control(me, "mode", args).await,
         "/check" | "/selfcheck" => self_check(me).await,
+        "/set" => set_command(me, args).await,
+        "/reset" => reset_command(me, args).await,
+        "/review" => {
+            let days = match args.trim().to_lowercase().as_str() {
+                "" => 30,
+                "all" | "全部" => 0,
+                d => d.parse::<i64>().unwrap_or(30).clamp(0, 3650),
+            };
+            let data = me.borrow_mut().review_data(days);
+            review_text(&data, days)
+        }
+        "/settings" => settings_text(&me.borrow().settings_view()),
         "/test" => order_test(me).await,
         _ => {
-            "命令：/menu 按钮菜单｜/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜/id"
+            "命令：/menu 按钮菜单｜/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜/settings 设置｜/set 设置名 数值｜/review 复盘｜/id"
                 .into()
         }
     }

@@ -22,7 +22,10 @@ from .util import LOG, RemoteError, clean_error
 API = "https://api.telegram.org/bot{token}/{method}"
 LIMIT = 3900  # characters a message (Telegram allows 4096)
 CONFIRM_S = 60  # a button's "yes" is taken this long
-COMMANDS = [("menu", "菜单：按钮操作（状态、自检、暂停、恢复、切换模式、挂单测试）"), ("status", "状态（模式、下一场、抢单记录、今天的盈亏）"), ("rules", "同 /status（和 Railway 机器人的 /rules 一样的内容）"),
+COMMANDS = [("menu", "菜单：按钮操作（状态、自检、暂停、恢复、切换模式、挂单测试、设置、复盘）"),
+            ("settings", "设置：点一项改价格、份数、每天上限、停机线（/set 设置名 数值 改成任意值）"),
+            ("review", "复盘：近 30 天的场次、胜负、盈亏（/review 7、/review all）"),
+            ("status", "状态（模式、下一场、抢单记录、今天的盈亏）"), ("rules", "同 /status（和 Railway 机器人的 /rules 一样的内容）"),
             ("check", "自检：登录、账户、余额、授权、下单接口、推送"),
             ("test", "挂单测试：挂一张约 $1 的低价单、查到、撤掉"), ("pause", "暂停开新单（挂着的单当场撤）"),
             ("resume", "恢复"), ("mode", "切换模式：/mode off | paper | on"), ("id", "查你的用户 ID 和这个聊天的 ID")]
@@ -59,6 +62,28 @@ def confirm_card(cmd: str, now_s: int) -> tuple[str, dict]:
             {"inline_keyboard": [[{"text": "✅ 确定", "callback_data": f"y:{now_s}:{cmd}"}, {"text": "取消", "callback_data": "m:"}]]})
 
 
+def fields(view: Any) -> list[dict]:
+    """The settings' fields (the control page's console.view), every group's in turn."""
+    return [f for g in (view or []) for f in (g.get("fields") or [])]
+
+
+def preset_values(field: dict) -> list[str]:
+    """The values a field's buttons offer (a choice's option, a number's or a text's preset)."""
+    return [str(p[0]) if isinstance(p, (list, tuple)) else str(p) for p in field.get("presets") or []]
+
+
+def shown(field: dict, value: str) -> str:
+    """A field's value as the control page shows it: a choice by its option's name, 0 as "不做" / "不限", with its unit."""
+    if field.get("kind") == "choice":
+        return next((str(p[1]) for p in field.get("presets") or [] if isinstance(p, (list, tuple)) and str(p[0]) == value), value)
+    if value == "":
+        return "（空）"
+    if value == "0" and field.get("zero"):
+        return str(field["zero"])
+    unit = str(field.get("unit") or "")
+    return f"${value}" if unit == "$" else value if not unit else f"{value}¢" if unit == "¢" else f"{value} {unit}"
+
+
 def chunks(text: str, limit: int = LIMIT) -> list[str]:
     """A long text cut at line ends into messages of at most ``limit`` characters."""
     out, part = [], ""
@@ -87,6 +112,7 @@ class Telegram:
         self.chats = tuple(chats) or (((self.admin, 0),) if self.admin else ())
         self.handler = handler
         self.menu_head: Callable[[], tuple[str, str]] | None = None  # the menu card's head and the mode in force (the taker's)
+        self.settings_view: Callable[[], list] | None = None  # the control page's settings (console.view)
         self.enabled = enabled and bool(token) and bool(self.chats)
         self.bot_name = ""        # the commands' bot as Telegram names it (getMe), once it answered
         self.poll_error = ""      # the commands' last failure to be polled: "" while they come through
@@ -141,8 +167,33 @@ class Telegram:
         keyboard = [[b("📊 状态", "c:/status"), b("🔎 自检", "c:/check")],
                     [b("⏸ 暂停", "c:/pause"), b("▶️ 恢复", "c:/resume")],
                     [b(tick("off", "关"), "c:/mode off"), b(tick("paper", "只记录"), "c:/mode paper"), b(tick("on", "真实吃单"), "c:/mode on")],
+                    [b("⚙️ 设置", "g:"), b("📈 复盘", "v:30")],
                     [b("🧪 挂单测试", "c:/test"), b("🔄 刷新", "m:")]]
         return f"📋 规则吃单菜单\n{head}", {"inline_keyboard": keyboard}
+
+    def view(self) -> list:
+        return self.settings_view() if self.settings_view is not None else []
+
+    def settings_card(self) -> tuple[str, dict]:
+        """The settings: one button a field (its group, its name, its value); "•" marks a value saved here or on the page."""
+        rows = [[{"text": f"{'• ' if f.get('saved') else ''}{g['group']}·{f['label']}：{shown(f, str(f.get('value') or ''))}",
+                  "callback_data": f"f:{f['key']}"}] for g in self.view() for f in g.get("fields") or []]
+        rows.append([{"text": "← 菜单", "callback_data": "m:"}])
+        return "⚙️ 设置：点一项看说明、换一个值（当场生效）。• = 在这里或网页上改过的（不是设置文件里的值）", {"inline_keyboard": rows}
+
+    def field_card(self, key: str) -> tuple[str, dict] | None:
+        """One field: its value, what it does, a button for each preset (the one in force ticked), back to the settings file's."""
+        field = next((f for f in fields(self.view()) if f.get("key") == key), None)
+        if field is None:
+            return None
+        value = str(field.get("value") or "")
+        buttons = [{"text": ("✅ " if v == value else "") + shown(field, v), "callback_data": f"s:{key}:{v}"} for v in preset_values(field)]
+        rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+        rows.append(([{"text": "恢复设置文件的值", "callback_data": f"r:{key}"}] if field.get("saved") else [])
+                    + [{"text": "← 设置", "callback_data": "g:"}])
+        text = (f"⚙️ {field['label']}\n现在：{shown(field, value)}（{'在这里或网页上改过的' if field.get('saved') else '设置文件里的'}）\n"
+                f"{field.get('help') or ''}\n别的数值：发 /set {key} 数值")
+        return text, {"inline_keyboard": rows}
 
     def health(self) -> tuple[bool, str]:
         """The self-check's Telegram line: (fine, text) — not fine says what keeps the bot from answering, and what to do."""
@@ -307,6 +358,9 @@ class Telegram:
         if command in {"/menu", "/start"}:
             self.send_card((chat, thread), self.menu_card())
             return
+        if command == "/settings" and self.settings_view is not None:
+            self.send_card((chat, thread), self.settings_card())
+            return
         if self.handler is not None:
             # each command in a task of its own: a self-check of a few seconds holds no other command (nor the polling) up
             self.spawn(self.answer(command, args.strip(), (chat, thread)))
@@ -329,6 +383,31 @@ class Telegram:
             return
         self.admin_seen = True
         kind, _, rest = data.partition(":")
+        # the settings and the review: a field's card, a preset saved (one of the field's own), back to the file's value
+        if kind == "g":
+            await self.answer_button(query_id, "")
+            await self.edit_card(chat, message_id, self.settings_card())
+            return
+        if kind == "f":
+            await self.answer_button(query_id, "")
+            await self.edit_card(chat, message_id, self.field_card(rest) or self.settings_card())
+            return
+        if kind in {"s", "r"}:
+            key, _, value = rest.partition(":")
+            field = next((f for f in fields(self.view()) if f.get("key") == key), None)
+            fine = field is not None and (value in preset_values(field) if kind == "s" else bool(field.get("saved")))
+            if not fine:
+                await self.answer_button(query_id, "这个按钮已经过时，重新打开设置")
+                await self.edit_card(chat, message_id, self.settings_card())
+                return
+            await self.answer_button(query_id, "收到")
+            await self.answer("/set" if kind == "s" else "/reset", f"{key} {value}" if kind == "s" else key, (chat, thread))
+            await self.edit_card(chat, message_id, self.field_card(key) or self.settings_card())
+            return
+        if kind == "v":
+            await self.answer_button(query_id, "收到")
+            await self.answer("/review", rest if rest in {"7", "30", "90", "all"} else "30", (chat, thread))
+            return
         if kind == "c" and button_command(rest) and needs_yes(rest):
             await self.answer_button(query_id, "")
             await self.edit_card(chat, message_id, confirm_card(rest, int(time.time())))
