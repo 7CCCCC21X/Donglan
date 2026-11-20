@@ -4,6 +4,7 @@
 #   bash deploy/gcp/rt.sh deploy          第一次：在东京建一台虚拟机（asia-northeast1），装好、启动
 #   bash deploy/gcp/rt.sh lockdown        安全加固：封掉这台机器所有对外的入站连接，SSH 只能走 Google 的 IAP 通道（要 Google 登录）
 #   bash deploy/gcp/rt.sh unlock          解除上面的加固
+#   bash deploy/gcp/rt.sh nosa            去掉虚拟机的服务账号（早期部署的机器带着项目默认的；要停机约 1 分钟，会先问）
 #   bash deploy/gcp/rt.sh update          代码更新后：重新上传代码、编译、跑测试、重启（设置不动）
 #   RT_IMPL=python bash deploy/gcp/rt.sh update   换回 Python 版（备用）；RT_IMPL=rust 再换回 Rust 版（记录、设置都通用）
 #   bash deploy/gcp/rt.sh env [文件]      上传新的设置文件（默认 ./ruletaker.env）并重启
@@ -200,6 +201,29 @@ case "$cmd" in
     echo "✅ 加固完成：这台机器不再接受任何来自公网的连接；rt.sh 的所有命令从现在起自动走 IAP 通道（会慢一两秒）。"
     echo "   解除：bash deploy/gcp/rt.sh unlock"
     ;;
+  nosa)
+    # A VM made before the script created it without one carries the project's default service account (Editor on the whole
+    # project unless that was changed; what the machine may do with it is cut by its scopes): taken off. Only a stopped machine's
+    # can be changed — the service withdraws what rests on the book as it stops and starts again with the machine.
+    sa="$(gcloud compute instances describe "$VM" "${G[@]}" "${Z[@]}" --format='value(serviceAccounts[].email)' 2>/dev/null || true)"
+    if [ -z "$sa" ]; then
+      echo "✅ 虚拟机 $VM 本来就不带服务账号"
+      exit 0
+    fi
+    echo "虚拟机 $VM 带着服务账号 $sa。去掉它要先停机：服务会先撤掉挂着的单，约 1 分钟后随机器重新启动。"
+    echo "不要在抢单前后几分钟做（对手挂单时刻、开场前后）。"
+    read -r -p "现在停机去掉服务账号？输入 yes 确认：" ok
+    [ "$ok" = "yes" ] || die "没有改动"
+    gcloud compute instances stop "$VM" "${G[@]}" "${Z[@]}"
+    changed=0
+    if gcloud compute instances set-service-account "$VM" "${G[@]}" "${Z[@]}" --no-service-account --no-scopes; then
+      changed=1
+    fi
+    gcloud compute instances start "$VM" "${G[@]}" "${Z[@]}"   # (started again whatever happened above)
+    wait_ssh "$VM" "$ZONE"
+    remote "sudo systemctl is-active --quiet ruletaker && echo '✅ 服务已经重新运行' || echo '⚠️ 服务没起来：bash deploy/gcp/rt.sh logs 看原因'"
+    if [ "$changed" = 1 ]; then echo "✅ 服务账号已去掉：进了这台机器也拿不到操作项目的令牌"; else die "服务账号没去掉（上面有 gcloud 的报错），机器已重新启动"; fi
+    ;;
   unlock)
     gcloud compute firewall-rules delete "$RULE_DENY" "${G[@]}" --quiet 2>/dev/null || echo "（本来就没有封锁规则）"
     echo "已解除加固：SSH 端口恢复成 Google Cloud 默认的对外可连（仍然只认密钥、不认密码）。再加固：bash deploy/gcp/rt.sh lockdown"
@@ -234,7 +258,7 @@ case "$cmd" in
     fi
     echo "-- Google Cloud 项目 $PROJECT --"
     sa="$(gcloud compute instances describe "$VM" "${G[@]}" "${Z[@]}" --format='value(serviceAccounts[].email)' 2>/dev/null || true)"
-    if [ -z "$sa" ]; then echo "✅ 虚拟机不带服务账号（进了机器也拿不到操作项目的令牌）"; else echo "⚠️ 虚拟机带着服务账号 $sa"; fi
+    if [ -z "$sa" ]; then echo "✅ 虚拟机不带服务账号（进了机器也拿不到操作项目的令牌）"; else echo "⚠️ 虚拟机带着服务账号 $sa：去掉它运行 bash deploy/gcp/rt.sh nosa（停机约 1 分钟）"; fi
     if [ ${#IAP[@]} -gt 0 ]; then
       echo "✅ 已加固（lockdown）：公网连不进这台机器，SSH 只走 Google 登录的 IAP 通道"
     else

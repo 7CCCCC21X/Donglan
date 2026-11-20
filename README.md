@@ -383,6 +383,7 @@ bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
 
 - 机器**不带服务账号**：就算有人进了机器，也拿不到能操作你 Google Cloud 项目的令牌。
 - 服务只往外连（Predict、BNB 链节点、币安、Telegram），**不监听任何公网端口**；控制台只在本机 `127.0.0.1`，要看得走 SSH 通道。
+- 2026-11-19 之前部署的机器带着项目默认的服务账号（`rt.sh audit` 会提示）：`bash deploy/gcp/rt.sh nosa` 去掉它（要停机约 1 分钟，会先问；服务随机器自动重新启动）。
 - **`bash deploy/gcp/rt.sh lockdown`**（部署后运行一次）：防火墙封掉这台机器的所有入站连接，SSH 只能走 Google 的 IAP 通道——连接先过 Google 登录和项目权限检查，公网上连不到它的 22 端口。脚本先验证通道能用才封；封完验证失败会自动撤回。之后 `rt.sh` 的所有命令自动走通道（慢一两秒）；`rt.sh unlock` 解除。
 - **依赖锁定并校验哈希**：Rust 版的每个依赖包按 `Cargo.lock` 锁定版本，cargo 下载时逐个核对 SHA-256（`--locked`：锁文件和代码对不上就拒绝编译）；编译器来自 Ubuntu 官方源（有签名的软件包，不从网上下载安装脚本）。Python 版（备用）的每个包按 `python/requirements.lock` 的 SHA-256 校验，只装现成的 wheel。
 - Shielded VM（安全启动、vTPM、完整性监控）；Ubuntu 默认自动装安全更新。
