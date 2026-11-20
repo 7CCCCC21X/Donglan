@@ -188,7 +188,7 @@ bash deploy/gcp/rt.sh env
 
 1. 在 Telegram 里找 **@BotFather**，发 `/newbot`，起个名字（例如“规则吃单东京”）和用户名（必须以 `bot` 结尾），它会回一串 Token（`123456:ABC…` 这样的）。
 2. 点开新机器人的对话，按 **Start**（机器人不能主动给没和它说过话的人发消息）。
-3. 设置文件里填三行：
+3. 设置文件里填三行（在虚拟机上直接改：`bash deploy/gcp/rt.sh edit`，私钥不用经过 Cloud Shell）：
 
    ```
    TELEGRAM_COMMAND_TOKEN=新机器人的 Token
@@ -196,8 +196,8 @@ bash deploy/gcp/rt.sh env
    ADMIN_USER_ID=你的数字用户 ID
    ```
 
-   用户 ID 就是 Railway 变量里那个 `ADMIN_USER_ID`，照抄；不记得就给 Railway 的机器人发 `/id`。
-4. `bash deploy/gcp/rt.sh env` 上传并重启。几秒后新机器人会发来“🚀 规则吃单已启动”，输入框旁边的“菜单”里有全部命令。发 `/check` 试一下。
+   用户 ID 就是 Railway 变量里那个 `ADMIN_USER_ID`，照抄。不知道的话：先只填前两行（`ADMIN_USER_ID` 留 0）保存，给新机器人发 `/id`，它回“你的用户 ID：…”（`/id` 谁发都回，别的命令只认 `ADMIN_USER_ID`），再 `rt.sh edit` 填上。
+4. 编辑器里 `Ctrl+O` 回车保存、`Ctrl+X` 退出，它会先检查设置再重启。几秒后新机器人会发来“🚀 规则吃单已启动”，输入框旁边的“菜单”里有全部命令。发 `/check` 试一下。
 
 这样启动、成交、结算、告警都发到你和新机器人的私聊里，和 Railway 机器人的消息分开。
 
