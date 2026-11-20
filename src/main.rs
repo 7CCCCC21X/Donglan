@@ -216,9 +216,15 @@ async fn latency(config: Config, rounds: usize) -> i32 {
     0
 }
 
-/// ``latency`` on the API at ``base`` and the push connection at ``ws_url`` (stand-ins, for the tests): (the reads' round
-/// trips, the push delays).
-pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &str, push_seconds: f64) -> (Vec<f64>, Vec<f64>) {
+/// ``latency`` on the API at ``base`` and the push connection at ``ws_url`` (stand-ins, for the tests; the Binance index at
+/// the configuration's BINANCE_WS_URL): (the reads' round trips, Predict's push delays, Binance's).
+pub(crate) async fn probe(
+    config: Config,
+    rounds: usize,
+    base: &str,
+    ws_url: &str,
+    push_seconds: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let host = http::Url::parse(base).map(|u| u.host).unwrap_or_default();
     let headers: Vec<(&str, &str)> =
         if config.api_key.is_empty() { vec![] } else { vec![("x-api-key", config.api_key.as_str())] };
@@ -279,102 +285,148 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
         if net.edge.is_empty() { String::new() } else { format!("｜入口 {}", net.edge) }
     );
     let ws_headers: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-    let began = mono();
-    let mut lags: Vec<f64> = vec![];
-    match stream::ws_connect(ws_url, &ws_headers).await {
-        Err(e) => println!("推送连接失败：{}", clean_error(&e)),
-        Ok(ws) => {
-            let open = (mono() - began) * 1000.0;
-            let (mut sink, mut source) = ws.split();
-            let mut pings = vec![];
-            let mut book_ms = None;
-            for _ in 0..5 {
-                let began = mono();
-                if sink.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into())).await.is_err() {
-                    break;
-                }
-                let pong = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    while let Some(Ok(frame)) = source.next().await {
-                        if matches!(frame, tokio_tungstenite::tungstenite::Message::Pong(_)) {
-                            return true;
-                        }
-                    }
-                    false
-                })
-                .await;
-                if pong != Ok(true) {
-                    break;
-                }
-                pings.push((mono() - began) * 1000.0);
-                sync::sleep(0.2).await;
-            }
-            // every change of the watched books for push_seconds: its delay from Predict's own timestamp to here (the first
-            // book of a market is the book as it stands, not a change: not timed — as the service times its pushes)
-            if !watched.is_empty() {
-                use tokio_tungstenite::tungstenite::Message;
-                let began = mono();
-                let mut subscribed = true;
-                for (i, mid) in watched.iter().enumerate() {
-                    let ask = serde_json::json!({"method": "subscribe", "requestId": i + 1, "params": [format!("predictOrderbook/{mid}")]});
-                    subscribed &= sink.send(Message::text(ask.to_string())).await.is_ok();
-                }
-                println!("看 {} 个 BTC 15 分钟盘口 {push_seconds:.0} 秒，量推送延迟…", watched.len());
-                let mut seen = std::collections::HashSet::new();
-                while subscribed {
-                    let left = began + push_seconds - mono();
-                    if left <= 0.0 {
+    // Predict's push connection, and at the same time the Binance index the in-play rules buy on
+    let index_url = format!("{}/stream?streams=xauusdt@markPrice@1s", config.binance_ws);
+    let predict = async {
+        let began = mono();
+        let mut lags: Vec<f64> = vec![];
+        match stream::ws_connect(ws_url, &ws_headers).await {
+            Err(e) => println!("推送连接失败：{}", clean_error(&e)),
+            Ok(ws) => {
+                let open = (mono() - began) * 1000.0;
+                let (mut sink, mut source) = ws.split();
+                let mut pings = vec![];
+                let mut book_ms = None;
+                for _ in 0..5 {
+                    let began = mono();
+                    if sink.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into())).await.is_err() {
                         break;
                     }
-                    let Ok(Some(Ok(frame))) = tokio::time::timeout(std::time::Duration::from_secs_f64(left), source.next()).await
-                    else {
+                    let pong = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while let Some(Ok(frame)) = source.next().await {
+                            if matches!(frame, tokio_tungstenite::tungstenite::Message::Pong(_)) {
+                                return true;
+                            }
+                        }
+                        false
+                    })
+                    .await;
+                    if pong != Ok(true) {
                         break;
-                    };
-                    let Message::Text(text) = frame else { continue };
-                    let v: serde_json::Value = serde_json::from_str(text.as_str()).unwrap_or_default();
-                    if v["type"] != "M" {
-                        continue;
                     }
-                    let topic = v["topic"].as_str().unwrap_or("");
-                    if topic == stream::HEARTBEAT {
-                        let echo = serde_json::json!({"method": "heartbeat", "data": v["data"].clone()});
-                        let _ = sink.send(Message::text(echo.to_string())).await;
-                        continue;
+                    pings.push((mono() - began) * 1000.0);
+                    sync::sleep(0.2).await;
+                }
+                // every change of the watched books for push_seconds: its delay from Predict's own timestamp to here (the first
+                // book of a market is the book as it stands, not a change: not timed — as the service times its pushes)
+                if !watched.is_empty() {
+                    use tokio_tungstenite::tungstenite::Message;
+                    let began = mono();
+                    let mut subscribed = true;
+                    for (i, mid) in watched.iter().enumerate() {
+                        let ask = serde_json::json!({"method": "subscribe", "requestId": i + 1, "params": [format!("predictOrderbook/{mid}")]});
+                        subscribed &= sink.send(Message::text(ask.to_string())).await.is_ok();
                     }
-                    let Some(mid) = topic.strip_prefix("predictOrderbook/") else { continue };
-                    if book_ms.is_none() {
-                        book_ms = Some((mono() - began) * 1000.0);
-                    }
-                    let stamp = v["data"]["updateTimestampMs"].as_f64().unwrap_or(0.0);
-                    if !seen.insert(mid.to_string()) && stamp > 0.0 {
-                        let lag = now_ms() as f64 - stamp;
-                        if (-1_000.0..60_000.0).contains(&lag) {
-                            lags.push(lag);
+                    println!("看 {} 个 BTC 15 分钟盘口 {push_seconds:.0} 秒，量推送延迟…", watched.len());
+                    let mut seen = std::collections::HashSet::new();
+                    while subscribed {
+                        let left = began + push_seconds - mono();
+                        if left <= 0.0 {
+                            break;
+                        }
+                        let Ok(Some(Ok(frame))) =
+                            tokio::time::timeout(std::time::Duration::from_secs_f64(left), source.next()).await
+                        else {
+                            break;
+                        };
+                        let Message::Text(text) = frame else { continue };
+                        let v: serde_json::Value = serde_json::from_str(text.as_str()).unwrap_or_default();
+                        if v["type"] != "M" {
+                            continue;
+                        }
+                        let topic = v["topic"].as_str().unwrap_or("");
+                        if topic == stream::HEARTBEAT {
+                            let echo = serde_json::json!({"method": "heartbeat", "data": v["data"].clone()});
+                            let _ = sink.send(Message::text(echo.to_string())).await;
+                            continue;
+                        }
+                        let Some(mid) = topic.strip_prefix("predictOrderbook/") else { continue };
+                        if book_ms.is_none() {
+                            book_ms = Some((mono() - began) * 1000.0);
+                        }
+                        let stamp = v["data"]["updateTimestampMs"].as_f64().unwrap_or(0.0);
+                        if !seen.insert(mid.to_string()) && stamp > 0.0 {
+                            let lag = now_ms() as f64 - stamp;
+                            if (-1_000.0..60_000.0).contains(&lag) {
+                                lags.push(lag);
+                            }
                         }
                     }
                 }
+                let _ = sink.close().await;
+                println!(
+                    "推送连接：握手 {open:.0} ms｜ping 来回 {}{}",
+                    spread(&pings),
+                    book_ms.map(|b| format!("｜订阅到第一份盘口 {b:.0} ms")).unwrap_or_default()
+                );
+                println!(
+                    "{}",
+                    match lags.len() {
+                        0 => "推送延迟：没量到（盘口这段时间没变，或推送没连上）：换个时段再量".to_string(),
+                        n if n < 5 => format!("推送延迟：盘口只变了 {n} 次，量不准（{}）：换个时段再量", delays(&lags)),
+                        n => format!("推送延迟（Predict 盘口时间戳 → 这里收到，{n} 次盘口变化）：{}", delays(&lags)),
+                    }
+                );
             }
-            let _ = sink.close().await;
-            println!(
-                "推送连接：握手 {open:.0} ms｜ping 来回 {}{}",
-                spread(&pings),
-                book_ms.map(|b| format!("｜订阅到第一份盘口 {b:.0} ms")).unwrap_or_default()
-            );
-            println!(
-                "{}",
-                match lags.len() {
-                    0 => "推送延迟：没量到（盘口这段时间没变，或推送没连上）：换个时段再量".to_string(),
-                    n if n < 5 => format!("推送延迟：盘口只变了 {n} 次，量不准（{}）：换个时段再量", delays(&lags)),
-                    n => format!("推送延迟（Predict 盘口时间戳 → 这里收到，{n} 次盘口变化）：{}", delays(&lags)),
-                }
-            );
         }
-    }
+        lags
+    };
+    let (lags, index) = tokio::join!(predict, index_delays(&index_url, push_seconds));
+    println!(
+        "{}",
+        match &index {
+            Err(e) => format!("币安指数：连不上（{e}）——这个区域做不了盘中规则（币安合约不对部分地区开放）"),
+            Ok(xs) if xs.len() < 5 => format!("币安指数：{push_seconds:.0} 秒只收到 {} 次，量不准：换个时段再量", xs.len()),
+            Ok(xs) => format!("币安指数推送延迟（XAUUSDT 每秒一次，币安时间戳 → 这里收到，{} 次）：{}", xs.len(), delays(xs)),
+        }
+    );
     println!(
         "怎么看：抢单时卖单从出现到我们看到，就是“推送延迟”这一段（东京实测中位 66～85 ms）——比区域主要看它，越小越近。\
+         盘中规则另看“币安指数推送延迟”：换区域时它也会变，两项一起比。\
          “读盘口”代表不了下单：东京读一次约 12 ms，下单往返约 49 ms（下单在 Predict 那边走得更远）。下单往返只能用私钥量：\
-         在候选区域临时部署一台只记录模式的机器跑 rt.sh test（README“换区域”）。各区域请在同一时段量。"
+         在候选区域临时部署一台只记录模式的机器跑 rt.sh test（README“为什么是东京、怎么确认”）。各区域请在同一时段量。"
     );
-    (reads, lags)
+    (reads, lags, index.unwrap_or_default())
+}
+
+/// The index the in-play rules buy on (Binance XAUUSDT markPrice, pushed every second) for ``seconds``: each push's delay from
+/// Binance's own event time to here. Err: why no connection was had.
+async fn index_delays(url: &str, seconds: f64) -> Result<Vec<f64>, String> {
+    use tokio_tungstenite::tungstenite::Message;
+    let began = mono();
+    let mut ws = stream::ws_connect(url, &[]).await.map_err(|e| clean_error(&e))?;
+    let mut lags = vec![];
+    loop {
+        let left = began + seconds - mono();
+        if left <= 0.0 {
+            break;
+        }
+        let Ok(Some(Ok(frame))) = tokio::time::timeout(std::time::Duration::from_secs_f64(left), ws.next()).await else {
+            break;
+        };
+        let Message::Text(text) = frame else { continue };
+        let v: serde_json::Value = serde_json::from_str(text.as_str()).unwrap_or_default();
+        let data = if v["data"].is_object() { &v["data"] } else { &v };
+        let stamp = data["E"].as_f64().unwrap_or(0.0);
+        if data["e"] == "markPriceUpdate" && stamp > 0.0 {
+            let lag = now_ms() as f64 - stamp;
+            if (-1_000.0..60_000.0).contains(&lag) {
+                lags.push(lag);
+            }
+        }
+    }
+    let _ = ws.close(None).await;
+    Ok(lags)
 }
 
 async fn check(config: Config, probe_order: bool) -> i32 {

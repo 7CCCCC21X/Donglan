@@ -2203,12 +2203,32 @@ fn the_probe_times_each_pushed_change_and_answers_the_heartbeat() {
                 }
             }
         });
-        let config = Config::from_env(&env_of(&[("RULE_TAKER", "off"), ("RULE_REGION", "test")])).unwrap();
+        // Binance's index: a markPrice push every 50 ms, each 3 ms after Binance's own event time
+        let binance = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let binance_port = binance.local_addr().unwrap().port();
+        tokio::task::spawn_local(async move {
+            let (tcp, _) = binance.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            loop {
+                let e = crate::util::now_ms() - 3;
+                let frame = json!({"stream": "xauusdt@markPrice@1s",
+                                   "data": {"e": "markPriceUpdate", "E": e, "s": "XAUUSDT", "i": "4000.5"}});
+                if ws.send(Message::text(frame.to_string())).await.is_err() {
+                    break;
+                }
+                crate::sync::sleep(0.05).await;
+            }
+        });
+        let binance_url = format!("ws://127.0.0.1:{binance_port}");
+        let pairs = [("RULE_TAKER", "off"), ("RULE_REGION", "test"), ("BINANCE_WS_URL", binance_url.as_str())];
+        let config = Config::from_env(&env_of(&pairs)).unwrap();
         let base = format!("http://127.0.0.1:{api_port}/v1");
-        let (reads, lags) = crate::probe(config, 2, &base, &format!("ws://127.0.0.1:{ws_port}/ws"), 0.8).await;
+        let (reads, lags, index) = crate::probe(config, 2, &base, &format!("ws://127.0.0.1:{ws_port}/ws"), 0.8).await;
         assert_eq!(reads.len(), 2);
         assert_eq!(lags.len(), 8, "{lags:?}"); // two markets × four changes; the books as they stood (5 s old) not counted
         assert!(lags.iter().all(|l| (35.0..400.0).contains(l)), "{lags:?}");
         assert_eq!(*echoed.borrow(), vec![json!(7), json!(7)]);
+        assert!(index.len() >= 5, "{index:?}"); // (the index watched over the same seconds)
+        assert!(index.iter().all(|l| (0.0..200.0).contains(l)), "{index:?}");
     });
 }

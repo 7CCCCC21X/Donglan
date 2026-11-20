@@ -118,6 +118,30 @@ async def run_service(config: Config, env: dict | None = None) -> int:
 PUSH_SECONDS = 45.0  # how long the probe watches the pushed books for their delay
 
 
+async def index_delays(url: str, seconds: float) -> list[float]:
+    """The index the in-play rules buy on (Binance XAUUSDT markPrice, pushed every second) for ``seconds``: each push's delay
+    from Binance's own event time to here (an error when no connection is had)."""
+    import json
+    from .stream import ws_connect
+    began, lags = time.perf_counter(), []
+    ws = await ws_connect(url, {})
+    try:
+        while (left := began + seconds - time.perf_counter()) > 0:
+            try:
+                frame = json.loads(await asyncio.wait_for(ws.recv(), left))
+            except asyncio.TimeoutError:
+                break
+            data = frame.get("data") if isinstance(frame, dict) and isinstance(frame.get("data"), dict) else frame
+            stamp = data.get("E") if isinstance(data, dict) else None
+            if isinstance(data, dict) and data.get("e") == "markPriceUpdate" and isinstance(stamp, (int, float)) and stamp > 0:
+                lag = time.time() * 1000 - stamp
+                if -1_000 <= lag < 60_000:
+                    lags.append(lag)
+    finally:
+        await ws.close()
+    return lags
+
+
 def delays(xs: list[float]) -> str:
     """"中位 66 ms（最快 41，九成在 90 以内）": the push delays' median, fastest and 90th percentile."""
     v = sorted(xs)
@@ -137,7 +161,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     headers = {"x-api-key": config.api_key} if config.api_key else {}
     spread = lambda xs: f"中位 {statistics.median(xs):.1f} ms（最快 {min(xs):.1f}，最慢 {max(xs):.1f}）" if xs else "没量到"
     zone = config.region or await asyncio.to_thread(gce_zone)
-    found: dict = {"region": zone, "reads": [], "pings": [], "first": None, "ws_open": None, "ws_book": None, "lags": []}
+    found: dict = {"region": zone, "reads": [], "pings": [], "first": None, "ws_open": None, "ws_book": None, "lags": [], "index": []}
     print(f"Predict 网络延迟探测（只读，不下单）｜区域 {zone or '未知'}｜版本 {VERSION}" + ("" if config.api_key else "｜没有设置 API Key：可能被拒绝"))
     loop = asyncio.get_running_loop()
     now = int(time.time() * 1000)
@@ -176,6 +200,8 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     print((f"读盘口 {len(found['reads'])} 次（同一条连接）：{spread(found['reads'])}" if found["reads"] or not refused else
            f"读盘口被拒绝（{why}），{len(refused)} 次被拒的应答来回 {spread(refused)}——也是一次往返，可以拿来比")
           + (f"｜新建连接（TCP+TLS）{spread(connect)}" if connect else "") + (f"｜入口 {net['edge']}" if net.get("edge") else ""))
+    # Predict's push connection, and at the same time the Binance index the in-play rules buy on
+    index = asyncio.ensure_future(index_delays(f"{config.binance_ws}/stream?streams=xauusdt@markPrice@1s", push_seconds))
     try:
         began = time.perf_counter()
         ws = await ws_connect(ws_url or PREDICT_WS_URL, headers)
@@ -227,9 +253,16 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
               f"推送延迟（Predict 盘口时间戳 → 这里收到，{len(lags)} 次盘口变化）：{delays(lags)}")
     except Exception as error:
         print(f"推送连接失败：{clean_error(error) or type(error).__name__}")
+    try:
+        found["index"] = xs = await index
+        print(f"币安指数：{push_seconds:.0f} 秒只收到 {len(xs)} 次，量不准：换个时段再量" if len(xs) < 5 else
+              f"币安指数推送延迟（XAUUSDT 每秒一次，币安时间戳 → 这里收到，{len(xs)} 次）：{delays(xs)}")
+    except Exception as error:
+        print(f"币安指数：连不上（{clean_error(error) or type(error).__name__}）——这个区域做不了盘中规则（币安合约不对部分地区开放）")
     print("怎么看：抢单时卖单从出现到我们看到，就是“推送延迟”这一段（东京实测中位 66～85 ms）——比区域主要看它，越小越近。"
+          "盘中规则另看“币安指数推送延迟”：换区域时它也会变，两项一起比。"
           "“读盘口”代表不了下单：东京读一次约 12 ms，下单往返约 49 ms（下单在 Predict 那边走得更远）。下单往返只能用私钥量："
-          "在候选区域临时部署一台只记录模式的机器跑 rt.sh test（README“换区域”）。各区域请在同一时段量。")
+          "在候选区域临时部署一台只记录模式的机器跑 rt.sh test（README“为什么是东京、怎么确认”）。各区域请在同一时段量。")
     return found
 
 

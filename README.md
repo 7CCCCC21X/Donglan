@@ -318,7 +318,11 @@ bash deploy/gcp/rt.sh probe asia-east1-b         # 台湾
 bash deploy/gcp/rt.sh probe asia-northeast3-a    # 首尔
 ```
 
-每次会看 BTC 15 分钟盘口 45 秒，量每一次盘口变化从 Predict 自己的时间戳到这台机器收到用了多久。**主要比“推送延迟 … 中位”**：最小的区域离 Predict 的盘口最近，差 15 ms 以上才算数（同一区域前后两次也会差几毫秒）。“读盘口”只作参考，它代表不了下单：东京读一次 12 ms，下单往返却要 49 ms。
+每次会看 BTC 15 分钟盘口 45 秒，量每一次盘口变化从 Predict 自己的时间戳到这台机器收到用了多久；同时量币安 XAUUSDT 指数（盘中规则用的就是它）每秒一次的推送延迟。临时机器和正式那台同一规格（`e2-standard-2`），比的是同样的机器。
+
+- **主要比“推送延迟 … 中位”**：最小的区域离 Predict 的盘口最近，差 15 ms 以上才算数（同一区域前后两次也会差几毫秒）。
+- **开着盘中规则的，再看“币安指数推送延迟”**：换到 Predict 更近的区域，币安可能变远，盘前快了、盘中可能慢，两项一起比。连不上币安的区域做不了盘中规则。
+- “读盘口”只作参考，它代表不了下单：东京读一次 12 ms，下单往返却要 49 ms。
 
 **真要换区域之前，再量下单往返**（只有用私钥才量得到）：在候选区域另起一台临时机器，只记录、不吃单，做一次挂单测试，看每一步的往返：
 
@@ -331,6 +335,13 @@ shred -u ruletaker.env
 ```
 
 两台不要同时开真实吃单（会互相抢同一场）。下单往返也明显更短，再把正式那台换过去。
+
+**换更贵的机器、调内核参数有没有用**：几乎没有。实测推送一到就发单，处理只要 0.07～0.13 ms，主循环延迟中位 1.4 ms、最长 2 ms，CPU 不是瓶颈；时间全在网络上（推送 66–85 ms、下单半个往返约 25–41 ms）。
+
+- c3 / c4 独享核：最多再省零点几毫秒。而且这两种要求 gVNIC 网卡（c4 还要 Hyperdisk），现在这台不能直接改规格，得重建。
+- 绑核、`nohz_full`、`Nice`、`TimerSlackNS`：省的是微秒；改 GRUB 启动参数一旦写错，机器可能起不来。
+- `TCP_QUICKACK`、`initcwnd`、`tcp_slow_start_after_idle`、BBR：管的是“我们往外发大量数据”时的确认和窗口。我们的单是一个小包、等一个回复，推送的发送窗口由 Predict / Cloudflare 那边决定，改我们这边不起作用；改默认路由改错了，机器会断网。
+- 对时：GCP 上的 Ubuntu 默认就用 Google 自己的时间服务器（`metadata.google.internal`），`chronyc sources` 可以看到，误差在毫秒以内。
 
 **AWS 还是 Google Cloud？** 对速度起作用的是机器在哪个城市，不是哪家云：两家在东京都有机房，请求都是先到 Cloudflare 的东京入口、再到 Predict。估计两家只差一两毫秒（没有实测过），而从阿姆斯特丹搬到东京省的是几百毫秒。这个仓库的部署脚本是给 Google Cloud 写的（Cloud Shell 一条命令部署、用网页预览看控制台，自己电脑上什么都不用装）；代码本身不挑云，`deploy/gcp/vm-setup.sh` 在任何 Ubuntu 24.04 机器上都能装。建议先在 Google Cloud 东京跑起来看实测；想和 AWS 东京（`ap-northeast-1`）比，在那边开一台小机器跑同一个 `ruletaker latency`（或 Python 版的 `python -m ruletaker latency`），比“读盘口”的中位数。如果别的区域明显更小，`ZONE=那个区域 bash deploy/gcp/rt.sh deploy` 换过去（先 `delete` 旧的，或者用 `VM=ruletaker2` 另起一台再删旧的，注意不要两台同时 `on`）。
 

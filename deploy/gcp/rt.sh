@@ -384,7 +384,7 @@ case "$cmd" in
     printf '%s\n' "$keys" | grep -qE '^(RULE_API_KEY|PREDICT_API_KEY)=.+' || die "${file:-虚拟机 $VM 的设置文件}里没有填 RULE_API_KEY / PREDICT_API_KEY"
     name="rt-probe-$(date +%s)"
     echo "在 $zone 临时创建 $name 量延迟（量完删除；只带 API Key 过去，不带私钥；量网络用不着编译，临时机器上用轻量的 Python 版）…"
-    create_vm "$name" "$zone" e2-small 10GB
+    create_vm "$name" "$zone" "${PROBE_MACHINE:-$MACHINE}" 10GB  # (the same kind of machine as the service's: like with like)
     trap 'echo "删除临时虚拟机 $name…"; gcloud compute instances delete "$name" "${G[@]}" --zone "$zone" --quiet >/dev/null 2>&1 || true' EXIT
     wait_ssh "$name" "$zone"
     upload_code "$name" "$zone"
