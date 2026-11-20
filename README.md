@@ -226,7 +226,9 @@ bash deploy/gcp/rt.sh env
 2. 点 Cloud Shell 工具栏右上角的 **「网页预览」**（方框里一个眼睛的图标）→ **「在端口 8080 上预览」**。浏览器新开一页就是控制台。这个预览地址只有登录了你的 Google 账号才能打开。
 3. 看完回到 Cloud Shell 按 `Ctrl+C` 关掉通道。
 
-用自己电脑上的 gcloud 也可以：`gcloud compute ssh ruletaker --zone asia-northeast1-b -- -N -L 8080:127.0.0.1:8080`，然后打开 <http://localhost:8080>。设了 `STATUS_KEY` 时网页会先要口令（存在这个浏览器里）。
+通道开着时这个 Cloud Shell 标签页被占用，要运行别的命令点终端标签旁边的 **+** 开一个新的。Cloud Shell 端口 8080 被占用时换一个：`bash deploy/gcp/rt.sh console 8081`，预览时选“更改端口”填 8081。
+
+用自己电脑上的 gcloud 也可以（不受 Cloud Shell 超时影响）：`gcloud compute ssh ruletaker --zone asia-northeast1-b --tunnel-through-iap -- -N -L 8080:127.0.0.1:8080`，然后打开 <http://localhost:8080>（运行过 `rt.sh lockdown` 就必须带 `--tunnel-through-iap`；没加固时可以去掉）。设了 `STATUS_KEY` 时网页会先要口令（存在这个浏览器里）。
 
 **控制台**（每 3 秒刷新）：
 
