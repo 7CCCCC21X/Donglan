@@ -142,6 +142,20 @@ async def index_delays(url: str, seconds: float) -> list[float]:
     return lags
 
 
+def book_sig(data: Any) -> str:
+    """A book's top five levels a side, as text: the same book read over REST and pushed compares equal."""
+    from .predict import predict_levels
+    data = data if isinstance(data, dict) else {}
+    side = lambda key, bids: ",".join(f"{p.normalize()}@{q.normalize()}" for p, q in predict_levels(data.get(key), bids)[:5])
+    return f"{side('bids', True)}|{side('asks', False)}"
+
+
+def fastest(xs: list[float]) -> str:
+    """The fastest and the 10th percentile of a list of delays: "最快 8 ms、10% 分位 15 ms"."""
+    v = sorted(xs)
+    return f"最快 {v[0]:.0f} ms、10% 分位 {v[int((len(v) - 1) * 0.1)]:.0f} ms"
+
+
 def delays(xs: list[float]) -> str:
     """"中位 66 ms（最快 41，九成在 90 以内）": the push delays' median, fastest and 90th percentile."""
     v = sorted(xs)
@@ -163,6 +177,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     zone = config.region or await asyncio.to_thread(gce_zone)
     found: dict = {"region": zone, "reads": [], "pings": [], "first": None, "ws_open": None, "ws_book": None, "lags": [], "index": []}
     print(f"Predict 网络延迟探测（只读，不下单）｜区域 {zone or '未知'}｜版本 {VERSION}" + ("" if config.api_key else "｜没有设置 API Key：可能被拒绝"))
+    print("（约 1 分钟，其间占这把 Key 每分钟额度的四分之一左右：别在抢单时段跑）")
     loop = asyncio.get_running_loop()
     now = int(time.time() * 1000)
     slug, market_id = f"btc-updown-15m-{(now - now % 900_000) // 1000}", ""
@@ -200,8 +215,44 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     print((f"读盘口 {len(found['reads'])} 次（同一条连接）：{spread(found['reads'])}" if found["reads"] or not refused else
            f"读盘口被拒绝（{why}），{len(refused)} 次被拒的应答来回 {spread(refused)}——也是一次往返，可以拿来比")
           + (f"｜新建连接（TCP+TLS）{spread(connect)}" if connect else "") + (f"｜入口 {net['edge']}" if net.get("edge") else ""))
-    # Predict's push connection, and at the same time the Binance index the in-play rules buy on
+    # Predict's push connection, and at the same time the Binance index the in-play rules buy on, and the first watched book
+    # read over REST (a quarter of the key's budget) over the very seconds the pushes are watched: which shows a new book first
     index = asyncio.ensure_future(index_delays(f"{config.binance_ws}/stream?streams=xauusdt@markPrice@1s", push_seconds))
+    polled = watched[0] if watched else ""
+    ws_first: dict = {}
+    rest_first: dict = {}
+    poll_s = max(0.1, 60 / (0.25 * max(config.rate_per_min, 1.0)))
+    watching, watched_out = asyncio.Event(), asyncio.Event()
+
+    async def rest_reads() -> tuple[int, int, list[float]]:
+        reads = stamped = 0
+        ages: list[float] = []
+        await asyncio.wait([asyncio.ensure_future(watching.wait()), asyncio.ensure_future(watched_out.wait())],
+                           return_when=asyncio.FIRST_COMPLETED)
+        last = ""
+        while polled and not watched_out.is_set():
+            asked = time.perf_counter()
+            try:
+                answer = await loop.run_in_executor(READ_POOL, http.request_json, f"{base}/markets/{polled}/orderbook", None, 10, headers)
+            except Exception:
+                answer = None
+            if isinstance(answer, dict):
+                got = time.perf_counter()
+                reads += 1
+                data = answer.get("data") if isinstance(answer.get("data"), dict) else answer
+                stamp = data.get("updateTimestampMs")
+                stamp = stamp if isinstance(stamp, (int, float)) and stamp > 0 else 0
+                stamped += stamp > 0
+                sig = book_sig(data)
+                if sig != last:  # (a book new since the last read: when it first showed here, how old Predict says it was)
+                    rest_first.setdefault(sig, (got, not last))
+                    age = time.time() * 1000 - stamp
+                    if stamp and last and -1_000 <= age < 60_000:
+                        ages.append(age)
+                    last = sig
+            await asyncio.sleep(max(0.0, poll_s - (time.perf_counter() - asked)))
+        return reads, stamped, ages
+    rest = asyncio.ensure_future(rest_reads())
     try:
         began = time.perf_counter()
         ws = await ws_connect(ws_url or PREDICT_WS_URL, headers)
@@ -220,6 +271,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
                 for i, mid in enumerate(watched, 1):
                     await ws.send(json.dumps({"method": "subscribe", "requestId": i, "params": [f"predictOrderbook/{mid}"]}))
                 print(f"看 {len(watched)} 个 BTC 15 分钟盘口 {push_seconds:.0f} 秒，量推送延迟…")
+                watching.set()
                 seen: set = set()
                 while (left := began + push_seconds - time.perf_counter()) > 0:
                     try:
@@ -238,12 +290,15 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
                         found["ws_book"] = (time.perf_counter() - began) * 1000
                     stamp = (frame.get("data") or {}).get("updateTimestampMs")
                     mid = topic.split("/", 1)[1]
+                    if mid == polled:
+                        ws_first.setdefault(book_sig(frame.get("data")), (time.perf_counter(), not ws_first))
                     if mid in seen and isinstance(stamp, (int, float)) and stamp > 0:
                         lag = time.time() * 1000 - stamp
                         if -1_000 <= lag < 60_000:
                             found["lags"].append(lag)
                     seen.add(mid)
         finally:
+            watched_out.set()
             await ws.close()
         print(f"推送连接：握手 {found['ws_open']:.0f} ms｜ping 来回 {spread(found['pings'])}"
               + (f"｜订阅到第一份盘口 {found['ws_book']:.0f} ms" if found["ws_book"] is not None else ""))
@@ -253,12 +308,37 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
               f"推送延迟（Predict 盘口时间戳 → 这里收到，{len(lags)} 次盘口变化）：{delays(lags)}")
     except Exception as error:
         print(f"推送连接失败：{clean_error(error) or type(error).__name__}")
+    watched_out.set()
     try:
         found["index"] = xs = await index
         print(f"币安指数：{push_seconds:.0f} 秒只收到 {len(xs)} 次，量不准：换个时段再量" if len(xs) < 5 else
               f"币安指数推送延迟（XAUUSDT 每秒一次，币安时间戳 → 这里收到，{len(xs)} 次）：{delays(xs)}")
     except Exception as error:
         print(f"币安指数：连不上（{clean_error(error) or type(error).__name__}）——这个区域做不了盘中规则（币安合约不对部分地区开放）")
+    rest_count, stamped, rest_ages = await rest
+    # the same book seen both ways (neither side's first book: that is the book as it stood, not a change)
+    rest_ahead, push_ahead = [], []
+    for sig, (at_rest, first_rest) in rest_first.items():
+        if sig in ws_first and not first_rest and not ws_first[sig][1]:
+            lead = (ws_first[sig][0] - at_rest) * 1000
+            (rest_ahead if lead >= 0 else push_ahead).append(abs(lead))
+    found.update(rest_ages=rest_ages, rest_ahead=rest_ahead, push_ahead=push_ahead)
+    lags = found["lags"]
+    if rest_count:
+        print(f"REST 读盘口（每 {poll_s:.2f} 秒一次，{rest_count} 次）：" + (
+            "答复里没有盘口时间戳" if not stamped else "盘口没变过" if not rest_ages else
+            f"新盘口从 Predict 时间戳到这里 {fastest(rest_ages)}（含读的间隔，看最快的）；推送 {fastest(lags) if lags else '没量到'}"))
+        lead = lambda xs: f"{len(xs)} 次" + (f"（中位早 {statistics.median(xs):.0f} ms）" if xs else "")
+        if rest_ahead or push_ahead:
+            print(f"同一份盘口两边都看到 {len(rest_ahead) + len(push_ahead)} 次：REST 先到 {lead(rest_ahead)}，推送先到 {lead(push_ahead)}")
+        fresher = len(rest_ages) >= 5 and lags and min(rest_ages) + 15 < min(lags)
+        print("→ REST 的盘口比推送新：开场前那几秒加快 REST 读取有用（设置 RULE_VERIFY_MS，见 README）"
+              if fresher or (len(rest_ahead) >= 5 and len(rest_ahead) > 2 * len(push_ahead)) else
+              "→ REST 不比推送新：加快 REST 读取没用，RULE_VERIFY_MS 不用改" if len(rest_ages) >= 5 or len(rest_ahead) + len(push_ahead) >= 5 else
+              "→ 样本太少，判断不了：换个盘口活跃的时段再量")
+    limits = (http.HTTP_NET.get(host) or {}).get("limits", "")
+    print(f"接口限额（Predict 答复里写的）：{limits}——按它设 PREDICT_RATE_PER_MIN（留一成余量）" if limits else
+          "接口限额：Predict 的答复里没有写，按 Predict 给这把 Key 的额度设 PREDICT_RATE_PER_MIN（留一成余量）")
     print("怎么看：抢单时卖单从出现到我们看到，就是“推送延迟”这一段（东京实测中位 66～85 ms）——比区域主要看它，越小越近。"
           "盘中规则另看“币安指数推送延迟”：换区域时它也会变，两项一起比。"
           "“读盘口”代表不了下单：东京读一次约 12 ms，下单往返约 49 ms（下单在 Predict 那边走得更远）。下单往返只能用私钥量："

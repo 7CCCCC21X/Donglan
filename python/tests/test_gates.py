@@ -215,7 +215,7 @@ class LastMomentGateTest(unittest.TestCase):
                 return "已暂停（握手时按的）" if state["paused"] else ""
             gates: list = []
 
-            def fake_request(url, payload=None, timeout=15, headers=None, gate=None):
+            def fake_request(url, payload=None, timeout=15, headers=None, gate=None, trace=None):
                 gates.append(gate is not None)
                 if gate is not None:
                     state["paused"] = True  # (the pause lands while the handshake runs on this thread)

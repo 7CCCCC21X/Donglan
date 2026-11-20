@@ -7,7 +7,7 @@
 //! Credentials (x-api-key, Authorization) go to the host the request was made to and to no other (a redirect elsewhere drops
 //! them; a POST is never redirected).
 use crate::util::{RemoteError, Res, clean_error, http_error_text, mono};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::pin::Pin;
@@ -228,6 +228,19 @@ pub struct Net {
     pub connect: VecDeque<f64>,
     /// the last answer's cf-ray (its suffix names the Cloudflare site the request entered at), else its Server header
     pub edge: String,
+    /// the last answer's rate-limit headers, as sent ("x-ratelimit-limit: 600; …"), when it had any
+    pub limits: String,
+}
+
+/// What became of one request on its way (an order's): from the caller's call to the request handed to the network layer (the
+/// key's budget, a free slot), its new connection's TCP + TLS handshake (none: a warm one reused), when its bytes were all
+/// written (wall ms).
+#[derive(Default, Debug)]
+pub struct Trace {
+    pub entered: Cell<f64>,
+    pub queued_ms: Cell<f64>,
+    pub connect_ms: Cell<Option<f64>>,
+    pub wrote_wall: Cell<i64>,
 }
 
 pub struct Http {
@@ -531,7 +544,7 @@ impl Http {
 
     /// GET (or POST ``payload``: JSON bytes already encoded) and return the body; HTTP and network failures become RemoteError.
     pub async fn request(&self, url: &str, payload: Option<&[u8]>, timeout: f64, headers: &[(&str, &str)]) -> Res<Vec<u8>> {
-        self.request_gated(url, payload, timeout, headers, None).await
+        self.request_gated(url, payload, timeout, headers, None, None).await
     }
 
     /// ``request`` with an order's last check: the caller judged it just before this call; whenever this call then waits
@@ -544,6 +557,7 @@ impl Http {
         timeout: f64,
         headers: &[(&str, &str)],
         gate: Option<&dyn Fn() -> String>,
+        trace: Option<&Trace>,
     ) -> Res<Vec<u8>> {
         let timeout_d = Duration::from_secs_f64(timeout.max(0.1));
         let mut url = Url::parse(url)?;
@@ -583,9 +597,15 @@ impl Http {
             let mut waited = false;
             let (mut conn, head) = loop {
                 let (mut conn, reused) = match self.take(&key, max_idle) {
-                    Some(c) => (c, true),
+                    Some(c) => {
+                        if let Some(t) = trace {
+                            t.connect_ms.set(None);
+                        }
+                        (c, true)
+                    }
                     None => {
                         waited = true;
+                        let opened = mono();
                         // no connection (refused, unreachable, the TLS handshake failed or timed out): not a byte of the
                         // request was written — a POST is told as not sent, so an order that never left holds nothing
                         let conn = self.open(&url, timeout_d).await.map_err(|e| {
@@ -596,6 +616,9 @@ impl Http {
                                 error
                             }
                         })?;
+                        if let Some(t) = trace {
+                            t.connect_ms.set(Some((mono() - opened) * 1000.0));
+                        }
                         (conn, false)
                     }
                 };
@@ -612,6 +635,9 @@ impl Http {
                 })
                 .await
                 .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")));
+                if let (Ok(()), Some(t)) = (&sent, trace) {
+                    t.wrote_wall.set(crate::util::now_ms());
+                }
                 if let Err(e) = sent {
                     if reused {
                         self.stats.borrow_mut().retried += 1; // the server had closed it; nothing of this request was taken
@@ -636,6 +662,18 @@ impl Http {
             if let Some(edge) = head.header("cf-ray").or_else(|| head.header("server")) {
                 let mut net = self.net.borrow_mut();
                 net.entry(url.host.clone()).or_default().edge = edge.chars().take(40).collect();
+            }
+            let limits: Vec<String> = head
+                .headers
+                .iter()
+                .filter(|(k, _)| {
+                    let k = k.to_ascii_lowercase();
+                    k.contains("ratelimit") || k.contains("rate-limit")
+                })
+                .map(|(k, v)| format!("{}: {}", k.to_ascii_lowercase(), v.chars().take(40).collect::<String>()))
+                .collect();
+            if !limits.is_empty() {
+                self.net.borrow_mut().entry(url.host.clone()).or_default().limits = limits.join("; ");
             }
             let status = head.status;
             let encoding = head.header("content-encoding").unwrap_or("").to_string();
@@ -939,6 +977,24 @@ kH4quf9Jdu9x9uX2RLFwvDZb+aYhwhTYdaU3pUXXQzcms0rqJfVKpo5S\
     }
 
     #[test]
+    fn an_order_s_way_out_is_timed() {
+        run(async {
+            let (port, _) = serve(answers, 0).await;
+            let h = Http::new();
+            let url = format!("http://127.0.0.1:{port}/echo");
+            let trace = Trace::default();
+            let before = crate::util::now_ms();
+            h.request_gated(&url, Some(b"1"), 5.0, &[], None, Some(&trace)).await.unwrap();
+            assert!(trace.connect_ms.get().is_some_and(|ms| ms >= 0.0)); // (no warm one: a handshake)
+            assert!(trace.wrote_wall.get() >= before);
+            let again = Trace::default();
+            h.request_gated(&url, Some(b"2"), 5.0, &[], None, Some(&again)).await.unwrap();
+            assert_eq!(again.connect_ms.get(), None); // (the warm one reused)
+            assert!(again.wrote_wall.get() >= before);
+        });
+    }
+
+    #[test]
     fn an_error_answer_read_whole_keeps_its_connection() {
         run(async {
             let (port, log) = serve(answers, 0).await;
@@ -1004,13 +1060,13 @@ kH4quf9Jdu9x9uX2RLFwvDZb+aYhwhTYdaU3pUXXQzcms0rqJfVKpo5S\
             let url = format!("http://127.0.0.1:{port}/echo");
             let refuse = || "已暂停".to_string();
             // no pooled connection: one is made (a wait), then the order is judged again — and held, nothing written
-            let e = h.request_gated(&url, Some(b"1"), 5.0, &[], Some(&refuse)).await.unwrap_err();
+            let e = h.request_gated(&url, Some(b"1"), 5.0, &[], Some(&refuse), None).await.unwrap_err();
             assert_eq!((e.kind, e.msg.as_str()), (crate::util::Kind::NotSent, "已暂停"));
             assert!(log.borrow().iter().all(|l| !l.ends_with("POST /echo")), "{:?}", log.borrow());
             // the new connection was kept for the next request; one taken from the pool at once needs no second look (no
             // wait since the caller's own check)
             let pass = || String::new();
-            assert_eq!(h.request_gated(&url, Some(b"2"), 5.0, &[], Some(&pass)).await.unwrap(), b"POST2");
+            assert_eq!(h.request_gated(&url, Some(b"2"), 5.0, &[], Some(&pass), None).await.unwrap(), b"POST2");
             assert_eq!(h.stats.borrow().new, 1);
         });
     }

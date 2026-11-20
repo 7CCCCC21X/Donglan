@@ -295,6 +295,13 @@ impl Taker {
     }
 
     /// ``take`` within the USDT at hand and the day's cap left, whole shares.
+    /// How often the REST read beside the pushes may run (s): RULE_VERIFY_MS, never more than 80% of the key's budget
+    /// (PREDICT_RATE_PER_MIN; the default 340 ms is three a second, within the standard key's 220 a minute).
+    pub fn verify_every(&self) -> f64 {
+        let budget = if self.config.rate_per_min > 0.0 { 60.0 / (0.8 * self.config.rate_per_min) } else { 0.0 };
+        (self.config.verify_ms / 1000.0).max(budget)
+    }
+
     pub fn clamp(&self, take: Decimal, limit: Decimal, now: i64) -> Decimal {
         let mut take = take;
         if let Some(usd_left) = self.usd(None) {
@@ -961,7 +968,7 @@ async fn warm_inner(me: &Me) -> Res<()> {
 }
 
 /// The REST read beside the pushes (in the per-second stretches): one window's book at a time, the longest unread first,
-/// three a second at most and a window not again within a second. At the makers' moment the reads are that window's; a market
+/// at most every verify_every() (three a second by default) and a window not again within a second. At the makers' moment the reads are that window's; a market
 /// not yet seen open for matching is asked its status instead.
 pub fn verify_tick(me: &Me) {
     let pick = {
@@ -970,7 +977,8 @@ pub fn verify_tick(me: &Me) {
             return;
         }
         let m = mono();
-        if m - t.verify_at < VERIFY_EVERY_S || t.cooling() > 0.0 || (t.settings.mode == "on" && !t.block(0.0, None).is_empty()) {
+        let every = t.verify_every();
+        if m - t.verify_at < every || t.cooling() > 0.0 || (t.settings.mode == "on" && !t.block(0.0, None).is_empty()) {
             return;
         }
         let now = t.now();
@@ -996,7 +1004,7 @@ pub fn verify_tick(me: &Me) {
             open_to.push((slug.clone(), w.clone()));
         }
         let hot: Vec<(String, W)> = open_to.iter().filter(|(_, w)| t.hot(&w.borrow(), now)).cloned().collect();
-        let often = if hot.is_empty() { VERIFY_AGAIN_S } else { VERIFY_EVERY_S };
+        let often = if hot.is_empty() { VERIFY_AGAIN_S.max(every) } else { every };
         let pool = if hot.is_empty() { &open_to } else { &hot };
         let due = pool
             .iter()

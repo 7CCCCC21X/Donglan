@@ -109,6 +109,7 @@ class FakeApi:
             import json
             body = json.loads(body)
         self.created.append(body)
+        landed = int(time.time() * 1000)
         if self.create_delay:
             await asyncio.sleep(self.create_delay)
         if self.create_error is not None:
@@ -122,7 +123,9 @@ class FakeApi:
                                        "amountFilled": str(filled), "order": {"hash": digest}}
         if self.lose_answer:
             raise RemoteError("网络错误 (TimeoutError: timed out)")
-        return {"order_id": oid, "hash": digest}
+        # (as the real client tells it: a handshake when one was waited for, the bytes out as they landed)
+        timing = {"queued_ms": 0.0, "wrote_wall": landed, **({"connect_ms": self.connect_delay * 1000} if self.connect_delay else {})}
+        return {"order_id": oid, "hash": digest, **timing}
 
     async def remove_orders(self, ids: list[str]) -> dict:
         self.calls.append(("remove", tuple(ids)))

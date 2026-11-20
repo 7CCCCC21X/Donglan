@@ -139,6 +139,7 @@ class Config:
     rpc_url: str = ""
     fee_bps: int = 200
     rate_per_min: float = 220.0
+    verify_ms: float = 340.0  # how often the REST read beside the pushes may run at the makers' moment (RULE_VERIFY_MS)
     max_daily_loss_usd: float = 0.0
     state_db: str = "data/ruletaker.sqlite3"
     telegram_token: str = dataclasses.field(default="", repr=False)
@@ -206,6 +207,7 @@ class Config:
             rpc_url=str(e.get("BSC_RPC_URL", "")).strip().rstrip("/"),
             fee_bps=int(bounded(e, "PREDICT_FEE_BPS", 200, 0, 1000)),
             rate_per_min=float(bounded(e, "PREDICT_RATE_PER_MIN", 220, 0, 6000, float)),
+            verify_ms=float(bounded(e, "RULE_VERIFY_MS", 340, 50, 2000, float)),
             max_daily_loss_usd=float(bounded(e, "RULE_MAX_DAILY_LOSS_USD", 0, 0, 1_000_000, float)),
             state_db=str(e.get("STATE_DB", "")).strip() or "data/ruletaker.sqlite3",
             telegram_token=str(e.get("TELEGRAM_BOT_TOKEN", "")).strip(),

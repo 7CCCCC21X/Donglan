@@ -83,7 +83,6 @@ pub const WARM_MS: i64 = 60_000;
 pub const WARM_EVERY_MS: i64 = 30_000;
 pub const FAST_LOOK_S: f64 = 1.0;
 pub const FAST_STALE_S: f64 = 20.0;
-pub const VERIFY_EVERY_S: f64 = 0.34;
 pub const VERIFY_AGAIN_S: f64 = 1.0;
 pub const LIVE_START_MS: i64 = 3_000;
 pub const LIVE_FULL_MS: i64 = 60_000;

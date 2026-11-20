@@ -47,7 +47,14 @@ HTTP_NET: dict[str, dict] = {}
 
 def http_net(host: str) -> dict:
     with _POOL_LOCK:
-        return HTTP_NET.setdefault(host, {"connect": collections.deque(maxlen=40), "edge": ""})
+        return HTTP_NET.setdefault(host, {"connect": collections.deque(maxlen=40), "edge": "", "limits": ""})
+
+
+def _note_limits(host: str, headers: Any) -> None:
+    """The answer's rate-limit headers, as sent ("x-ratelimit-limit: 600; …"), kept for the host when it had any."""
+    found = [f"{k.lower()}: {str(v)[:40]}" for k, v in headers if "ratelimit" in k.lower() or "rate-limit" in k.lower()]
+    if found:
+        http_net(host)["limits"] = "; ".join(found)
 
 
 def _count(name: str) -> None:
@@ -191,7 +198,7 @@ def _read_body(response: Any, timeout: float) -> bytes:
 
 
 def request(url: str, payload: Any = None, timeout: float = 15, headers: dict[str, str] | None = None,
-            gate: Callable[[], str] | None = None) -> bytes:
+            gate: Callable[[], str] | None = None, trace: dict | None = None) -> bytes:
     """GET (or POST ``payload`` — a dict sent as JSON, or bytes already encoded) and return the body; HTTP and network failures
     become RemoteError. Over https without a proxy the connection is kept alive and reused. ``gate`` (an order's): judged again
     when the request waited before its bytes could go — a new connection's handshake, a dead one replaced: a reason refuses it
@@ -201,9 +208,11 @@ def request(url: str, payload: Any = None, timeout: float = 15, headers: dict[st
             **({"Content-Type": "application/json"} if data is not None else {}), **(headers or {})}
     split = urllib.parse.urlsplit(url)
     host = split.hostname or ""
+    if trace is not None:  # (an order's way out: the moment its thread took it up)
+        trace["started"] = time.monotonic()
     if split.scheme != "https" or not host or _proxied(host):
         return _request_urllib(url, data, hdrs, timeout, host)
-    return _request_keepalive(url, split, data, hdrs, timeout, gate)
+    return _request_keepalive(url, split, data, hdrs, timeout, gate, trace)
 
 
 def _request_urllib(url: str, data: bytes | None, hdrs: dict[str, str], timeout: float, host: str) -> bytes:
@@ -213,6 +222,7 @@ def _request_urllib(url: str, data: bytes | None, hdrs: dict[str, str], timeout:
             req.add_unredirected_header(name, value)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as response:
+            _note_limits(host, response.headers.items())
             raw = _read_body(response, timeout)
             return _inflate(raw, response.headers.get("Content-Encoding", ""))
     except urllib.error.HTTPError as error:
@@ -229,7 +239,7 @@ def _request_urllib(url: str, data: bytes | None, hdrs: dict[str, str], timeout:
 
 
 def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str, str], timeout: float,
-                       gate: Callable[[], str] | None = None) -> bytes:
+                       gate: Callable[[], str] | None = None, trace: dict | None = None) -> bytes:
     host, port = split.hostname, split.port or 443
     path = (split.path or "/") + (f"?{split.query}" if split.query else "")
     method = "POST" if data is not None else "GET"
@@ -238,6 +248,8 @@ def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str,
         max_idle = KEEPALIVE_POST_IDLE_SECONDS if data is not None else KEEPALIVE_IDLE_SECONDS
         while True:
             conn, reused = _pool_take(host, port, timeout, max_idle)
+            if trace is not None:
+                trace.pop("connect_ms", None)
             if not reused and callable(getattr(conn, "connect", None)):
                 began = time.perf_counter()
                 try:
@@ -250,11 +262,15 @@ def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str,
                         raise NotSent(f"{NOT_CONNECTED}（{_net_error(error)}），请求没有发出") from None
                     raise _net_error(error) from None
                 http_net(host)["connect"].append((time.perf_counter() - began) * 1000)
+                if trace is not None:
+                    trace["connect_ms"] = (time.perf_counter() - began) * 1000
             try:
                 if gate is not None and (waited or not reused) and (why := gate()):
                     _pool_put(host, port, conn)  # (untouched by this request: kept for the next one)
                     raise NotSent(why)
                 conn.request(method, path, body=data, headers=hdrs)
+                if trace is not None:
+                    trace["wrote_wall"] = int(time.time() * 1000)
             except (OSError, http.client.HTTPException) as error:
                 conn.close()
                 if reused:  # the server had closed it; nothing of this request was taken: once more, on a fresh one
@@ -274,6 +290,7 @@ def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str,
         status = response.status
         if edge := (response.getheader("cf-ray") or response.getheader("server")):
             http_net(host)["edge"] = str(edge)[:40]
+        _note_limits(host, response.getheaders())
         try:
             if status >= 400:
                 raw = b""

@@ -119,7 +119,7 @@ class NoConnectionTest(unittest.TestCase):
 class EmptyAnswerTest(unittest.TestCase):
     def test_an_empty_answer_is_no_word_on_an_order_with_an_id(self) -> None:
         async def go() -> None:
-            def fake_request(url, payload=None, timeout=15, headers=None, gate=None):
+            def fake_request(url, payload=None, timeout=15, headers=None, gate=None, trace=None):
                 return b'{"success": true, "data": {}}'
             api = PredictApi("https://api.predict.fun/v1", "k", None)
             api.jwt, api.jwt_exp = "t", 0

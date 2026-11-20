@@ -248,6 +248,7 @@ impl Telegram {
             timeout,
             headers: vec![],
             gate: None,
+            trace: None,
         };
         let raw = self.transport.request(req).await?;
         let answer: Value = serde_json::from_slice(&raw).map_err(|_| RemoteError::new("接口未返回有效 JSON"))?;

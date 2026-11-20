@@ -51,6 +51,8 @@ pub struct Req {
     /// an order's last check: judged again once a new connection is up (its TCP + TLS handshake is a wait the pause, the
     /// mode or the start's line may have come during), right before its bytes are written
     pub gate: Option<Gate>,
+    /// an order's timing on its way, filled in by the network layer (None: not asked for)
+    pub trace: Option<Rc<crate::http::Trace>>,
 }
 
 pub trait Transport {
@@ -64,7 +66,14 @@ impl Transport for Live {
         Box::pin(async move {
             let headers: Vec<(&str, &str)> = req.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             crate::http::http()
-                .request_gated(&req.url, req.payload.as_deref().map(Vec::as_slice), req.timeout, &headers, req.gate.as_deref())
+                .request_gated(
+                    &req.url,
+                    req.payload.as_deref().map(Vec::as_slice),
+                    req.timeout,
+                    &headers,
+                    req.gate.as_deref(),
+                    req.trace.as_deref(),
+                )
                 .await
         })
     }
@@ -226,6 +235,11 @@ pub type BeforeSend = Rc<dyn Fn(&str) -> String>;
 pub struct Created {
     pub order_id: String,
     pub hash: String,
+    /// its way out: waiting for the key's budget and a slot (ms), a new connection's handshake (ms; None: a warm one), the
+    /// moment its bytes were all written (wall ms; 0 when not known)
+    pub queued_ms: f64,
+    pub connect_ms: Option<f64>,
+    pub wrote_wall: i64,
 }
 
 pub struct PredictApi {
@@ -325,6 +339,24 @@ impl PredictApi {
         priority: bool,
         gate: Option<Gate>,
     ) -> Res<Value> {
+        self.call_traced(method, path, payload, timeout, priority, gate, None).await
+    }
+
+    /// ``call``, its way out timed in ``trace`` (an order's).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_traced(
+        &self,
+        method: &str,
+        path: &str,
+        payload: Option<Rc<Vec<u8>>>,
+        timeout: f64,
+        priority: bool,
+        gate: Option<Gate>,
+        trace: Option<Rc<crate::http::Trace>>,
+    ) -> Res<Value> {
+        if let Some(t) = &trace {
+            t.entered.set(mono());
+        }
         let left = self.cooling();
         if left > 0.0 {
             return Err(Self::cooling_error(left));
@@ -336,7 +368,7 @@ impl PredictApi {
             self.writes_inflight.set(self.writes_inflight.get() + 1);
             let result = async {
                 let _slot = self.gate.acquire().await.map_err(|_| RemoteError::new("closed"))?;
-                self.send(path, payload, timeout, gate).await
+                self.send(path, payload, timeout, gate, trace).await
             }
             .await;
             self.writes_inflight.set(self.writes_inflight.get() - 1);
@@ -344,7 +376,7 @@ impl PredictApi {
         } else {
             let _read = self.read_gate.acquire().await.map_err(|_| RemoteError::new("closed"))?;
             let _slot = self.gate.acquire().await.map_err(|_| RemoteError::new("closed"))?;
-            self.send(path, payload, timeout, gate).await?
+            self.send(path, payload, timeout, gate, trace).await?
         };
         push_cap(&mut self.trips.borrow_mut(), (method.to_string(), (mono() - began) * 1000.0), 300);
         self.last_ok.set(mono());
@@ -367,7 +399,14 @@ impl PredictApi {
         Ok(answer)
     }
 
-    async fn send(&self, path: &str, payload: Option<Rc<Vec<u8>>>, timeout: f64, gate: Option<Gate>) -> Res<(Vec<u8>, f64)> {
+    async fn send(
+        &self,
+        path: &str,
+        payload: Option<Rc<Vec<u8>>>,
+        timeout: f64,
+        gate: Option<Gate>,
+        trace: Option<Rc<crate::http::Trace>>,
+    ) -> Res<(Vec<u8>, f64)> {
         let left = self.cooling();
         if left > 0.0 {
             return Err(Self::cooling_error(left));
@@ -383,7 +422,10 @@ impl PredictApi {
             }
         }
         let began = mono();
-        let req = Req { url: format!("{}{path}", self.base), payload, timeout, headers: self.headers(), gate };
+        if let Some(t) = &trace {
+            t.queued_ms.set((began - t.entered.get()) * 1000.0);
+        }
+        let req = Req { url: format!("{}{path}", self.base), payload, timeout, headers: self.headers(), gate, trace };
         match self.transport.request(req).await {
             Ok(raw) => Ok((raw, began)),
             Err(error) => {
@@ -409,15 +451,30 @@ impl PredictApi {
         priority: bool,
         gate: Option<Gate>,
     ) -> Res<Value> {
+        self.authed_traced(method, path, payload, timeout, priority, gate, None).await
+    }
+
+    /// ``authed``, its way out timed in ``trace`` (an order's; a retry after a refused sign-in times the retry).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn authed_traced(
+        &self,
+        method: &str,
+        path: &str,
+        payload: Option<Rc<Vec<u8>>>,
+        timeout: f64,
+        priority: bool,
+        gate: Option<Gate>,
+        trace: Option<Rc<crate::http::Trace>>,
+    ) -> Res<Value> {
         self.ensure_auth().await?;
         let used = self.jwt.borrow().clone();
-        match self.call(method, path, payload.clone(), timeout, priority, gate.clone()).await {
+        match self.call_traced(method, path, payload.clone(), timeout, priority, gate.clone(), trace.clone()).await {
             Err(error) if error.status() == 401 && self.wallet.is_some() => {
                 if *self.jwt.borrow() == used {
                     self.jwt.borrow_mut().clear(); // only the token that was refused is dropped
                 }
                 self.ensure_auth().await?;
-                self.call(method, path, payload, timeout, priority, gate).await
+                self.call_traced(method, path, payload, timeout, priority, gate, trace).await
             }
             other => other,
         }
@@ -506,7 +563,8 @@ impl PredictApi {
     /// POST /orders -> the order's id and hash; ``body`` the request's bytes made beforehand, ``gate`` its last check (a rule
     /// order's before_send, the order test's own). A 2xx answer without an order id is no refusal: the order may be there.
     pub async fn create_order(&self, body: Rc<Vec<u8>>, gate: Option<Gate>) -> Res<Created> {
-        let answer = self.authed("POST", "/orders", Some(body), ORDER_TIMEOUT, true, gate).await?;
+        let trace = Rc::new(crate::http::Trace::default());
+        let answer = self.authed_traced("POST", "/orders", Some(body), ORDER_TIMEOUT, true, gate, Some(trace.clone())).await?;
         let shown = || brief_error(&serde_json::to_string(&answer).unwrap_or_default(), 120);
         let Some(data) = answer.get("data").and_then(Value::as_object) else {
             return Err(RemoteError::new(format!("下单应答没有可读的内容（订单可能已被接受，按哈希核对）：{}", shown())));
@@ -522,7 +580,13 @@ impl PredictApi {
         }
         let hash =
             [data.get("orderHash"), data.get("hash")].into_iter().flatten().find(|v| truthy(v)).map(py_str).unwrap_or_default();
-        Ok(Created { order_id, hash })
+        Ok(Created {
+            order_id,
+            hash,
+            queued_ms: trace.queued_ms.get(),
+            connect_ms: trace.connect_ms.get(),
+            wrote_wall: trace.wrote_wall.get(),
+        })
     }
 
     pub async fn remove_orders(&self, ids: &[String]) -> Res<(Vec<String>, Vec<String>)> {
@@ -841,6 +905,28 @@ pub fn predict_resolution(market: &Obj) -> Option<Resolution> {
     Some(Resolution { index: Some(index), name: names[index].clone(), split: false, how: "resolution" })
 }
 
+/// A market's settings that hold back the orders that take (a speed bump: whatever field names a delay or a speed bump,
+/// at any depth), as "speedBump.delayMs=500" — the race is another one where Predict delays the takers.
+pub fn delay_fields(market: &Obj) -> Vec<String> {
+    fn walk(prefix: &str, value: &Value, depth: usize, named: bool, out: &mut Vec<String>) {
+        match value {
+            Value::Object(o) if depth < 4 => {
+                for (k, v) in o {
+                    let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                    let low = k.to_ascii_lowercase();
+                    walk(&path, v, depth + 1, named || low.contains("delay") || low.contains("speedbump"), out);
+                }
+            }
+            Value::Null | Value::Object(_) | Value::Array(_) => {}
+            v if named => out.push(format!("{prefix}={}", py_str(v).chars().take(40).collect::<String>())),
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    walk("", &Value::Object(market.clone()), 0, false, &mut out);
+    out
+}
+
 /// The indexSet of the outcome a market settled on, numbered as parse_market numbers its outcomes; None for a split.
 pub fn won_index_set(market: &Obj, res: &Resolution) -> Option<i64> {
     let i = res.index?;
@@ -1083,6 +1169,7 @@ impl Chain {
             timeout: RPC_TIMEOUT,
             headers: vec![],
             gate: None,
+            trace: None,
         };
         let raw = match self.transport.request(req).await {
             Ok(r) => r,

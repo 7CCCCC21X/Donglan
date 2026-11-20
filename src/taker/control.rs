@@ -447,6 +447,25 @@ pub async fn self_check(me: &Me) -> String {
                     }
                 }
             }
+            // a speed bump Predict puts on the takers of a market followed: the race is then decided at Predict, not here
+            let delays: std::collections::BTreeSet<String> = me
+                .borrow()
+                .track
+                .values()
+                .filter_map(|w| {
+                    let b = w.borrow();
+                    let fields = crate::predict::delay_fields(b.market.as_ref()?);
+                    (!fields.is_empty()).then(|| format!("{}：{}", b.rule().name, fields.join("、")))
+                })
+                .collect();
+            if delays.is_empty() {
+                r.ok("吃单延迟：跟踪的市场没有这类设置（speedBump / delay）");
+            } else {
+                r.warn(format!(
+                    "Predict 对这些市场的吃单有延迟设置（吃单的单要在 Predict 那边等这么久才撮合）：{}",
+                    delays.into_iter().collect::<Vec<_>>().join("；")
+                ));
+            }
             if api.fresh() {
                 let body = Rc::new(br#"{"data":{}}"#.to_vec());
                 match api.authed("POST", "/orders", Some(body), crate::predict::API_TIMEOUT, true, None).await {

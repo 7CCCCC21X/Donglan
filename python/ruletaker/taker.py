@@ -45,7 +45,7 @@ from . import console
 from .config import Config, RuleSettings
 from .predict import (API_BASES, PREDICT_REST, RPC_URLS, Chain, NotSent, OrderRejected, PredictApi, book_up_first,
                       category_market, http_status, market_start_price, order_fill, order_final, order_price,
-                      outcome_for_side, parse_market, predict_resolution, won_index_set, DUPLICATE_WORDS, DOWN_WORDS,
+                      outcome_for_side, parse_market, predict_resolution, won_index_set, delay_fields, DUPLICATE_WORDS, DOWN_WORDS,
                       UP_WORDS)  # noqa: F401
 from .rules import (FINAL_STATES, MARKET_NAMES, MODES, NEVER_PLACED, PREFIX, RACES_SHOWN, RULE_OF, RULES, WATCH, Rule, avg_price,
                     claims, cost, course_part, course_speed, course_stats, filled, held, in_flight, lead_note, live_price_of,
@@ -91,7 +91,7 @@ WARM_MS = 60_000              # the per-second hours are prepared for this long 
 WARM_EVERY_MS = 30_000        # ...and the preparation renewed this often through them
 FAST_LOOK_S = 1.0
 FAST_STALE_S = 20.0
-VERIFY_EVERY_S, VERIFY_AGAIN_S = 0.34, 1.0  # the REST reads beside the pushes: at most three a second, a window not again within a second
+VERIFY_AGAIN_S = 1.0  # the REST reads beside the pushes: a window not again within a second (verify_every(): how often at all)
 LIVE_START_MS = 3_000         # 盘中: not in the window's first moments (the start line is read then)...
 LIVE_FULL_MS = 60_000         # ...in its first minute no dearer than before the window...
 LIVE_STOP_MS = 15_000         # ...nothing placed this close to its end
@@ -1007,7 +1007,8 @@ class RuleTaker:
         if self.verifying is not None and not self.verifying.done():
             return
         mono = time.monotonic()
-        if mono - self.verify_at < VERIFY_EVERY_S or self.cooling() > 0 or (self.settings.mode == "on" and self.block(0.0)):
+        every = self.verify_every()
+        if mono - self.verify_at < every or self.cooling() > 0 or (self.settings.mode == "on" and self.block(0.0)):
             return
         now = self.now()
         open_to = [(slug, w) for slug, w in self.track.items()
@@ -1016,7 +1017,7 @@ class RuleTaker:
                    and not self.finished(slug, RULE_OF[w["rule"]], phase == "live")
                    and not (phase == "live" and self.live_guard(slug, RULE_OF[w["rule"]], now))]
         hot = [(slug, w) for slug, w in open_to if self.hot(w, now)]
-        often = VERIFY_EVERY_S if hot else VERIFY_AGAIN_S
+        often = every if hot else max(VERIFY_AGAIN_S, every)
         due = [(w.get("rest_at", 0.0), slug) for slug, w in (hot or open_to) if mono - w.get("rest_at", 0.0) >= often]
         if not due:
             return
@@ -1082,6 +1083,12 @@ class RuleTaker:
         self.verify_ms.append(int((time.monotonic() - asked) * 1000))
         if self.stream.merge(mid, bids, asks, asked):
             self.verify_diffs += 1
+
+    def verify_every(self) -> float:
+        """How often the REST read beside the pushes may run (s): RULE_VERIFY_MS, never more than 80% of the key's budget
+        (PREDICT_RATE_PER_MIN; the default 340 ms is three a second, within the standard key's 220 a minute)."""
+        budget = 60 / (0.8 * self.config.rate_per_min) if self.config.rate_per_min > 0 else 0.0
+        return max(self.config.verify_ms / 1000, budget)
 
     def plan(self, now: int) -> None:
         """The windows of the enabled rules from now to a day on; a window of a rule switched off is dropped, and so is one this
@@ -1676,6 +1683,9 @@ class RuleTaker:
         try:
             result = await self.api.create_order(body, order["hash"])
             order.update(id=str(result.get("order_id") or ""), state="open", next_ms=self.now() + FILL_READ_MS)
+            # its way out, in parts: the wait for the key's budget, a slot and a thread, a new connection (if one was
+            # needed), and the moment its bytes were all written
+            order.update({k: result[k] for k in ("queued_ms", "connect_ms", "wrote_wall") if k in result})
         except NotSent as error:
             order.update(state="not_sent", error=clean_error(error))
             order.pop("sent_wall", None)
@@ -2188,6 +2198,13 @@ class RuleTaker:
                             no(f"授权：{name} 没有 USDT 额度（跟踪的市场要用：在 Predict 网站用这个账户交易一次）")
                     except Exception as error:
                         warn(f"授权：{name} 没读到（{clean_error(error) or type(error).__name__}）")
+            # a speed bump Predict puts on the takers of a market followed: the race is then decided at Predict, not here
+            delays = sorted({f"{RULE_OF[w['rule']].name}：{'、'.join(bump)}" for w in self.track.values()
+                             if w.get("market") is not None and (bump := delay_fields(w["market"]))})
+            if delays:
+                warn("Predict 对这些市场的吃单有延迟设置（吃单的单要在 Predict 那边等这么久才撮合）：" + "；".join(delays))
+            else:
+                ok("吃单延迟：跟踪的市场没有这类设置（speedBump / delay）")
             if self.api.fresh() if hasattr(self.api, "fresh") else False:
                 try:
                     await self.api.authed("POST", "/orders", {"data": {}}, priority=True)

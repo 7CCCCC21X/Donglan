@@ -882,6 +882,15 @@ pub async fn send_order(
                 o.insert("id".into(), json!(created.order_id));
                 o.insert("state".into(), json!("open"));
                 o.insert("next_ms".into(), json!(now + FILL_READ_MS));
+                // its way out, in parts: the wait for the key's budget and a slot, a new connection (if one was needed),
+                // and the moment its bytes were all written
+                o.insert("queued_ms".into(), jf(round_to(created.queued_ms, 1)));
+                if let Some(c) = created.connect_ms {
+                    o.insert("connect_ms".into(), jf(round_to(c, 1)));
+                }
+                if created.wrote_wall > 0 {
+                    o.insert("wrote_wall".into(), json!(created.wrote_wall));
+                }
             }
             Err(error) if error.kind == Kind::NotSent => {
                 o.insert("state".into(), json!("not_sent"));

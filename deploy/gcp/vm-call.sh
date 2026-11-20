@@ -92,7 +92,7 @@ case "${1:-}" in
     echo "$port"
     ;;
   probe-keys)
-    for name in RULE_API_KEY PREDICT_API_KEY PREDICT_CHAIN_ID; do
+    for name in RULE_API_KEY PREDICT_API_KEY PREDICT_CHAIN_ID PREDICT_RATE_PER_MIN; do
       value="$(setting "$name")"
       [ -z "$value" ] || printf '%s=%s\n' "$name" "$value"
     done

@@ -234,6 +234,13 @@ impl Transport for FakePredict {
                             }
                         }
                     }
+                    if let Some(t) = &req.trace {
+                        // (as the real client tells it: a handshake when one was waited for, the bytes out as they land)
+                        if self.connect_delay.get() > 0.0 {
+                            t.connect_ms.set(Some(self.connect_delay.get() * 1000.0));
+                        }
+                        t.wrote_wall.set(crate::util::now_ms());
+                    }
                     self.created.borrow_mut().push(req.payload.as_deref().cloned().unwrap_or_default()); // (as the request lands)
                     if self.create_delay.get() > 0.0 {
                         crate::sync::sleep(self.create_delay.get()).await;
@@ -2155,22 +2162,33 @@ fn the_console_refuses_on_the_head_and_takes_no_flood() {
     });
 }
 
-/// The probe's stand-in API: a quarter hour's BTC market (and the next one's) and an empty book.
+/// The probe's stand-in book: the state Predict has now (its number, when it changed); the push of each state goes out 40 ms
+/// after it changed, so a REST read in between shows it first.
+static PROBE_STATE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+static PROBE_STAMP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn probe_book(k: i64, stamp: i64) -> Value {
+    json!({"updateTimestampMs": stamp, "bids": [["0.40", "10"]], "asks": [[format!("0.{}", 50 + k.rem_euclid(40)), "5"]]})
+}
+
+/// The probe's stand-in API: a quarter hour's BTC market (and the next one's), and the book as it stands.
 fn probe_api(_method: &str, path: &str, _body: &[u8]) -> Vec<u8> {
+    use std::sync::atomic::Ordering::SeqCst;
     let data = match path.rsplit_once("btc-updown-15m-") {
         Some((_, quarter)) => {
             let q: i64 = quarter.parse().unwrap_or(0);
             json!({"markets": [{"id": format!("m{}", q % 1800 / 900), "conditionId": "0x01", "title": "BTC Up or Down"}]})
         }
-        None => json!({"bids": [], "asks": []}),
+        None => probe_book(PROBE_STATE.load(SeqCst), PROBE_STAMP.load(SeqCst)),
     };
     let body = json!({"success": true, "data": data}).to_string();
-    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
+    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-RateLimit-Limit: 600\r\n\r\n{body}", body.len()).into_bytes()
 }
 
 #[test]
 fn the_probe_times_each_pushed_change_and_answers_the_heartbeat() {
     use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::Ordering::SeqCst;
     use tokio_tungstenite::tungstenite::Message;
     run(async {
         let (api_port, _) = crate::http::tests::serve(probe_api, 0).await;
@@ -2181,25 +2199,37 @@ fn the_probe_times_each_pushed_change_and_answers_the_heartbeat() {
         tokio::task::spawn_local(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            while let Some(Ok(frame)) = ws.next().await {
-                let Message::Text(text) = frame else { continue };
+            let send = |v: Value| Message::text(v.to_string());
+            let mut topics = vec![];
+            // both subscriptions: each answered, its book as it stands (5 s old), a heartbeat
+            while topics.len() < 2 {
+                let Some(Ok(frame)) = ws.next().await else { return };
+                let Message::Text(text) = frame else { continue }; // (the probe's pings first: answered by the library)
                 let msg: Value = serde_json::from_str(text.as_str()).unwrap();
-                if msg["method"] == "heartbeat" {
-                    heard.borrow_mut().push(msg["data"].clone());
-                    continue;
-                }
                 let topic = msg["params"][0].as_str().unwrap_or("").to_string();
-                let send = |v: Value| Message::text(v.to_string());
-                let now = || crate::util::now_ms() as f64;
                 ws.send(send(json!({"type": "R", "requestId": msg["requestId"], "success": true}))).await.unwrap();
-                ws.send(send(json!({"type": "M", "topic": topic, "data": {"updateTimestampMs": now() - 5000.0}}))).await.unwrap();
+                let old = probe_book(-1, crate::util::now_ms() - 5000);
+                ws.send(send(json!({"type": "M", "topic": topic, "data": old}))).await.unwrap();
                 ws.send(send(json!({"type": "M", "topic": "heartbeat", "data": 7}))).await.unwrap();
-                for _ in 0..4 {
-                    // four changes, each pushed 40 ms after Predict's own stamp
-                    crate::sync::sleep(0.02).await;
-                    ws.send(send(json!({"type": "M", "topic": topic, "data": {"updateTimestampMs": now() - 40.0}})))
-                        .await
-                        .unwrap();
+                topics.push(topic);
+            }
+            // six changes: each pushed to both 40 ms after Predict has it (a REST read in between shows it first)
+            for k in 0..6 {
+                let stamp = crate::util::now_ms();
+                PROBE_STAMP.store(stamp, SeqCst);
+                PROBE_STATE.store(k, SeqCst);
+                crate::sync::sleep(0.04).await;
+                for topic in &topics {
+                    ws.send(send(json!({"type": "M", "topic": topic, "data": probe_book(k, stamp)}))).await.unwrap();
+                }
+                crate::sync::sleep(0.06).await;
+            }
+            while let Ok(Some(Ok(frame))) = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
+                if let Message::Text(text) = frame {
+                    let msg: Value = serde_json::from_str(text.as_str()).unwrap_or_default();
+                    if msg["method"] == "heartbeat" {
+                        heard.borrow_mut().push(msg["data"].clone());
+                    }
                 }
             }
         });
@@ -2220,15 +2250,84 @@ fn the_probe_times_each_pushed_change_and_answers_the_heartbeat() {
             }
         });
         let binance_url = format!("ws://127.0.0.1:{binance_port}");
-        let pairs = [("RULE_TAKER", "off"), ("RULE_REGION", "test"), ("BINANCE_WS_URL", binance_url.as_str())];
+        let pairs = [
+            ("RULE_TAKER", "off"),
+            ("RULE_REGION", "test"),
+            ("BINANCE_WS_URL", binance_url.as_str()),
+            ("PREDICT_RATE_PER_MIN", "6000"), // (REST read every 0.1 s)
+        ];
         let config = Config::from_env(&env_of(&pairs)).unwrap();
         let base = format!("http://127.0.0.1:{api_port}/v1");
-        let (reads, lags, index) = crate::probe(config, 2, &base, &format!("ws://127.0.0.1:{ws_port}/ws"), 0.8).await;
-        assert_eq!(reads.len(), 2);
-        assert_eq!(lags.len(), 8, "{lags:?}"); // two markets × four changes; the books as they stood (5 s old) not counted
-        assert!(lags.iter().all(|l| (35.0..400.0).contains(l)), "{lags:?}");
+        let p = crate::probe(config, 2, &base, &format!("ws://127.0.0.1:{ws_port}/ws"), 1.0).await;
+        assert_eq!(p.reads.len(), 2);
+        assert_eq!(p.lags.len(), 12, "{:?}", p.lags); // two markets × six changes; the books as they stood (5 s old) not counted
+        assert!(p.lags.iter().all(|l| (35.0..400.0).contains(l)), "{:?}", p.lags);
         assert_eq!(*echoed.borrow(), vec![json!(7), json!(7)]);
-        assert!(index.len() >= 5, "{index:?}"); // (the index watched over the same seconds)
-        assert!(index.iter().all(|l| (0.0..200.0).contains(l)), "{index:?}");
+        assert!(p.index.len() >= 5, "{:?}", p.index); // (the index watched over the same seconds)
+        assert!(p.index.iter().all(|l| (0.0..200.0).contains(l)), "{:?}", p.index);
+        // REST beside the pushes: the changes it caught in their 40 ms are ahead by at most that; the others behind
+        assert!(p.rest_ahead.len() + p.push_ahead.len() >= 3, "{p:?}");
+        assert!(!p.rest_ahead.is_empty(), "{p:?}");
+        assert!(p.rest_ahead.iter().all(|l| *l <= 60.0), "{p:?}");
+        assert!(!p.rest_ages.is_empty() && p.rest_ages.iter().all(|a| (0.0..200.0).contains(a)), "{p:?}");
+        assert_eq!(crate::http::http().net_of("127.0.0.1").limits, "x-ratelimit-limit: 600");
+    });
+}
+
+#[test]
+fn the_rest_reads_at_the_moment_keep_within_the_key_s_budget() {
+    let every = |pairs: &[(&str, &str)]| rig(start(), pairs).me.borrow().verify_every();
+    assert!((every(&[]) - 60.0 / (0.8 * 220.0)).abs() < 1e-9); // three a second on the standard key, as before
+    assert!((every(&[("RULE_VERIFY_MS", "100")]) - 60.0 / (0.8 * 220.0)).abs() < 1e-9); // (asked faster: the budget holds it)
+    assert!((every(&[("RULE_VERIFY_MS", "100"), ("PREDICT_RATE_PER_MIN", "1100")]) - 0.1).abs() < 1e-9);
+    assert!((every(&[("PREDICT_RATE_PER_MIN", "1100")]) - 0.34).abs() < 1e-9); // (a bigger budget alone changes nothing)
+}
+
+#[test]
+fn an_order_s_round_trip_is_told_in_parts() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.create_delay.set(0.03); // (Predict takes 30 ms to answer)
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        let o = r.order(0);
+        assert!(o.t("wrote_wall") && !o.t("connect_ms") && o.f("queued_ms") < 5.0, "{o:?}");
+        assert!(o.i("answered_wall") - o.i("wrote_wall") >= 25, "{o:?}");
+        let status = r.me.borrow().status();
+        assert!(status.contains("［排队 0 ms、复用连接、写出→应答"), "{status}");
+        // a new connection on the way: its handshake told
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.connect_delay.set(0.02);
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        assert_eq!(r.order(0).f("connect_ms"), 20.0);
+        assert!(r.me.borrow().status().contains("新建连接 20 ms"), "{}", r.me.borrow().status());
+    });
+}
+
+#[test]
+fn the_check_tells_a_speed_bump_on_a_market_followed() {
+    let market: Obj = json!({"id": "1", "speedBump": {"delayMs": 500, "enabled": true}, "liveDelayMs": 3000, "title": "x",
+                             "outcomes": [{"name": "Up", "delay": null}]})
+    .as_object()
+    .cloned()
+    .unwrap();
+    let mut found = crate::predict::delay_fields(&market);
+    found.sort();
+    assert_eq!(found, vec!["liveDelayMs=3000", "speedBump.delayMs=500", "speedBump.enabled=True"]); // (as Python writes it)
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        let text = control::self_check(&r.me).await;
+        assert!(text.contains("✅ 吃单延迟：跟踪的市场没有这类设置"), "{text}");
+        {
+            let t = r.me.borrow();
+            let mut w = t.track.get(&slug_of(start())).unwrap().borrow_mut();
+            w.market.as_mut().unwrap().insert("speedBump".into(), json!({"delayMs": 500}));
+        }
+        let text = control::self_check(&r.me).await;
+        assert!(text.contains("⚠️ Predict 对这些市场的吃单有延迟设置") && text.contains("speedBump.delayMs=500"), "{text}");
     });
 }

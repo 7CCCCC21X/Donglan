@@ -375,7 +375,7 @@ case "$cmd" in
     # service's own VM as the service reads it, and passed straight on (never on disk here); or from a file named here.
     if [ -n "$file" ]; then
       [ -f "$file" ] || die "找不到 $file（要用里面的 API Key 读 Predict）"
-      keys="$(grep -E '^(RULE_API_KEY|PREDICT_API_KEY|PREDICT_CHAIN_ID)=' "$file" || true)"
+      keys="$(grep -E '^(RULE_API_KEY|PREDICT_API_KEY|PREDICT_CHAIN_ID|PREDICT_RATE_PER_MIN)=' "$file" || true)"
     else
       iap_mode
       echo "从虚拟机 $VM 的设置文件读 API Key（只读这一项，不读私钥）…"

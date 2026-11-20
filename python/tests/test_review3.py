@@ -296,3 +296,43 @@ class ConsoleServerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MeasureTest(unittest.TestCase):
+    def test_an_order_s_round_trip_is_told_in_parts(self) -> None:
+        async def go() -> None:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            api.create_delay = 0.03  # (Predict takes 30 ms to answer)
+            stream.take(MID, book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0)
+            await asyncio.gather(*taker.sends)
+            order = taker.record(SLUG, "on")["orders"][0]
+            self.assertTrue(order.get("wrote_wall") and "connect_ms" not in order and order["queued_ms"] < 5, order)
+            self.assertGreaterEqual(order["answered_wall"] - order["wrote_wall"], 25)
+            self.assertIn("［排队 0 ms、复用连接、写出→应答", taker.status())
+            again, api2, _, stream2, _ = make_taker(START - 3_600_000)
+            await found(again, api2)
+            api2.connect_delay = 0.02
+            stream2.take(MID, book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0)
+            await asyncio.gather(*again.sends)
+            self.assertEqual(again.record(SLUG, "on")["orders"][0]["connect_ms"], 20.0)
+            self.assertIn("新建连接 20 ms", again.status())
+        run(go())
+
+    def test_the_check_tells_a_speed_bump_on_a_market_followed(self) -> None:
+        from ruletaker.predict import delay_fields
+        market = {"id": "1", "speedBump": {"delayMs": 500, "enabled": True}, "liveDelayMs": 3000, "title": "x",
+                  "outcomes": [{"name": "Up", "delay": None}]}
+        self.assertEqual(sorted(delay_fields(market)), ["liveDelayMs=3000", "speedBump.delayMs=500", "speedBump.enabled=True"])
+
+        async def go() -> None:
+            taker, api, *_ = make_taker(START - 3_600_000)
+            await found(taker, api)
+            self.assertIn("✅ 吃单延迟：跟踪的市场没有这类设置", await taker.self_check())
+            taker.track[SLUG]["market"]["speedBump"] = {"delayMs": 500}
+            text = await taker.self_check()
+            self.assertIn("⚠️ Predict 对这些市场的吃单有延迟设置", text)
+            self.assertIn("speedBump.delayMs=500", text)
+        run(go())

@@ -156,6 +156,7 @@ class PredictApi:
         self.trips: collections.deque = collections.deque(maxlen=300)  # (method, ms): the request alone, after the pace and the gate
         self.last_ok = 0.0  # monotonic: the last answered request (a warm connection)
         self.last_remove = ""  # the last cancel's answer as Predict gave it (cut short): shown when the order is not in it
+        self.traces: dict[str, dict] = {}  # an order's way out (by its hash), timed for create_order
 
     # -- plumbing --
     def gates(self) -> tuple[asyncio.Semaphore, asyncio.Semaphore]:
@@ -184,6 +185,10 @@ class PredictApi:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
         if method == "POST" and payload is None:
             payload = {}
+        if check:  # (an order's way out timed, kept by its hash for create_order: the key's budget, a slot, the thread)
+            self.traces[check] = {"entered": time.monotonic()}
+            while len(self.traces) > 64:
+                self.traces.pop(next(iter(self.traces)))
         await self.pacer.take(write=priority)
         self.calls += 1
         gate, read_gate = self.gates()
@@ -216,9 +221,10 @@ class PredictApi:
         loop = asyncio.get_running_loop()
         gate = self.thread_gate(loop, check) if check and self.before_send is not None else None
         began = time.perf_counter()
+        traced = {"trace": self.traces[check]} if check in self.traces else {}
         try:
             raw = await loop.run_in_executor(WRITE_POOL if write else READ_POOL, functools.partial(
-                http.request, self.base + path, payload, timeout, self.headers(), **({"gate": gate} if gate else {})))
+                http.request, self.base + path, payload, timeout, self.headers(), **({"gate": gate} if gate else {}), **traced))
         except RemoteError as error:
             if error.retry_after or http_status(error) == 429:
                 self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS))
@@ -330,7 +336,13 @@ class PredictApi:
         order_id = str(data.get("orderId") or data.get("id") or data.get("order_id") or "")
         if not order_id:
             raise RemoteError("下单应答没有订单号：" + brief_error(json.dumps(answer, ensure_ascii=False), 120))
-        return {"order_id": order_id, "hash": str(data.get("orderHash") or data.get("hash") or "")}
+        # its way out: waiting for the key's budget, a slot and a thread (ms), a new connection's handshake (ms; none: a warm
+        # one), the moment its bytes were all written
+        trace = self.traces.pop(check or (digest if checked else ""), {})
+        timing = {"queued_ms": round((trace["started"] - trace["entered"]) * 1000, 1)} if "started" in trace else {}
+        timing.update({k: round(trace[k], 1) for k in ("connect_ms",) if k in trace})
+        timing.update({k: trace[k] for k in ("wrote_wall",) if k in trace})
+        return {"order_id": order_id, "hash": str(data.get("orderHash") or data.get("hash") or ""), **timing}
 
     async def remove_orders(self, ids: list[str]) -> dict:
         answer = await self.authed("POST", "/orders/remove", {"data": {"ids": [str(i) for i in ids]}}, priority=True)
@@ -490,6 +502,23 @@ def predict_resolution(market: dict) -> dict | None:
     if index is None:
         return None
     return {"index": index, "name": names[index], "split": False, "how": "resolution"}
+
+
+def delay_fields(market: dict) -> list[str]:
+    """A market's settings that hold back the orders that take (a speed bump: whatever field names a delay or a speed bump,
+    at any depth), as "speedBump.delayMs=500" — the race is another one where Predict delays the takers."""
+    out: list[str] = []
+
+    def walk(prefix: str, value: Any, depth: int, named: bool) -> None:
+        if isinstance(value, dict):
+            if depth < 4:
+                for k, v in value.items():
+                    low = str(k).lower()
+                    walk(f"{prefix}.{k}" if prefix else str(k), v, depth + 1, named or "delay" in low or "speedbump" in low)
+        elif value is not None and not isinstance(value, list) and named:
+            out.append(f"{prefix}={str(value)[:40]}")
+    walk("", market, 0, False)
+    return out
 
 
 def won_index_set(market: dict, resolution: dict) -> int | None:

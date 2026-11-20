@@ -92,6 +92,9 @@ class FakeResponse:
     def getheader(self, name: str, default: str | None = None) -> str | None:
         return self.headers.get(name.lower(), default)
 
+    def getheaders(self) -> list[tuple[str, str]]:
+        return list(self.headers.items())
+
     def read(self, n: int = -1) -> bytes:
         out, self.body = self.body, b""
         return out
@@ -214,6 +217,18 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(len(FakeConn.made), 2)
         self.assertEqual(FakeConn.made[1].requests[0][0], "POST")
 
+
+    def test_an_order_s_way_out_is_timed(self) -> None:
+        trace: dict = {}
+        before = int(time.time() * 1000)
+        nethttp.request("https://api.predict.fun/v1/orders", b"{}", trace=trace)
+        self.assertIn("connect_ms", trace)  # (no warm one: a handshake)
+        self.assertGreaterEqual(trace["wrote_wall"], before)
+        self.assertIn("started", trace)
+        again: dict = {}
+        nethttp.request("https://api.predict.fun/v1/orders", b"{}", trace=again)
+        self.assertNotIn("connect_ms", again)  # (the warm one reused)
+        self.assertGreaterEqual(again["wrote_wall"], before)
 
     def test_an_error_answer_read_whole_keeps_its_connection(self) -> None:
         FakeConn.script = ["400"]

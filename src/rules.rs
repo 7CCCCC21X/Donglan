@@ -565,6 +565,12 @@ pub fn races(recs: &Recs, mode: &str, since_ms: i64) -> Vec<Obj> {
                 "trip".into(),
                 opt_i(if both("answered_wall", "sent_wall") { Some(o.i("answered_wall") - o.i("sent_wall")) } else { None }),
             );
+            x.insert("queued".into(), o.get("queued_ms").cloned().unwrap_or(Value::Null));
+            x.insert("connect".into(), o.get("connect_ms").cloned().unwrap_or(Value::Null));
+            x.insert(
+                "reply".into(),
+                opt_i(if both("answered_wall", "wrote_wall") { Some(o.i("answered_wall") - o.i("wrote_wall")) } else { None }),
+            );
             out_orders.push(Value::Object(x));
         }
         row.insert("orders".into(), Value::Array(out_orders));
@@ -668,7 +674,17 @@ pub fn race_text(row: &Obj) -> String {
             parts.push(piece);
         }
         if let Some(t) = num("trip") {
-            parts.push(format!("往返 {t} ms"));
+            let mut piece = format!("往返 {t} ms");
+            if let Some(r) = num("reply") {
+                // (where it went: waiting for the key's budget and a slot, a connection, Predict's own answer)
+                let link = if o.t("connect") {
+                    format!("新建连接 {} ms", g(o.f("connect").round()))
+                } else {
+                    "复用连接".to_string()
+                };
+                piece += &format!("［排队 {} ms、{link}、写出→应答 {r} ms］", g(o.f("queued").round()));
+            }
+            parts.push(piece);
         }
         text += &format!("｜第 {i} 张 要 {} 成交 {}", g(o.f("shares")), g(o.f("filled")));
         if o.t("seen") {

@@ -305,7 +305,9 @@ def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
                         "out": int(o["sent_wall"]) - int(o["signed_wall"]) if o.get("sent_wall") and o.get("signed_wall") else None,
                         "presigned": bool(o.get("presigned")),
                         "open_wait": o.get("open_wait"), "open_reads": o.get("open_reads"),
-                        "trip": int(o["answered_wall"]) - int(o["sent_wall"]) if o.get("answered_wall") and o.get("sent_wall") else None}
+                        "trip": int(o["answered_wall"]) - int(o["sent_wall"]) if o.get("answered_wall") and o.get("sent_wall") else None,
+                        "queued": o.get("queued_ms"), "connect": o.get("connect_ms"),
+                        "reply": int(o["answered_wall"]) - int(o["wrote_wall"]) if o.get("answered_wall") and o.get("wrote_wall") else None}
                        for o in orders]})
     return sorted(rows, key=lambda x: -x["start_ms"])
 
@@ -341,7 +343,11 @@ def race_text(row: dict) -> str:
                 split.append(f"卖单先到、等撮合开启 {o['open_wait']} ms（读了 {o.get('open_reads') or 0} 次状态）")
             parts.append(f"到达→发出 {o['own']} ms" + (f"［{'、'.join(split)}］" if split else "") + ("（不是盘口一到就下的）" if o["fresh"] is False else ""))
         if o["trip"] is not None:
-            parts.append(f"往返 {o['trip']} ms")
+            piece = f"往返 {o['trip']} ms"
+            if o.get("reply") is not None:  # (where it went: the key's budget and a slot, a connection, Predict's own answer)
+                link = f"新建连接 {round(float(o['connect'])):g} ms" if o.get("connect") else "复用连接"
+                piece += f"［排队 {round(float(o.get('queued') or 0)):g} ms、{link}、写出→应答 {o['reply']} ms］"
+            parts.append(piece)
         text += (f"｜第 {i} 张 要 {o['shares']:g} 成交 {o['filled']:g}" + (f"（当时盘口上 {o['seen']:g} 份）" if o["seen"] else "")
                  + ("：" + "、".join(parts) if parts else ""))
     return text

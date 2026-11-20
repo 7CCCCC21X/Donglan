@@ -230,6 +230,9 @@ pub struct Config {
     pub rpc_url: String,
     pub fee_bps: i64,
     pub rate_per_min: f64,
+    /// how often the REST read beside the pushes may run at the makers' moment (ms; RULE_VERIFY_MS), never above 80% of the
+    /// key's budget
+    pub verify_ms: f64,
     pub max_daily_loss_usd: f64,
     pub state_db: String,
     pub telegram_token: String,
@@ -261,6 +264,7 @@ impl Default for Config {
             rpc_url: String::new(),
             fee_bps: 200,
             rate_per_min: 220.0,
+            verify_ms: 340.0,
             max_daily_loss_usd: 0.0,
             state_db: "data/ruletaker.sqlite3".into(),
             telegram_token: String::new(),
@@ -363,6 +367,7 @@ impl Config {
             rpc_url: get(e, "BSC_RPC_URL", "").trim().trim_end_matches('/').to_string(),
             fee_bps: bounded(e, "PREDICT_FEE_BPS", 200.0, 0.0, 1000.0, true)? as i64,
             rate_per_min: bounded(e, "PREDICT_RATE_PER_MIN", 220.0, 0.0, 6000.0, false)?,
+            verify_ms: bounded(e, "RULE_VERIFY_MS", 340.0, 50.0, 2000.0, false)?,
             max_daily_loss_usd: bounded(e, "RULE_MAX_DAILY_LOSS_USD", 0.0, 0.0, 1_000_000.0, false)?,
             state_db: {
                 let v = get(e, "STATE_DB", "").trim();

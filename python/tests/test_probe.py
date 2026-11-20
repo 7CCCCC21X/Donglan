@@ -14,6 +14,15 @@ import unittest
 from fakes import make_config
 
 
+# The stand-in book: the state Predict has now (its number, when it changed); the push of each state goes out 40 ms after it
+# changed, so a REST read in between shows it first.
+STATE = {"k": -1, "stamp": 0}
+
+
+def book(k: int, stamp: int) -> dict:
+    return {"updateTimestampMs": stamp, "bids": [["0.40", "10"]], "asks": [[f"0.{50 + k % 40}", "5"]]}
+
+
 class _Api(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:
         pass
@@ -24,10 +33,11 @@ class _Api(http.server.BaseHTTPRequestHandler):
             mid = f"m{quarter % 1800 // 900}"  # (this quarter hour's market, and the next one's)
             data = {"markets": [{"id": mid, "conditionId": "0x01", "title": "BTC Up or Down", "question": ""}]}
         else:
-            data = {"bids": [], "asks": []}
+            data = book(STATE["k"], STATE["stamp"])
         body = json.dumps({"success": True, "data": data}).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-RateLimit-Limit", "600")
         self.end_headers()
         self.wfile.write(body)
 
@@ -45,18 +55,28 @@ class ProbeTest(unittest.TestCase):
         echoed: list = []
 
         async def pushes(ws) -> None:
+            topics: list = []
+            async for raw in ws:  # both subscriptions: each answered, its book as it stands (5 s old), a heartbeat
+                msg = json.loads(raw)
+                if msg.get("method") == "subscribe":
+                    topic = msg["params"][0]
+                    await ws.send(json.dumps({"type": "R", "requestId": msg["requestId"], "success": True}))
+                    await ws.send(json.dumps({"type": "M", "topic": topic, "data": book(-1, int(time.time() * 1000) - 5000)}))
+                    await ws.send(json.dumps({"type": "M", "topic": "heartbeat", "data": 7}))
+                    topics.append(topic)
+                    if len(topics) == 2:
+                        break
+            for k in range(6):  # six changes: each pushed to both 40 ms after Predict has it
+                stamp = int(time.time() * 1000)
+                STATE.update(k=k, stamp=stamp)
+                await asyncio.sleep(0.04)
+                for topic in topics:
+                    await ws.send(json.dumps({"type": "M", "topic": topic, "data": book(k, stamp)}))
+                await asyncio.sleep(0.06)
             async for raw in ws:
                 msg = json.loads(raw)
                 if msg.get("method") == "heartbeat":
                     echoed.append(msg.get("data"))
-                elif msg.get("method") == "subscribe":
-                    topic = msg["params"][0]
-                    await ws.send(json.dumps({"type": "R", "requestId": msg["requestId"], "success": True}))
-                    await ws.send(json.dumps({"type": "M", "topic": topic, "data": {"updateTimestampMs": time.time() * 1000 - 5000}}))
-                    await ws.send(json.dumps({"type": "M", "topic": "heartbeat", "data": 7}))
-                    for _ in range(4):  # four changes, each pushed 40 ms after Predict's own stamp
-                        await asyncio.sleep(0.02)
-                        await ws.send(json.dumps({"type": "M", "topic": topic, "data": {"updateTimestampMs": time.time() * 1000 - 40}}))
 
         async def index(ws) -> None:  # Binance's index: a markPrice push every 50 ms, each 3 ms after its own event time
             while True:
@@ -71,17 +91,36 @@ class ProbeTest(unittest.TestCase):
         async def go() -> dict:
             async with serve(pushes, "127.0.0.1", 0) as server, serve(index, "127.0.0.1", 0) as binance:
                 port, binance_port = server.sockets[0].getsockname()[1], binance.sockets[0].getsockname()[1]
-                config = make_config(RULE_TAKER="off", RULE_REGION="test", BINANCE_WS_URL=f"ws://127.0.0.1:{binance_port}")
-                return await latency(config, rounds=2, push_seconds=0.8,
+                config = make_config(RULE_TAKER="off", RULE_REGION="test", BINANCE_WS_URL=f"ws://127.0.0.1:{binance_port}",
+                                     PREDICT_RATE_PER_MIN="6000")  # (REST read every 0.1 s)
+                return await latency(config, rounds=2, push_seconds=1.0,
                                      base=f"http://127.0.0.1:{api.server_address[1]}/v1", ws_url=f"ws://127.0.0.1:{port}")
         found = asyncio.run(go())
         self.assertEqual(len(found["reads"]), 2)
         lags = found["lags"]
-        self.assertEqual(len(lags), 8, lags)  # two markets × four changes; the books as they stood (5 s old) not counted
+        self.assertEqual(len(lags), 12, lags)  # two markets × six changes; the books as they stood (5 s old) not counted
         self.assertTrue(all(35 <= lag < 400 for lag in lags), lags)
+        # REST beside the pushes: the changes it caught in their 40 ms are ahead by at most that; the others behind
+        self.assertGreaterEqual(len(found["rest_ahead"]) + len(found["push_ahead"]), 3, found)
+        self.assertTrue(found["rest_ahead"] and all(lead <= 60 for lead in found["rest_ahead"]), found)
+        self.assertTrue(found["rest_ages"] and all(0 <= a < 200 for a in found["rest_ages"]), found)
+        from ruletaker import http as nethttp
+        self.assertEqual(nethttp.HTTP_NET["127.0.0.1"]["limits"], "x-ratelimit-limit: 600")
         self.assertEqual(echoed, [7, 7])
         self.assertGreaterEqual(len(found["index"]), 5, found["index"])  # (the index watched over the same seconds)
         self.assertTrue(all(0 <= lag < 200 for lag in found["index"]), found["index"])
+
+
+class VerifyPaceTest(unittest.TestCase):
+    def test_the_rest_reads_at_the_moment_keep_within_the_key_s_budget(self) -> None:
+        from fakes import make_taker
+
+        def every(**env: str) -> float:
+            return make_taker(0, **env)[0].verify_every()
+        self.assertAlmostEqual(every(), 60 / (0.8 * 220))  # three a second on the standard key, as before
+        self.assertAlmostEqual(every(RULE_VERIFY_MS="100"), 60 / (0.8 * 220))  # (asked faster: the budget holds it)
+        self.assertAlmostEqual(every(RULE_VERIFY_MS="100", PREDICT_RATE_PER_MIN="1100"), 0.1)
+        self.assertAlmostEqual(every(PREDICT_RATE_PER_MIN="1100"), 0.34)  # (a bigger budget alone changes nothing)
 
 
 if __name__ == "__main__":
