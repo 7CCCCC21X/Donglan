@@ -2154,3 +2154,61 @@ fn the_console_refuses_on_the_head_and_takes_no_flood() {
         assert!(in_time && text.starts_with("HTTP/1.1 "), "{text}");
     });
 }
+
+/// The probe's stand-in API: a quarter hour's BTC market (and the next one's) and an empty book.
+fn probe_api(_method: &str, path: &str, _body: &[u8]) -> Vec<u8> {
+    let data = match path.rsplit_once("btc-updown-15m-") {
+        Some((_, quarter)) => {
+            let q: i64 = quarter.parse().unwrap_or(0);
+            json!({"markets": [{"id": format!("m{}", q % 1800 / 900), "conditionId": "0x01", "title": "BTC Up or Down"}]})
+        }
+        None => json!({"bids": [], "asks": []}),
+    };
+    let body = json!({"success": true, "data": data}).to_string();
+    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
+}
+
+#[test]
+fn the_probe_times_each_pushed_change_and_answers_the_heartbeat() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    run(async {
+        let (api_port, _) = crate::http::tests::serve(probe_api, 0).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = listener.local_addr().unwrap().port();
+        let echoed = Rc::new(RefCell::new(vec![]));
+        let heard = echoed.clone();
+        tokio::task::spawn_local(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(frame)) = ws.next().await {
+                let Message::Text(text) = frame else { continue };
+                let msg: Value = serde_json::from_str(text.as_str()).unwrap();
+                if msg["method"] == "heartbeat" {
+                    heard.borrow_mut().push(msg["data"].clone());
+                    continue;
+                }
+                let topic = msg["params"][0].as_str().unwrap_or("").to_string();
+                let send = |v: Value| Message::text(v.to_string());
+                let now = || crate::util::now_ms() as f64;
+                ws.send(send(json!({"type": "R", "requestId": msg["requestId"], "success": true}))).await.unwrap();
+                ws.send(send(json!({"type": "M", "topic": topic, "data": {"updateTimestampMs": now() - 5000.0}}))).await.unwrap();
+                ws.send(send(json!({"type": "M", "topic": "heartbeat", "data": 7}))).await.unwrap();
+                for _ in 0..4 {
+                    // four changes, each pushed 40 ms after Predict's own stamp
+                    crate::sync::sleep(0.02).await;
+                    ws.send(send(json!({"type": "M", "topic": topic, "data": {"updateTimestampMs": now() - 40.0}})))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let config = Config::from_env(&env_of(&[("RULE_TAKER", "off"), ("RULE_REGION", "test")])).unwrap();
+        let base = format!("http://127.0.0.1:{api_port}/v1");
+        let (reads, lags) = crate::probe(config, 2, &base, &format!("ws://127.0.0.1:{ws_port}/ws"), 0.8).await;
+        assert_eq!(reads.len(), 2);
+        assert_eq!(lags.len(), 8, "{lags:?}"); // two markets × four changes; the books as they stood (5 s old) not counted
+        assert!(lags.iter().all(|l| (35.0..400.0).contains(l)), "{lags:?}");
+        assert_eq!(*echoed.borrow(), vec![json!(7), json!(7)]);
+    });
+}

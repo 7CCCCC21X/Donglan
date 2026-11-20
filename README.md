@@ -178,7 +178,7 @@ bash deploy/gcp/rt.sh env
 | `bash deploy/gcp/rt.sh audit` | 私钥安全体检（只读）：私钥只在该在的文件里、权限、日志、加固、谁能登录（私钥本身不会显示） |
 | `bash deploy/gcp/rt.sh restart` / `stop` / `start` | 重启 / 停止 / 启动服务 |
 | `bash deploy/gcp/rt.sh ssh` | 登录虚拟机 |
-| `bash deploy/gcp/rt.sh probe asia-east2-a` | 在别的区域临时开一台小机器量延迟，量完自动删除 |
+| `bash deploy/gcp/rt.sh probe asia-southeast1-b` | 在别的区域临时开一台小机器量推送延迟和读盘口，量完自动删除（只带 API Key，从虚拟机读）；怎么比见“为什么是东京、怎么确认” |
 
 停止或重启时，服务会先等在途订单的应答（最多 25 秒）、撤掉还挂着的单，再退出。
 
@@ -304,16 +304,33 @@ bash deploy/gcp/rt.sh env
 
 huice 11-18 的网络一行：阿姆斯特丹到 Predict 的入口（Cloudflare）新建连接 7–31 ms，读一次盘口 233–311 ms。入口近、请求慢，说明 Predict 的服务器离欧洲很远，这个数和到东亚的往返吻合。
 
-部署前后都可以量：
+东京实测（11-20 那场 18:15）：读一次 12 ms、下单往返 49 ms、推送延迟中位 66–85 ms。
+
+**抢单比的是哪一段**：卖单出现 → Predict 推送到我们（东京 66–85 ms）→ 发出（0 ms：预先签好，推送一到当场发）→ 半个下单往返（约 25 ms）到 Predict。对手在卖单出现后 10–50 ms 就到了。我们这头的处理已经是 0 ms，再省只能省网络：离 Predict 更近，推送和下单都短。所以先量清楚哪个区域最近。
+
+量法（各区域请在**同一时段**量，比如同一个小时内；每个约 4～5 分钟，临时机器几美分；只带 API Key，从虚拟机的设置文件读，不带私钥）：
 
 ```bash
-bash deploy/gcp/rt.sh latency                 # 量正在跑的这台（东京）
-bash deploy/gcp/rt.sh probe asia-east2-a      # 香港，临时开一台小机器量完删掉
-bash deploy/gcp/rt.sh probe asia-northeast3-a # 首尔
-bash deploy/gcp/rt.sh probe asia-southeast1-a # 新加坡
+bash deploy/gcp/rt.sh latency                    # 正在跑的这台（东京），作为基准
+bash deploy/gcp/rt.sh probe asia-southeast1-b    # 新加坡：临时开一台小机器，量完自动删掉
+bash deploy/gcp/rt.sh probe asia-east2-a         # 香港
+bash deploy/gcp/rt.sh probe asia-east1-b         # 台湾
+bash deploy/gcp/rt.sh probe asia-northeast3-a    # 首尔
 ```
 
-比较输出里“读盘口 … 中位”那个数：最小的区域离 Predict 最近（下单的往返和它差不多）。
+每次会看 BTC 15 分钟盘口 45 秒，量每一次盘口变化从 Predict 自己的时间戳到这台机器收到用了多久。**主要比“推送延迟 … 中位”**：最小的区域离 Predict 的盘口最近，差 15 ms 以上才算数（同一区域前后两次也会差几毫秒）。“读盘口”只作参考，它代表不了下单：东京读一次 12 ms，下单往返却要 49 ms。
+
+**真要换区域之前，再量下单往返**（只有用私钥才量得到）：在候选区域另起一台临时机器，只记录、不吃单，做一次挂单测试，看每一步的往返：
+
+```bash
+# 设置文件 ruletaker.env 用正式的那份改两处：RULE_TAKER=paper；删掉 Telegram 那几行（同一个机器人不能两台同时收命令）
+VM=ruletaker-try ZONE=asia-southeast1-b bash deploy/gcp/rt.sh deploy
+VM=ruletaker-try ZONE=asia-southeast1-b bash deploy/gcp/rt.sh test     # 和东京的 bash deploy/gcp/rt.sh test 比
+VM=ruletaker-try ZONE=asia-southeast1-b bash deploy/gcp/rt.sh delete
+shred -u ruletaker.env
+```
+
+两台不要同时开真实吃单（会互相抢同一场）。下单往返也明显更短，再把正式那台换过去。
 
 **AWS 还是 Google Cloud？** 对速度起作用的是机器在哪个城市，不是哪家云：两家在东京都有机房，请求都是先到 Cloudflare 的东京入口、再到 Predict。估计两家只差一两毫秒（没有实测过），而从阿姆斯特丹搬到东京省的是几百毫秒。这个仓库的部署脚本是给 Google Cloud 写的（Cloud Shell 一条命令部署、用网页预览看控制台，自己电脑上什么都不用装）；代码本身不挑云，`deploy/gcp/vm-setup.sh` 在任何 Ubuntu 24.04 机器上都能装。建议先在 Google Cloud 东京跑起来看实测；想和 AWS 东京（`ap-northeast-1`）比，在那边开一台小机器跑同一个 `ruletaker latency`（或 Python 版的 `python -m ruletaker latency`），比“读盘口”的中位数。如果别的区域明显更小，`ZONE=那个区域 bash deploy/gcp/rt.sh deploy` 换过去（先 `delete` 旧的，或者用 `VM=ruletaker2` 另起一台再删旧的，注意不要两台同时 `on`）。
 

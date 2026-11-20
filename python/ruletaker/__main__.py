@@ -115,19 +115,29 @@ async def run_service(config: Config, env: dict | None = None) -> int:
     return 0
 
 
-async def latency(config: Config, rounds: int = 10) -> dict:
+PUSH_SECONDS = 45.0  # how long the probe watches the pushed books for their delay
+
+
+def delays(xs: list[float]) -> str:
+    """"中位 66 ms（最快 41，九成在 90 以内）": the push delays' median, fastest and 90th percentile."""
+    v = sorted(xs)
+    return f"中位 {statistics.median(v):.0f} ms（最快 {v[0]:.0f}，九成在 {v[int((len(v) - 1) * 0.9)]:.0f} 以内）"
+
+
+async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_SECONDS, base: str = "", ws_url: str = "") -> dict:
     """Read-only: a first request (a new connection: its handshake), ``rounds`` reads of an order book on that connection, the
-    push connection's handshake, its ping there and back and a subscription's first book. Compare the "读盘口" median between
-    regions: the smaller, the nearer to Predict."""
+    push connection's handshake, its ping there and back, and for ``push_seconds`` the delay of every change Predict pushes of
+    the BTC quarter-hour books (its own timestamp to here) — what a race is decided on before an order leaves. Compare the push
+    delay between regions: the smaller, the nearer to Predict's books."""
     from . import http
     from .predict import API_BASES, PREDICT_REST, READ_POOL, predict_markets
     from .stream import PREDICT_WS_URL, ws_connect
-    base = API_BASES.get(config.chain_id, PREDICT_REST)
+    base = base or API_BASES.get(config.chain_id, PREDICT_REST)  # (``base`` / ``ws_url``: stand-ins, for the tests)
     host = urllib.parse.urlsplit(base).hostname or ""
     headers = {"x-api-key": config.api_key} if config.api_key else {}
     spread = lambda xs: f"中位 {statistics.median(xs):.1f} ms（最快 {min(xs):.1f}，最慢 {max(xs):.1f}）" if xs else "没量到"
     zone = config.region or await asyncio.to_thread(gce_zone)
-    found: dict = {"region": zone, "reads": [], "pings": [], "first": None, "ws_open": None, "ws_book": None}
+    found: dict = {"region": zone, "reads": [], "pings": [], "first": None, "ws_open": None, "ws_book": None, "lags": []}
     print(f"Predict 网络延迟探测（只读，不下单）｜区域 {zone or '未知'}｜版本 {VERSION}" + ("" if config.api_key else "｜没有设置 API Key：可能被拒绝"))
     loop = asyncio.get_running_loop()
     now = int(time.time() * 1000)
@@ -141,6 +151,13 @@ async def latency(config: Config, rounds: int = 10) -> dict:
         print(f"第一次请求（含新建连接）{found['first']:.0f} ms｜市场 {slug} → {market_id or '没找到'}")
     except Exception as error:
         print(f"读市场失败：{clean_error(error) or type(error).__name__}")
+    watched = [market_id] if market_id else []
+    try:  # (the next quarter hour's market too: twice the books to time)
+        nxt = f"btc-updown-15m-{(now - now % 900_000) // 1000 + 900}"
+        more = predict_markets(await loop.run_in_executor(READ_POOL, http.request_json, f"{base}/categories/{nxt}", None, 10, headers))
+        watched += [str(more[0]["id"])] if more and more[0].get("id") else []
+    except Exception:
+        pass
     path = f"/markets/{market_id}/orderbook" if market_id else f"/categories/{slug}"
     why = ""
     refused: list[float] = []
@@ -161,7 +178,7 @@ async def latency(config: Config, rounds: int = 10) -> dict:
           + (f"｜新建连接（TCP+TLS）{spread(connect)}" if connect else "") + (f"｜入口 {net['edge']}" if net.get("edge") else ""))
     try:
         began = time.perf_counter()
-        ws = await ws_connect(PREDICT_WS_URL, headers)
+        ws = await ws_connect(ws_url or PREDICT_WS_URL, headers)
         found["ws_open"] = (time.perf_counter() - began) * 1000
         try:
             for _ in range(5):
@@ -169,26 +186,50 @@ async def latency(config: Config, rounds: int = 10) -> dict:
                 await asyncio.wait_for(await ws.ping(), 5)
                 found["pings"].append((time.perf_counter() - began) * 1000)
                 await asyncio.sleep(0.2)
-            if market_id:
+            if watched:
+                # every change of the watched books for push_seconds: its delay from Predict's own timestamp to here (the first
+                # book of a market is the book as it stands, not a change: not timed — as the service times its pushes)
                 import json
                 began = time.perf_counter()
-                await ws.send(json.dumps({"method": "subscribe", "requestId": 1, "params": [f"predictOrderbook/{market_id}"]}))
-                while time.perf_counter() - began < 5:
-                    frame = json.loads(await asyncio.wait_for(ws.recv(), 5))
-                    if isinstance(frame, dict) and frame.get("type") == "M" and str(frame.get("topic") or "").startswith("predictOrderbook/"):
-                        found["ws_book"] = (time.perf_counter() - began) * 1000
-                        stamp = (frame.get("data") or {}).get("updateTimestampMs")
-                        if isinstance(stamp, (int, float)) and stamp > 0:
-                            found["ws_age"] = time.time() * 1000 - stamp
+                for i, mid in enumerate(watched, 1):
+                    await ws.send(json.dumps({"method": "subscribe", "requestId": i, "params": [f"predictOrderbook/{mid}"]}))
+                print(f"看 {len(watched)} 个 BTC 15 分钟盘口 {push_seconds:.0f} 秒，量推送延迟…")
+                seen: set = set()
+                while (left := began + push_seconds - time.perf_counter()) > 0:
+                    try:
+                        frame = json.loads(await asyncio.wait_for(ws.recv(), left))
+                    except asyncio.TimeoutError:
                         break
+                    if not isinstance(frame, dict) or frame.get("type") != "M":
+                        continue
+                    topic = str(frame.get("topic") or "")
+                    if topic == "heartbeat":
+                        await ws.send(json.dumps({"method": "heartbeat", "data": frame.get("data")}))
+                        continue
+                    if not topic.startswith("predictOrderbook/"):
+                        continue
+                    if found["ws_book"] is None:
+                        found["ws_book"] = (time.perf_counter() - began) * 1000
+                    stamp = (frame.get("data") or {}).get("updateTimestampMs")
+                    mid = topic.split("/", 1)[1]
+                    if mid in seen and isinstance(stamp, (int, float)) and stamp > 0:
+                        lag = time.time() * 1000 - stamp
+                        if -1_000 <= lag < 60_000:
+                            found["lags"].append(lag)
+                    seen.add(mid)
         finally:
             await ws.close()
         print(f"推送连接：握手 {found['ws_open']:.0f} ms｜ping 来回 {spread(found['pings'])}"
               + (f"｜订阅到第一份盘口 {found['ws_book']:.0f} ms" if found["ws_book"] is not None else ""))
+        lags = found["lags"]
+        print("推送延迟：没量到（盘口这段时间没变，或推送没连上）：换个时段再量" if not lags else
+              f"推送延迟：盘口只变了 {len(lags)} 次，量不准（{delays(lags)}）：换个时段再量" if len(lags) < 5 else
+              f"推送延迟（Predict 盘口时间戳 → 这里收到，{len(lags)} 次盘口变化）：{delays(lags)}")
     except Exception as error:
         print(f"推送连接失败：{clean_error(error) or type(error).__name__}")
-    print("怎么看：“读盘口”的中位数就是这里到 Predict 的一次往返（下单也差不多）。在东京（asia-northeast1）量一次，"
-          "和原来 Railway 上 /rules 网络一行的“读一次”比——小得多就说明搬对了。")
+    print("怎么看：抢单时卖单从出现到我们看到，就是“推送延迟”这一段（东京实测中位 66～85 ms）——比区域主要看它，越小越近。"
+          "“读盘口”代表不了下单：东京读一次约 12 ms，下单往返约 49 ms（下单在 Predict 那边走得更远）。下单往返只能用私钥量："
+          "在候选区域临时部署一台只记录模式的机器跑 rt.sh test（README“换区域”）。各区域请在同一时段量。")
     return found
 
 

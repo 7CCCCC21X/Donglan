@@ -196,10 +196,29 @@ fn spread(xs: &[f64]) -> String {
     format!("中位 {:.1} ms（最快 {lo:.1}，最慢 {hi:.1}）", util::median(&mut v).unwrap_or(0.0))
 }
 
+/// How long the probe watches the pushed books for their delay (s).
+const PUSH_SECONDS: f64 = 45.0;
+
+/// "中位 66 ms（最快 41，九成在 90 以内）": the push delays' median, fastest and 90th percentile.
+fn delays(xs: &[f64]) -> String {
+    let mut v = xs.to_vec();
+    v.sort_by(f64::total_cmp);
+    let p90 = v[((v.len() - 1) as f64 * 0.9) as usize];
+    format!("中位 {:.0} ms（最快 {:.0}，九成在 {p90:.0} 以内）", util::median(&mut v.clone()).unwrap_or(0.0), v[0])
+}
+
 /// Read-only: a first request (a new connection: its handshake), reads of an order book on that connection, the push
-/// connection's handshake, its ping there and back and a subscription's first book.
+/// connection's handshake, its ping there and back, and for PUSH_SECONDS the delay of every change Predict pushes of the
+/// BTC quarter-hour books (its own timestamp to here) — what a race is decided on before an order leaves.
 async fn latency(config: Config, rounds: usize) -> i32 {
-    let base = predict::api_base(config.chain_id);
+    let base = predict::api_base(config.chain_id).to_string();
+    probe(config, rounds, &base, stream::PREDICT_WS_URL, PUSH_SECONDS).await;
+    0
+}
+
+/// ``latency`` on the API at ``base`` and the push connection at ``ws_url`` (stand-ins, for the tests): (the reads' round
+/// trips, the push delays).
+pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &str, push_seconds: f64) -> (Vec<f64>, Vec<f64>) {
     let host = http::Url::parse(base).map(|u| u.host).unwrap_or_default();
     let headers: Vec<(&str, &str)> =
         if config.api_key.is_empty() { vec![] } else { vec![("x-api-key", config.api_key.as_str())] };
@@ -225,6 +244,13 @@ async fn latency(config: Config, rounds: usize) -> i32 {
         }
         Err(e) => println!("读市场失败：{}", clean_error(&e)),
     }
+    // (the next quarter hour's market too: twice the books to time)
+    let next = format!("btc-updown-15m-{}", (now - now % 900_000) / 1000 + 900);
+    let mut watched: Vec<String> = vec![market_id.clone()];
+    if let Ok(answer) = pool.request_json(&format!("{base}/categories/{next}"), None, 10.0, &headers).await {
+        watched.extend(predict::predict_markets(&answer).first().map(|m| util::Py::s(m, "id")));
+    }
+    watched.retain(|m| !m.is_empty());
     let path = if market_id.is_empty() { format!("/categories/{slug}") } else { format!("/markets/{market_id}/orderbook") };
     let (mut reads, mut refused, mut why) = (vec![], vec![], String::new());
     for _ in 0..rounds {
@@ -254,7 +280,8 @@ async fn latency(config: Config, rounds: usize) -> i32 {
     );
     let ws_headers: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
     let began = mono();
-    match stream::ws_connect(stream::PREDICT_WS_URL, &ws_headers).await {
+    let mut lags: Vec<f64> = vec![];
+    match stream::ws_connect(ws_url, &ws_headers).await {
         Err(e) => println!("推送连接失败：{}", clean_error(&e)),
         Ok(ws) => {
             let open = (mono() - began) * 1000.0;
@@ -281,22 +308,49 @@ async fn latency(config: Config, rounds: usize) -> i32 {
                 pings.push((mono() - began) * 1000.0);
                 sync::sleep(0.2).await;
             }
-            if !market_id.is_empty() {
+            // every change of the watched books for push_seconds: its delay from Predict's own timestamp to here (the first
+            // book of a market is the book as it stands, not a change: not timed — as the service times its pushes)
+            if !watched.is_empty() {
+                use tokio_tungstenite::tungstenite::Message;
                 let began = mono();
-                let ask = serde_json::json!({"method": "subscribe", "requestId": 1, "params": [format!("predictOrderbook/{market_id}")]}).to_string();
-                if sink.send(tokio_tungstenite::tungstenite::Message::text(ask)).await.is_ok() {
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                        while let Some(Ok(frame)) = source.next().await {
-                            if let tokio_tungstenite::tungstenite::Message::Text(text) = frame {
-                                let v: serde_json::Value = serde_json::from_str(text.as_str()).unwrap_or_default();
-                                if v["type"] == "M" && v["topic"].as_str().unwrap_or("").starts_with("predictOrderbook/") {
-                                    book_ms = Some((mono() - began) * 1000.0);
-                                    return;
-                                }
-                            }
+                let mut subscribed = true;
+                for (i, mid) in watched.iter().enumerate() {
+                    let ask = serde_json::json!({"method": "subscribe", "requestId": i + 1, "params": [format!("predictOrderbook/{mid}")]});
+                    subscribed &= sink.send(Message::text(ask.to_string())).await.is_ok();
+                }
+                println!("看 {} 个 BTC 15 分钟盘口 {push_seconds:.0} 秒，量推送延迟…", watched.len());
+                let mut seen = std::collections::HashSet::new();
+                while subscribed {
+                    let left = began + push_seconds - mono();
+                    if left <= 0.0 {
+                        break;
+                    }
+                    let Ok(Some(Ok(frame))) = tokio::time::timeout(std::time::Duration::from_secs_f64(left), source.next()).await
+                    else {
+                        break;
+                    };
+                    let Message::Text(text) = frame else { continue };
+                    let v: serde_json::Value = serde_json::from_str(text.as_str()).unwrap_or_default();
+                    if v["type"] != "M" {
+                        continue;
+                    }
+                    let topic = v["topic"].as_str().unwrap_or("");
+                    if topic == stream::HEARTBEAT {
+                        let echo = serde_json::json!({"method": "heartbeat", "data": v["data"].clone()});
+                        let _ = sink.send(Message::text(echo.to_string())).await;
+                        continue;
+                    }
+                    let Some(mid) = topic.strip_prefix("predictOrderbook/") else { continue };
+                    if book_ms.is_none() {
+                        book_ms = Some((mono() - began) * 1000.0);
+                    }
+                    let stamp = v["data"]["updateTimestampMs"].as_f64().unwrap_or(0.0);
+                    if !seen.insert(mid.to_string()) && stamp > 0.0 {
+                        let lag = now_ms() as f64 - stamp;
+                        if (-1_000.0..60_000.0).contains(&lag) {
+                            lags.push(lag);
                         }
-                    })
-                    .await;
+                    }
                 }
             }
             let _ = sink.close().await;
@@ -305,13 +359,22 @@ async fn latency(config: Config, rounds: usize) -> i32 {
                 spread(&pings),
                 book_ms.map(|b| format!("｜订阅到第一份盘口 {b:.0} ms")).unwrap_or_default()
             );
+            println!(
+                "{}",
+                match lags.len() {
+                    0 => "推送延迟：没量到（盘口这段时间没变，或推送没连上）：换个时段再量".to_string(),
+                    n if n < 5 => format!("推送延迟：盘口只变了 {n} 次，量不准（{}）：换个时段再量", delays(&lags)),
+                    n => format!("推送延迟（Predict 盘口时间戳 → 这里收到，{n} 次盘口变化）：{}", delays(&lags)),
+                }
+            );
         }
     }
     println!(
-        "怎么看：“读盘口”的中位数就是这里到 Predict 的一次往返（下单也差不多）。在东京（asia-northeast1）量一次，\
-         和原来 Railway 上 /rules 网络一行的“读一次”比——小得多就说明搬对了。"
+        "怎么看：抢单时卖单从出现到我们看到，就是“推送延迟”这一段（东京实测中位 66～85 ms）——比区域主要看它，越小越近。\
+         “读盘口”代表不了下单：东京读一次约 12 ms，下单往返约 49 ms（下单在 Predict 那边走得更远）。下单往返只能用私钥量：\
+         在候选区域临时部署一台只记录模式的机器跑 rt.sh test（README“换区域”）。各区域请在同一时段量。"
     );
-    0
+    (reads, lags)
 }
 
 async fn check(config: Config, probe_order: bool) -> i32 {

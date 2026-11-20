@@ -7,6 +7,7 @@
 #   bash -s -- get /status | /status.json
 #   bash -s -- post /pause | /resume | /mode?to=off|paper|on
 #   bash -s -- control check | test          the self-check / the order test (the command line's check when the service is down)
+#   bash -s -- probe-keys                    what a probe machine needs (the API key, the chain) — never the private key
 #
 # Nothing here reads its own stdin (the script itself comes that way). For a test elsewhere: RT_ENV stands in for the VM's
 # settings file, RT_RUN for the command line of the version in use.
@@ -90,6 +91,12 @@ case "${1:-}" in
   port)
     echo "$port"
     ;;
+  probe-keys)
+    for name in RULE_API_KEY PREDICT_API_KEY PREDICT_CHAIN_ID; do
+      value="$(setting "$name")"
+      [ -z "$value" ] || printf '%s=%s\n' "$name" "$value"
+    done
+    ;;
   get|post)
     method="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
     case "$1 ${2:-}" in
@@ -119,7 +126,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "用法：bash vm-call.sh port | get PATH | post PATH | control check|test"
+    echo "用法：bash vm-call.sh port | get PATH | post PATH | control check|test | probe-keys"
     exit 2
     ;;
 esac

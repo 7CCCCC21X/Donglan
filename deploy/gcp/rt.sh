@@ -19,7 +19,8 @@
 #   bash deploy/gcp/rt.sh pause|resume    暂停 / 恢复开新单
 #   bash deploy/gcp/rt.sh mode off|paper|on   运行中切换模式（不会高于设置文件里的 RULE_TAKER）
 #   bash deploy/gcp/rt.sh restart|stop|start|ssh
-#   bash deploy/gcp/rt.sh probe ZONE      在别的区域临时开一台小机器量延迟，量完自动删除（例：asia-east2-a；只带 API Key，不带私钥）
+#   bash deploy/gcp/rt.sh probe ZONE      在别的区域临时开一台小机器量延迟（推送延迟、读盘口），量完自动删除（例：asia-southeast1-b；
+#                                         只带 API Key——从虚拟机的设置文件读，不带私钥）
 #   bash deploy/gcp/rt.sh delete          删除虚拟机（数据一起删掉，先确认）
 #
 # 可用环境变量改默认值：PROJECT（默认 gcloud 当前项目）ZONE（asia-northeast1-b）VM（ruletaker）MACHINE（e2-standard-2）
@@ -369,11 +370,18 @@ case "$cmd" in
   probe)
     zone="${1:-}"
     [ -n "$zone" ] || die "用法：rt.sh probe 区域（例：asia-northeast1-b 东京、asia-east2-a 香港、asia-northeast3-a 首尔、asia-southeast1-a 新加坡）"
-    file="${2:-$ROOT/ruletaker.env}"
-    [ -f "$file" ] || die "找不到 $file（要用里面的 API Key 读 Predict）"
-    # The API key alone goes to the throwaway machine — never the private key, the Telegram tokens or anything else of the file.
-    keys="$(grep -E '^(RULE_API_KEY|PREDICT_API_KEY|PREDICT_CHAIN_ID)=' "$file" || true)"
-    printf '%s\n' "$keys" | grep -qE '^(RULE_API_KEY|PREDICT_API_KEY)=.+' || die "$file 里没有填 RULE_API_KEY / PREDICT_API_KEY"
+    file="${2:-}"
+    # The API key alone goes to the throwaway machine — never the private key, the Telegram tokens or anything else. Read on the
+    # service's own VM as the service reads it, and passed straight on (never on disk here); or from a file named here.
+    if [ -n "$file" ]; then
+      [ -f "$file" ] || die "找不到 $file（要用里面的 API Key 读 Predict）"
+      keys="$(grep -E '^(RULE_API_KEY|PREDICT_API_KEY|PREDICT_CHAIN_ID)=' "$file" || true)"
+    else
+      iap_mode
+      echo "从虚拟机 $VM 的设置文件读 API Key（只读这一项，不读私钥）…"
+      keys="$(vm_call probe-keys || true)"
+    fi
+    printf '%s\n' "$keys" | grep -qE '^(RULE_API_KEY|PREDICT_API_KEY)=.+' || die "${file:-虚拟机 $VM 的设置文件}里没有填 RULE_API_KEY / PREDICT_API_KEY"
     name="rt-probe-$(date +%s)"
     echo "在 $zone 临时创建 $name 量延迟（量完删除；只带 API Key 过去，不带私钥；量网络用不着编译，临时机器上用轻量的 Python 版）…"
     create_vm "$name" "$zone" e2-small 10GB
