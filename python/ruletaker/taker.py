@@ -2144,9 +2144,34 @@ class RuleTaker:
             try:
                 answer = await self.api.remove_orders([oid])
                 removed = oid in (answer.get("removed") or []) or oid in (answer.get("noop") or [])
-                lines.append(("3/4 撤单成功" if removed else "3/4 撤单请求发出，Predict 的应答里没有它") + f"（往返 {(time.perf_counter() - began) * 1000:.0f} ms）")
+                lines.append(f"3/4 撤单成功（往返 {(time.perf_counter() - began) * 1000:.0f} ms）" if removed else
+                             f"3/4 撤单请求发出，Predict 的应答里没有它（往返 {(time.perf_counter() - began) * 1000:.0f} ms；"
+                             f"应答：{getattr(self.api, 'last_remove', '')}）")
             except Exception as error:
                 lines.append(f"3/4 撤单失败：{clean_error(error) or type(error).__name__}（它 {self.TEST_SECONDS // 60} 分钟后自己过期）")
+            if not removed:
+                # the answer did not name it: the order itself says whether it is gone (a cancel Predict carries out a moment
+                # later); still open after a few reads, asked once more
+                for attempt in range(TEST_LOOKUPS + 1):
+                    await asyncio.sleep(self.lookup_s / 3)
+                    with contextlib.suppress(Exception):
+                        row = await self.api.order(oid, digest)
+                        if row:
+                            got, status = order_fill(row, float(shares))
+                            filled_seen = max(filled_seen, got)
+                            if status and status != "OPEN":
+                                removed = True
+                                lines.append(f"3/4 再查：已经是 {status}，撤单生效了")
+                                break
+                    if attempt == TEST_LOOKUPS // 2:
+                        with contextlib.suppress(Exception):
+                            again = await self.api.remove_orders([oid])
+                            if oid in (again.get("removed") or []) or oid in (again.get("noop") or []):
+                                removed = True
+                                lines.append("3/4 再撤一次：撤单成功")
+                                break
+                if not removed:
+                    lines.append(f"3/4 再查了几次仍是挂着（最后一次撤单应答：{getattr(self.api, 'last_remove', '')}）")
             def spent(n: float) -> str:
                 return f"（花了约 ${n * float(price):.2f}，这几份照常结算）" if n > DUST else ""
             final_read = False

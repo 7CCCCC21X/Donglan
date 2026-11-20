@@ -49,7 +49,8 @@ class FakeApi:
         self.refuse_connect = False  # no connection to be had: an order's request never leaves (as http.request tells it)
         self.clock: Any = None       # the taker's clock, moved on by book_ms while a REST book read is out
         self.book_ms = 0
-        self.order_reads: list[str] = []  # GET /orders/{hash}, one answer each in turn: "" as it stands, "timeout" lost
+        self.order_reads: list[str] = []
+        self.remove_mode = ""  # a cancel answered without naming the ids: "silent" carried out all the same, "ignored" not  # GET /orders/{hash}, one answer each in turn: "" as it stands, "timeout" lost
         self.jwt_ok = True
         self.stream: Any = None
         self.pre_send: Any = None
@@ -126,9 +127,13 @@ class FakeApi:
     async def remove_orders(self, ids: list[str]) -> dict:
         self.calls.append(("remove", tuple(ids)))
         self.removed.extend(ids)
-        for row in self.orders.values():
-            if row["id"] in ids and row["status"] == "OPEN":
-                row["status"] = "CANCELLED"
+        if self.remove_mode != "ignored":
+            for row in self.orders.values():
+                if row["id"] in ids and row["status"] == "OPEN":
+                    row["status"] = "CANCELLED"
+        if self.remove_mode:
+            self.last_remove = '{"success":true,"data":{"removed":[],"noop":[]}}'
+            return {"removed": [], "noop": []}
         return {"removed": list(ids), "noop": []}
 
     async def order(self, oid: str, hash_: str = "") -> dict | None:

@@ -640,13 +640,46 @@ pub async fn order_test(me: &Me) -> String {
         match api.remove_orders(std::slice::from_ref(&oid)).await {
             Ok((gone, noop)) => {
                 removed = gone.contains(&oid) || noop.contains(&oid);
-                lines.push(format!(
-                    "{}（往返 {:.0} ms）",
-                    if removed { "3/4 撤单成功" } else { "3/4 撤单请求发出，Predict 的应答里没有它" },
-                    (mono() - began) * 1000.0
-                ));
+                lines.push(if removed {
+                    format!("3/4 撤单成功（往返 {:.0} ms）", (mono() - began) * 1000.0)
+                } else {
+                    format!(
+                        "3/4 撤单请求发出，Predict 的应答里没有它（往返 {:.0} ms；应答：{}）",
+                        (mono() - began) * 1000.0,
+                        api.last_remove.borrow()
+                    )
+                });
             }
             Err(e) => lines.push(format!("3/4 撤单失败：{}（它 {} 分钟后自己过期）", clean(&e), TEST_SECONDS / 60)),
+        }
+        if !removed {
+            // the answer did not name it: the order itself says whether it is gone (a cancel Predict carries out a moment
+            // later); still open after a few reads, asked once more
+            let pause = me.borrow().lookup_s;
+            for attempt in 0..=TEST_LOOKUPS {
+                crate::sync::sleep(pause / 3.0).await;
+                if let Ok(Some(row)) = api.order(&oid, &digest).await {
+                    let (got, status) = order_fill(&row, shares);
+                    filled_seen = filled_seen.max(got);
+                    if !status.is_empty() && status != "OPEN" {
+                        removed = true;
+                        lines.push(format!("3/4 再查：已经是 {status}，撤单生效了"));
+                        break;
+                    }
+                }
+                if attempt == TEST_LOOKUPS / 2 {
+                    if let Ok((gone, noop)) = api.remove_orders(std::slice::from_ref(&oid)).await {
+                        if gone.contains(&oid) || noop.contains(&oid) {
+                            removed = true;
+                            lines.push("3/4 再撤一次：撤单成功".into());
+                            break;
+                        }
+                    }
+                }
+            }
+            if !removed {
+                lines.push(format!("3/4 再查了几次仍是挂着（最后一次撤单应答：{}）", api.last_remove.borrow()));
+            }
         }
         let spent = |n: f64| {
             if n > crate::util::DUST { format!("（花了约 ${:.2}，这几份照常结算）", n * pf) } else { String::new() }

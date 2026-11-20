@@ -66,6 +66,8 @@ pub struct FakePredict {
     pub book_ms: Cell<i64>,
     /// GET /orders/{hash}, one answer each in turn: "" as it stands, "empty" a 200 with no order in it, "timeout" lost
     pub order_reads: RefCell<std::collections::VecDeque<&'static str>>,
+    /// a cancel answered without naming the ids ("silent": carried out all the same; "ignored": not carried out)
+    pub remove_mode: Cell<&'static str>,
 }
 
 impl FakePredict {
@@ -143,10 +145,16 @@ impl FakePredict {
             let ids: Vec<String> =
                 body["data"]["ids"].as_array().map(|a| a.iter().map(crate::util::py_str).collect()).unwrap_or_default();
             self.removed.borrow_mut().extend(ids.clone());
-            for row in self.orders.borrow_mut().values_mut() {
-                if ids.contains(&row.s("id")) && row.s("status") == "OPEN" {
-                    row.insert("status".into(), json!("CANCELLED"));
+            let mode = self.remove_mode.get();
+            if mode != "ignored" {
+                for row in self.orders.borrow_mut().values_mut() {
+                    if ids.contains(&row.s("id")) && row.s("status") == "OPEN" {
+                        row.insert("status".into(), json!("CANCELLED"));
+                    }
                 }
+            }
+            if !mode.is_empty() {
+                return Self::ok(json!({"removed": [], "noop": []}));
             }
             return Self::ok(json!({"removed": ids, "noop": []}));
         }
@@ -1514,5 +1522,29 @@ fn paper_records_nothing_past_the_15_second_line() {
         flow::turn(&r.me).await;
         let bought = r.me.borrow().record(&slug_of(start()), Some("paper")).map(crate::rules::filled).unwrap_or(0.0);
         assert_eq!(bought, 50.0, "{}", r.word());
+    });
+}
+
+#[test]
+fn an_order_test_whose_cancel_answer_names_nothing_reads_the_order_itself() {
+    run(async {
+        for (mode, done) in [("silent", true), ("ignored", false)] {
+            let r = rig(start() - 3_600_000, &[]);
+            r.found().await;
+            r.api.books.borrow_mut().insert(MID.into(), json!({"bids": [["0.40", "10"]], "asks": [["0.60", "10"]]}));
+            r.api.remove_mode.set(mode);
+            r.me.borrow_mut().lookup_s = 0.03;
+            let text = control::order_test(&r.me).await;
+            assert!(
+                text.contains("应答里没有它") && text.contains(r#"{"success":true,"data":{"removed":[],"noop":[]}}"#),
+                "{text}"
+            );
+            if done {
+                assert!(text.contains("已经是 CANCELLED，撤单生效了") && text.contains("结论：✅"), "{text}");
+            } else {
+                assert!(text.contains("仍是挂着") && text.contains("撤单没确认"), "{text}");
+                assert_eq!(r.api.removed.borrow().len(), 2, "{text}"); // (asked once more)
+            }
+        }
     });
 }

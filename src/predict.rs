@@ -251,6 +251,8 @@ pub struct PredictApi {
     pub trips: RefCell<VecDeque<(String, f64)>>,
     /// monotonic: the last answered request (a warm connection)
     pub last_ok: Cell<f64>,
+    /// the last cancel's answer as Predict gave it (cut short): shown when the order asked for is not in it
+    pub last_remove: RefCell<String>,
     pub transport: Rc<dyn Transport>,
     /// the tests' stand-in for whatever a request waits for before its bytes leave (a token, a slot, a sign-in)
     pub pre_send: RefCell<Option<Rc<dyn Fn()>>>,
@@ -286,6 +288,7 @@ impl PredictApi {
             last_ok: Cell::new(0.0),
             transport,
             pre_send: RefCell::new(None),
+            last_remove: RefCell::new(String::new()),
         }
     }
 
@@ -534,6 +537,7 @@ impl PredictApi {
                 None,
             )
             .await?;
+        *self.last_remove.borrow_mut() = answer.to_string().chars().take(200).collect();
         let data = answer.get("data").filter(|d| d.is_object()).cloned().unwrap_or(answer);
         let list = |k: &str| data.arr(k).iter().map(py_str).collect::<Vec<_>>();
         Ok((list("removed"), list("noop")))

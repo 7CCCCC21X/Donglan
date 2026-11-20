@@ -210,5 +210,24 @@ class PaperLineTest(unittest.TestCase):
         self.assertEqual(run(go(0)), 50.0)     # read at once: recorded
 
 
+class UnnamedCancelTest(unittest.TestCase):
+    def test_an_order_test_whose_cancel_answer_names_nothing_reads_the_order_itself(self) -> None:
+        async def go(mode: str) -> tuple:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            api.books[MID] = (((D("0.30"), D("10")),), ((D("0.55"), D("100")),))
+            api.remove_mode, taker.lookup_s = mode, 0.03
+            return await taker.order_test(), api
+        text, _ = run(go("silent"))
+        self.assertIn("应答里没有它", text)
+        self.assertIn('"removed":[]', text)
+        self.assertIn("已经是 CANCELLED，撤单生效了", text)
+        self.assertIn("结论：✅", text)
+        text, api = run(go("ignored"))
+        self.assertIn("仍是挂着", text)
+        self.assertIn("撤单没确认", text)
+        self.assertEqual(len(api.removed), 2)  # (asked once more)
+
+
 if __name__ == "__main__":
     unittest.main()

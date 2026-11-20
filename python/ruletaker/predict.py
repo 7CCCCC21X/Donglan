@@ -155,6 +155,7 @@ class PredictApi:
         self.limited: collections.deque = collections.deque(maxlen=500)
         self.trips: collections.deque = collections.deque(maxlen=300)  # (method, ms): the request alone, after the pace and the gate
         self.last_ok = 0.0  # monotonic: the last answered request (a warm connection)
+        self.last_remove = ""  # the last cancel's answer as Predict gave it (cut short): shown when the order is not in it
 
     # -- plumbing --
     def gates(self) -> tuple[asyncio.Semaphore, asyncio.Semaphore]:
@@ -333,6 +334,7 @@ class PredictApi:
 
     async def remove_orders(self, ids: list[str]) -> dict:
         answer = await self.authed("POST", "/orders/remove", {"data": {"ids": [str(i) for i in ids]}}, priority=True)
+        self.last_remove = json.dumps(answer, ensure_ascii=False, separators=(",", ":"))[:200]
         data = answer.get("data") if isinstance(answer.get("data"), dict) else answer
         return {"removed": [str(i) for i in (data.get("removed") or [])], "noop": [str(i) for i in (data.get("noop") or [])]}
 
