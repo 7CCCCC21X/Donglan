@@ -11,6 +11,7 @@ import collections
 import contextlib
 import http.client
 import json
+import select
 import ssl
 import threading
 import time
@@ -37,7 +38,7 @@ HTTP_HINTS = {451: "部署所在地或接口访问受限；请核对官方地区
 NOT_CONNECTED = "连接没建立"  # how a request that never got a connection is told: nothing of it went out (an order may go again)
 _POOL: dict[tuple[str, int], list[tuple[Any, float]]] = {}
 _POOL_LOCK = threading.Lock()
-HTTP_STATS = {"new": 0, "reused": 0, "retried": 0}
+HTTP_STATS = {"new": 0, "reused": 0, "retried": 0, "dead": 0}  # (changed under _POOL_LOCK: the requests run on several threads)
 # host -> "connect": the last new connections' TCP + TLS handshakes in ms (two or three round trips to whatever answers for the
 # host — a CDN's site near the machine, or the service itself); "edge": the last answer's cf-ray (its suffix names the Cloudflare
 # site the request entered at)
@@ -45,7 +46,40 @@ HTTP_NET: dict[str, dict] = {}
 
 
 def http_net(host: str) -> dict:
-    return HTTP_NET.setdefault(host, {"connect": collections.deque(maxlen=40), "edge": ""})
+    with _POOL_LOCK:
+        return HTTP_NET.setdefault(host, {"connect": collections.deque(maxlen=40), "edge": ""})
+
+
+def _count(name: str) -> None:
+    with _POOL_LOCK:
+        HTTP_STATS[name] += 1
+
+
+def _closed(conn: Any) -> bool:
+    """Whether the server has closed a pooled connection meanwhile (no wait): nothing come in — good; bytes come in are read
+    without waiting: TLS records of its own (a TLS 1.3 session ticket sent after the answer), nothing for us behind them — good;
+    its end, a close_notify, an alert, or data no request asked for (a 408 before it hangs up) — closed."""
+    sock = getattr(conn, "sock", None)
+    if sock is None:
+        return False  # (no socket held: http.client opens one for the request)
+    try:
+        pending = sock.pending() if isinstance(sock, ssl.SSLSocket) else 0
+        if not pending and not select.select([sock], [], [], 0)[0]:
+            return False
+    except (OSError, ValueError):
+        return True
+    timeout = sock.gettimeout()
+    try:
+        sock.setblocking(False)
+        sock.recv(1)
+        return True  # (b"": the end or a close_notify; a byte: data nobody asked for)
+    except (ssl.SSLWantReadError, BlockingIOError, InterruptedError):
+        return False
+    except (OSError, ValueError):
+        return True
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            sock.settimeout(timeout)
 
 
 def _inflate(raw: bytes, encoding: str) -> bytes:
@@ -62,23 +96,32 @@ def _inflate(raw: bytes, encoding: str) -> bytes:
 
 
 def _pool_take(host: str, port: int, timeout: float, max_idle: float) -> tuple[Any, bool]:
-    """The most recently used pooled connection to host:port, when used within ``max_idle`` seconds, else a new one (only the
-    pooled ones idle past KEEPALIVE_IDLE_SECONDS are dropped on a miss: the others stay for the GETs)."""
-    with _POOL_LOCK:
-        rows = _POOL.get((host, port))
-        now = time.monotonic()
-        if rows and now - rows[-1][1] <= max_idle:
-            conn, _ = rows.pop()
-            HTTP_STATS["reused"] += 1
-            if getattr(conn, "sock", None) is not None:
-                conn.sock.settimeout(timeout)
-            return conn, True
-        if rows:
-            for old, last in rows:
-                if now - last > KEEPALIVE_IDLE_SECONDS:
-                    old.close()
-            rows[:] = [(old, last) for old, last in rows if now - last <= KEEPALIVE_IDLE_SECONDS]
-        HTTP_STATS["new"] += 1
+    """The most recently used pooled connection to host:port, when used within ``max_idle`` seconds and not closed by the
+    server meanwhile, else a new one (only the pooled ones idle past KEEPALIVE_IDLE_SECONDS are dropped on a miss: the others
+    stay for the GETs)."""
+    while True:
+        with _POOL_LOCK:
+            rows = _POOL.get((host, port))
+            now = time.monotonic()
+            conn = None
+            if rows and now - rows[-1][1] <= max_idle:
+                conn, _ = rows.pop()
+            elif rows:
+                for old, last in rows:
+                    if now - last > KEEPALIVE_IDLE_SECONDS:
+                        old.close()
+                rows[:] = [(old, last) for old, last in rows if now - last <= KEEPALIVE_IDLE_SECONDS]
+        if conn is None:
+            break
+        if _closed(conn):  # (an order never goes out on a connection the server has let go: it could swallow it)
+            conn.close()
+            _count("dead")
+            continue
+        _count("reused")
+        if getattr(conn, "sock", None) is not None:
+            conn.sock.settimeout(timeout)
+        return conn, True
+    _count("new")
     return HTTPS_CONNECTION(host, port, timeout=timeout, context=SSL_CONTEXT), False
 
 
@@ -215,7 +258,7 @@ def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str,
             except (OSError, http.client.HTTPException) as error:
                 conn.close()
                 if reused:  # the server had closed it; nothing of this request was taken: once more, on a fresh one
-                    HTTP_STATS["retried"] += 1
+                    _count("retried")
                     waited = True
                     continue
                 raise _net_error(error) from None
@@ -224,7 +267,7 @@ def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str,
             except (OSError, http.client.HTTPException) as error:
                 conn.close()
                 if reused and data is None:  # a GET the closed connection swallowed: again; a POST may have been taken
-                    HTTP_STATS["retried"] += 1
+                    _count("retried")
                     continue
                 raise _net_error(error) from None
             break
@@ -235,7 +278,10 @@ def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str,
             if status >= 400:
                 raw = b""
                 with contextlib.suppress(Exception):
-                    raw = response.read(4096)
+                    raw = response.read(65536)
+                if response.isclosed() and not response.will_close:  # (its answer read whole: the connection serves the next one)
+                    _pool_put(host, port, conn)
+                    conn = None
                 raise _remote_error(host, status, response.getheader("Retry-After"), raw, response.getheader("Content-Encoding") or "")
             location = response.getheader("Location")
             if 300 <= status < 400 and location and data is None:

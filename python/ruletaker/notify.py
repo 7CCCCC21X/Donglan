@@ -120,6 +120,8 @@ class Telegram:
         self.stranger: tuple[int, str] | None = None  # the last command from someone not ADMIN_USER_ID: (their id, the command)
         self.admin_seen = False
         self.logged = ""
+        # the confirm cards whose ✅ was pressed (chat, message, the card's own time and command)
+        self.used_yes: collections.deque = collections.deque(maxlen=64)
         self.queue: collections.deque = collections.deque(maxlen=200)
         self.wake = asyncio.Event()
         self.sent = self.failed = 0
@@ -421,12 +423,22 @@ class Telegram:
                 await self.answer_button(query_id, "确认已过期，请重新点一次")
                 await self.edit_card(chat, message_id, self.menu_card())
                 return
+            # a card's yes runs its command once, however often it is tapped (the menu's message shows a new card, with its
+            # own time, for the next one)
+            card = (chat, message_id, rest)
+            if card in self.used_yes:
+                await self.answer_button(query_id, "已经确认过，正在执行或已执行完")
+                return
+            self.used_yes.append(card)
         else:
             await self.answer_button(query_id, "")
             await self.edit_card(chat, message_id, self.menu_card())
             return
         command, _, args = cmd.partition(" ")
         await self.answer_button(query_id, "收到")
+        if kind == "y":
+            # the card's ✅ gone before the command runs (the menu back in its place; refreshed again when it is done)
+            await self.edit_card(chat, message_id, self.menu_card())
         await self.answer(command, args, (chat, thread))
         await self.edit_card(chat, message_id, self.menu_card())
 

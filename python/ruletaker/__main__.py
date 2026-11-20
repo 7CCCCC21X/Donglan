@@ -228,8 +228,8 @@ async def check(config: Config, probe_order: bool = True) -> int:
         print(f"余额：USDT {from_wei(usdt):,.2f}｜签名钱包 BNB {from_wei(bnb):.4f}")
     except Exception as error:
         print(f"⚠️ 余额没读到：{clean_error(error)}")
-    for neg in (False, True):
-        key = exchange_key(neg, False)
+    # (all four: which one a market settles on is its isNegRisk × isYieldBearing; the service's /check names the ones in use)
+    for key in (exchange_key(n, y) for y in (False, True) for n in (False, True)):
         try:
             allowance = await chain.allowance(key)
             print(f"授权 {key}：{'✅ 已授权' if allowance >= 10 ** 20 else '❌ 没有授权（在 Predict 网站用这个账户交易一次）'}")

@@ -131,6 +131,8 @@ class FakeApi:
             for row in self.orders.values():
                 if row["id"] in ids and row["status"] == "OPEN":
                     row["status"] = "CANCELLED"
+        if self.remove_mode == "noop":  # (Predict: nothing to withdraw — filled or gone already)
+            return {"removed": [], "noop": list(ids)}
         if self.remove_mode:
             self.last_remove = '{"success":true,"data":{"removed":[],"noop":[]}}'
             return {"removed": [], "noop": []}
@@ -148,6 +150,7 @@ class FakeChain:
     def __init__(self, usdt: float = 1000.0) -> None:
         self.usdt = int(usdt * 10 ** 18)
         self.allowed = 2 ** 256 - 1
+        self.allowed_by: dict[str, int] = {}  # per exchange (an exchange_key); one not named has ``allowed``
 
     async def usdt_balance(self) -> int:
         return self.usdt
@@ -156,7 +159,7 @@ class FakeChain:
         return 10 ** 17
 
     async def allowance(self, key: str) -> int:
-        return self.allowed
+        return self.allowed_by.get(key, self.allowed)
 
     async def account_owner(self, account: str) -> str:
         return "0x" + "0" * 40

@@ -492,6 +492,17 @@ def predict_resolution(market: dict) -> dict | None:
     return {"index": index, "name": names[index], "split": False, "how": "resolution"}
 
 
+def won_index_set(market: dict, resolution: dict) -> int | None:
+    """The indexSet of the outcome a market settled on, numbered as parse_market numbers its outcomes; None for a split."""
+    i = resolution.get("index")
+    if i is None:
+        return None
+    rows = sorted((o for o in market.get("outcomes") or [] if isinstance(o, dict)), key=lambda o: int(o.get("indexSet") or 0))
+    if not 0 <= i < len(rows):
+        return None
+    return int(rows[i].get("indexSet") or i + 1)
+
+
 @dataclasses.dataclass
 class MarketInfo:
     market_id: str

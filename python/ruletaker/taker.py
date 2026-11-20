@@ -25,11 +25,14 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import datetime as dt
 import gc
 import hashlib
 import os
+import queue
 import statistics
 import sys
+import threading
 import time
 import urllib.parse
 from decimal import Decimal as D
@@ -37,12 +40,13 @@ from typing import Any
 
 from . import VERSION
 from . import http as nethttp
-from .clock import day_spans_text
+from .clock import CALENDAR, day_spans_text
 from . import console
 from .config import Config, RuleSettings
 from .predict import (API_BASES, PREDICT_REST, RPC_URLS, Chain, NotSent, OrderRejected, PredictApi, book_up_first,
                       category_market, http_status, market_start_price, order_fill, order_final, order_price,
-                      outcome_for_side, parse_market, predict_resolution, DUPLICATE_WORDS, DOWN_WORDS, UP_WORDS)  # noqa: F401
+                      outcome_for_side, parse_market, predict_resolution, won_index_set, DUPLICATE_WORDS, DOWN_WORDS,
+                      UP_WORDS)  # noqa: F401
 from .rules import (FINAL_STATES, MARKET_NAMES, MODES, NEVER_PLACED, PREFIX, RACES_SHOWN, RULE_OF, RULES, WATCH, Rule, avg_price,
                     claims, cost, course_part, course_speed, course_stats, filled, held, in_flight, lead_note, live_price_of,
                     live_rule, net, offered, open_cost, open_orders, race_summary, race_text, races, rid, speed_stats, spent_on,
@@ -126,6 +130,54 @@ def start_now(coro: Any, name: str) -> "asyncio.Task":
 
 MODE_RANK = {"off": 0, "paper": 1, "on": 2}
 TEST_LOOKUPS, TEST_LOOKUP_S = 4, 1.5   # an order test whose answer was lost: looked for by its hash this often, this far apart
+
+
+CALENDAR_WARN_DAYS = 30  # the CME holiday calendar's last days, told in /check, the status and once a day
+EXCHANGES = [exchange_key(n, y) for y in (False, True) for n in (False, True)]
+EXCHANGE_NAMES = {"CTF_EXCHANGE": "标准交易所", "NEG_RISK_CTF_EXCHANGE": "多结果交易所", "YIELD_BEARING_CTF_EXCHANGE": "收益型交易所",
+                  "YIELD_BEARING_NEG_RISK_CTF_EXCHANGE": "收益型多结果交易所"}
+_SYNCS: queue.SimpleQueue | None = None
+
+
+def journal_sync(fd: int, taker: Any) -> None:
+    """A journal's lines made durable (fdatasync) on a thread of its own — never in the order's path: asked right after the
+    line is written, done while the request is on its way."""
+    global _SYNCS
+    if _SYNCS is None:
+        _SYNCS = queue.SimpleQueue()
+        threading.Thread(target=_sync_journals, args=(_SYNCS,), name="rt-journal-sync", daemon=True).start()
+    _SYNCS.put((fd, taker))
+
+
+def _sync_journals(asked: queue.SimpleQueue) -> None:
+    while True:
+        fd, taker = asked.get()
+        with contextlib.suppress(OSError):
+            os.fdatasync(fd)
+        taker.journal_syncs += 1
+
+
+def settle_every(since_end_ms: int) -> int:
+    """How often a window's settlement is read: every minute at first; still unsettled an hour past its end, every ten minutes;
+    a day past it, every hour (a market Predict is slow to settle, or settles in words not understood, costs a read an hour)."""
+    if since_end_ms < 3_600_000:
+        return SETTLE_EVERY_MS
+    return 10 * 60_000 if since_end_ms < DAY_MS else 3_600_000
+
+
+def paid(rec: dict, resolution: dict, won: int | None) -> float | None:
+    """What a share the record holds paid at the settlement: by the outcome it bought (its indexSet) — the winning outcome's
+    name read only for a record without one (written before it was kept); a split pays half. None when it cannot be told."""
+    if resolution.get("split"):
+        return 0.5
+    held = int(rec.get("index_set") or 0)
+    if held > 0 and won is not None:
+        return 1.0 if won == held else 0.0
+    name = str(resolution.get("name") or "").strip().lower()
+    up = 1.0 if name in UP_WORDS else 0.0 if name in DOWN_WORDS else None
+    if up is None:
+        return None
+    return up if rec.get("side") == "up" else 1 - up
 
 
 def placed_or_not(error: BaseException) -> str:
@@ -268,6 +320,12 @@ class RuleTaker:
         self.presigned = self.presign_hits = 0
         self.journal_fd: int | None = None
         self.journal_cut = False
+        self.journal_syncs = 0       # the journal made durable behind the orders (journal_sync), so many times
+        self.testing = False         # an order test under way (one at a time: a second asked meanwhile is told so, not run)
+        # the last day of the CME holiday calendar (CME_CLOSED_DAYS / CME_EARLY_DAYS, as set at the start), and the Beijing day
+        # its running out was last told
+        self.cal_last = CALENDAR.last_day()
+        self.cal_told = ""
         self.errors: collections.deque = collections.deque(maxlen=20)
         self.error = ""
         self.stop = asyncio.Event()
@@ -338,8 +396,11 @@ class RuleTaker:
         """The USDT this taker may still spend: the balance last read on-chain, less what that read could not have seen (a fill
         reaches the chain a few seconds after it is matched: BALANCE_LAG_MS) — an order placed, or filled, since just before
         the read began: its fills at their price once its word is final, its limit in full while not; any other order not
-        final yet: its unfilled rest at its limit (resting, or its answer lost: it may still take the money, whatever its
-        age). None before a read. ``excluding``: an order not to count (before_send judges an order against what is left)."""
+        final yet: its unfilled rest at its limit (resting, or its answer lost: it may still take the money) — until a read
+        begun GIVE_UP_MS past the order's signed expiry (at its window's start, or its end: Predict matches nothing after it,
+        so that read has all it ever took, however long its answer stays lost). A window a day older than the read holds no
+        order that may take anything: not looked at. None before a read. ``excluding``: an order not to count (before_send
+        judges an order against what is left)."""
         if self.usdt is None:
             return None
         since = self.balance_asked_ms - BALANCE_LAG_MS
@@ -351,8 +412,10 @@ class RuleTaker:
                 if o is excluding or o.get("paper") or o.get("state") in NEVER_PLACED:
                     continue
                 unseen = int(o.get("at") or 0) >= since or int(o.get("filled_ms") or 0) >= since
+                expires = int(o.get("expires") or 0)
+                expired = expires > 0 and since >= expires * 1000 + GIVE_UP_MS
                 shares, done, limit = float(o.get("shares") or 0), float(o.get("filled") or 0), float(o.get("limit") or 0)
-                if o.get("state") in FINAL_STATES:
+                if o.get("state") in FINAL_STATES or expired:
                     spent += done * float(o.get("avg") or o.get("limit") or 0) if unseen else 0.0
                 else:
                     spent += shares * limit if unseen else max(shares - done, 0.0) * limit
@@ -431,6 +494,8 @@ class RuleTaker:
             return f"已暂停（{self.paused}）"
         if stop := self.loss_stop_why():
             return stop
+        if why := self.calendar_why(self.now()):
+            return why
         if not self.ready:
             return f"真实交易未就绪：{self.not_ready_why}"
         if error := str(getattr(self.store, "error", "") or ""):
@@ -440,6 +505,20 @@ class RuleTaker:
         usd_left = self.usd(excluding)
         if usd_left is not None and usd_left < usd - 1e-9:
             return f"USDT 余额 ${usd_left:,.2f} 不足本单 ${usd:,.2f}"
+        return ""
+
+    def calendar_left(self, now: int) -> int | None:
+        """Days the CME holiday calendar still covers from ``now`` (0 once its last listed day is over); None without one."""
+        if self.cal_last is None:
+            return None
+        return max((self.cal_last - dt.date(1970, 1, 1)).days + 1 - now // DAY_MS, 0)
+
+    def calendar_why(self, now: int) -> str:
+        """Why no real order goes out for the calendar: its last listed day over, a holiday after it is not known (a day
+        missing trades a standing index). "" while it covers today."""
+        if self.calendar_left(now) == 0:
+            return (f"CME 休市日历只排到 {self.cal_last.isoformat()}，之后哪天休市不知道（错过一天就会在不动的指数上下单）："
+                    "在设置文件补上之后的 CME_CLOSED_DAYS、CME_EARLY_DAYS 再重启")
         return ""
 
     def halted(self) -> bool:
@@ -1007,6 +1086,13 @@ class RuleTaker:
     def plan(self, now: int) -> None:
         """The windows of the enabled rules from now to a day on; a window of a rule switched off is dropped, and so is one this
         close to its start (or, for a rule that buys in its windows' course too, to its end). Old finished records removed."""
+        # the holiday calendar running out: told once a day for its last CALENDAR_WARN_DAYS (then no real order goes out)
+        left = self.calendar_left(now)
+        if left is not None and left <= CALENDAR_WARN_DAYS and self.cal_told != day_of(now) and self.settings.mode == "on":
+            self.cal_told = day_of(now)
+            self.alarm(f"⛔ 规则吃单：{self.calendar_why(now)}" if left == 0 else
+                       f"⚠️ 规则吃单：CME 休市日历只排到 {self.cal_last.isoformat()}（还剩 {left} 天）。到期后不再下单：在设置文件补上之后的"
+                       " CME_CLOSED_DAYS、CME_EARLY_DAYS（bash deploy/gcp/rt.sh edit）")
         want: dict[str, tuple[str, int]] = {}
         if self.settings.mode != "off":
             for rule in RULES:
@@ -1530,6 +1616,9 @@ class RuleTaker:
             w["word"] = f"认不出{rule.word}的代币"
             return
         fields, amounts, info, outcome, expires = made
+        # the record's shares are the ones signed: Predict keeps 5 significant digits of a quantity (a whole number up to the
+        # settings' 100 000 keeps every one; a longer one is cut, and its fills are read against what was cut)
+        take = D(int(amounts["taker"])) / D(10 ** 18)
         digest, signature, ahead = self.sign(fields, info.neg_risk, info.yield_bearing)
         if ahead:
             self.presign_hits += 1
@@ -1657,6 +1746,7 @@ class RuleTaker:
             self.note(f"订单日志只写进 {wrote}/{len(line)} 字节（磁盘满了？），改为等数据库写完再发单")
             return False
         self.journal_cut = False
+        journal_sync(self.journal_fd, self)  # (on the disk itself a moment after the request leaves, a power cut or not)
         return True
 
     def recover(self) -> None:
@@ -1688,6 +1778,14 @@ class RuleTaker:
                         LOG.warning("规则吃单：订单日志里有一张记录里没有的单（%s），按哈希核对", order["hash"][:12])
             written = self.store.flush()
             self.journal_fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | (os.O_TRUNC if written else 0), 0o600)
+            # the file and its folder's entry on the disk now (once, at the start), its lines after each order
+            with contextlib.suppress(OSError):
+                os.fsync(self.journal_fd)
+                folder = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+                try:
+                    os.fsync(folder)
+                finally:
+                    os.close(folder)
         except OSError as error:
             LOG.warning("规则吃单：订单日志打不开（%s），发单前改为等数据库写完", type(error).__name__)
 
@@ -1764,7 +1862,9 @@ class RuleTaker:
         except Exception as error:
             order.update(error=clean_error(error) or type(error).__name__, next_ms=0)
             return
-        if str(order["id"]) in {str(i) for i in (result.get("removed") or [])}:
+        # (noop: nothing left to withdraw — filled or expired already; either way off the book, as follow_order takes it)
+        gone = {str(i) for i in (result.get("removed") or [])} | {str(i) for i in (result.get("noop") or [])}
+        if str(order["id"]) in gone:
             order.update(removed=now, left_ms=now, state="cancelling", next_ms=now + FOLLOW_EVERY_MS)
         else:
             order["next_ms"] = 0
@@ -1847,14 +1947,16 @@ class RuleTaker:
         for slug, rec in list(self.recs.items()):
             if rec.get("pnl") is not None or in_flight(rec) or filled(rec) <= DUST:
                 continue
-            if now < int(rec.get("end_ms") or 0) + SETTLE_AFTER_MS or now - int(rec.get("settle_checked") or 0) < SETTLE_EVERY_MS:
+            end = int(rec.get("end_ms") or 0)
+            if now < end + SETTLE_AFTER_MS or now - int(rec.get("settle_checked") or 0) < settle_every(now - end):
                 continue
             if self.cooling() > 0:
                 return
             rec["settle_checked"] = now
             try:
                 self.reads += 1
-                resolution = predict_resolution(await self.api.market(str(rec["market_id"])))
+                market = await self.api.market(str(rec["market_id"]))
+                resolution = predict_resolution(market)
             except Exception as error:
                 rec["settle_error"] = clean_error(error) or type(error).__name__
                 self.save(rec)
@@ -1862,13 +1964,17 @@ class RuleTaker:
             if not resolution:
                 self.save(rec)
                 continue
-            name = str(resolution.get("name") or "").lower()
-            up = 0.5 if resolution.get("split") else 1.0 if name in UP_WORDS else 0.0 if name in DOWN_WORDS else None
-            if up is None:
+            pay = paid(rec, resolution, won_index_set(market, resolution))
+            if pay is None:
+                first = not rec.get("settle_alarmed")
                 rec["settle_error"] = f"结果名称认不出：{resolution.get('name')}"
+                rec["settle_alarmed"] = True
                 self.save(rec)
+                if first:
+                    self.alarm(f"⚠️ 规则吃单：{rec.get('name') or slug} 已结算，但认不出结果（{resolution.get('name')}），"
+                               "这一场的盈亏算不出、不计入今天的亏损停机线：请到 Predict 网站核对")
                 continue
-            pay = up if rec["side"] == "up" else 1 - up
+            up = pay if resolution.get("split") or rec["side"] == "up" else 1 - pay
             pnl = net(rec) * pay - cost(rec)
             rec.update(result="split" if up == 0.5 else "up" if up == 1.0 else "down", pnl=round(pnl, 6), settled_ms=now, settled_day=day_of(now))
             self.pnl_epoch += 1
@@ -1989,6 +2095,15 @@ class RuleTaker:
                 "/settings 设置｜/set 设置名 数值｜/review 复盘｜/id")
 
     # -- the self-check and the order test (Telegram /check /test, the control page's buttons, rt.sh check / test) --
+    def exchanges_in_use(self) -> set[str]:
+        """The exchanges (EXCHANGES keys) the markets followed now settle on."""
+        out = set()
+        for w in self.track.values():
+            if w.get("market") is not None:
+                info = parse_market(w["market"], self.config.fee_bps)
+                out.add(exchange_key(info.neg_risk, info.yield_bearing))
+        return out
+
     async def self_check(self) -> str:
         """Everything a real order needs, looked at now and said in one message (huice's /live check, and more): the mode and its
         stops, the sign-in, the Predict account's owner on-chain, the balance, the exchange allowances, whether Predict's order
@@ -2016,6 +2131,16 @@ class RuleTaker:
             no("LIVE_TRADING_ALLOWED 不是 on：真实吃单模式也不会下单")
         if live and floor is not None and self.loss_stop_why():
             no(f"今天已到过日亏损停机线 {money(floor)}：今天不再开新单（/resume 从现在的盈亏起再给一个额度）")
+        left = self.calendar_left(now)
+        if left == 0:
+            (no if live else warn)(self.calendar_why(now))
+        elif left is not None and left <= CALENDAR_WARN_DAYS:
+            warn(f"CME 休市日历只排到 {self.cal_last.isoformat()}（还剩 {left} 天）：到期前在设置文件补上之后的 CME_CLOSED_DAYS、"
+                 "CME_EARLY_DAYS，到期后不下单")
+        elif left is not None:
+            ok(f"CME 休市日历排到 {self.cal_last.isoformat()}")
+        else:
+            warn("CME 休市日历是空的（CME_CLOSED_DAYS、CME_EARLY_DAYS 都没写）：节假日也会照常下单")
         if self.wallet is None:
             (no if live else warn)("没有设置 PREDICT_PRIVATE_KEY：只能 off / paper")
         else:
@@ -2045,15 +2170,22 @@ class RuleTaker:
                 text = f"余额：USDT {from_wei(self.usdt):,.2f}（可用 {self.usd():,.2f}）" + (f"｜签名钱包 BNB {from_wei(self.bnb):.4f}" if self.bnb is not None else "")
                 (warn if need and (self.usd() or 0) < need else ok)(text + (f"｜不够买满一场（最多要 ${need:,.2f}）" if need and (self.usd() or 0) < need else ""))
             if self.chain is not None:
-                yielding = any(bool((w["market"] or {}).get("isYieldBearing")) for w in self.track.values() if w["market"] is not None)
-                for key, name, needed in (("CTF_EXCHANGE", "标准交易所", not yielding), ("YIELD_BEARING_CTF_EXCHANGE", "收益型交易所", yielding)):
+                # the exchanges the markets followed now settle on (each market's isNegRisk × isYieldBearing, as an order checks
+                # it): each must have the USDT allowance, or its orders are refused the moment they are due; with no market
+                # followed yet, all four told (none of them failing the check)
+                used = self.exchanges_in_use()
+                for key in EXCHANGES:
+                    if used and key not in used:
+                        continue
+                    name = EXCHANGE_NAMES[key]
                     try:
                         got = await self.read_allowance(key)
                         if got[1] >= 10 ** 20:
                             ok(f"授权：{name} USDT 额度已授权")
+                        elif not used:
+                            warn(f"授权：{name} 没有 USDT 额度（现在没有跟踪的市场，用到它的市场才需要）")
                         else:
-                            (no if needed else warn)(f"授权：{name} 没有 USDT 额度" + ("（规则吃单的市场要用：在 Predict 网站用这个账户交易一次）" if needed
-                                                                             else "（现在跟踪的市场用不到）"))
+                            no(f"授权：{name} 没有 USDT 额度（跟踪的市场要用：在 Predict 网站用这个账户交易一次）")
                     except Exception as error:
                         warn(f"授权：{name} 没读到（{clean_error(error) or type(error).__name__}）")
             if self.api.fresh() if hasattr(self.api, "fresh") else False:
@@ -2139,7 +2271,17 @@ class RuleTaker:
         the market (2¢ at the most, a cent under the best bid, never at or above the best ask: it rests), on a rule window whose
         matching is open — else the BTC quarter hour running now; read back by its hash, withdrawn, read again. Each step with
         Predict's answer and its round trip. The order is signed to expire in ten minutes, and is no rule order (not recorded as
-        one, nothing follows it but this)."""
+        one, nothing follows it but this). One at a time: asked again while one is under way (Telegram, the console, both),
+        the second is told so and places nothing."""
+        if self.testing:
+            return "⏳ 挂单测试正在进行，等它的结果（同一时间只做一张，这次没有再挂）"
+        self.testing = True
+        try:
+            return await self._run_order_test()
+        finally:
+            self.testing = False
+
+    async def _run_order_test(self) -> str:
         import math
         now = self.now()
         if self.wallet is None:
@@ -2536,6 +2678,16 @@ class RuleTaker:
                 + f"｜{'已登录' if self.api.fresh() else '未登录'}" + (f"｜未就绪：{self.not_ready_why}" if self.settings.mode == "on" and not self.ready else "")
                 + (f"｜在途和未结算 ${open_cost(self.recs):,.2f}" if open_cost(self.recs) > 0 else ""))
 
+    def calendar_note(self, now: int) -> str:
+        """The status's word on the holiday calendar in its last CALENDAR_WARN_DAYS ("" before)."""
+        left = self.calendar_left(now)
+        if left is None or left > CALENDAR_WARN_DAYS:
+            return ""
+        last = self.cal_last.isoformat()
+        if left == 0:
+            return f"｜⛔ CME 休市日历只排到 {last}，不再下单：补上 CME_CLOSED_DAYS、CME_EARLY_DAYS 再重启"
+        return f"｜⚠️ CME 休市日历只排到 {last}（还剩 {left} 天）"
+
     def status(self) -> str:
         now, s = self.now(), self.settings
         recs = self.recs
@@ -2543,6 +2695,7 @@ class RuleTaker:
         lines = [f"规则吃单 {VERSION}（独立服务）：{MODES.get(s.mode, s.mode)}（RULE_TAKER={self.env_mode}"
                  + (f"，运行中调成 {s.mode}" if s.mode != self.env_mode else "") + f"）｜{'开场前吃' if in_course else '只在开场前吃'}，盘口一有就买，到开场前 {STOP_MS // 1000} 秒"
                  + (f"；设了盘中价格的规则开场后接着买（开场 {LIVE_START_MS // 1000} 秒后到结束前 {LIVE_STOP_MS // 1000} 秒，第 1 分钟最高按盘前的价格）" if in_course else "")
+                 + self.calendar_note(now)
                  + (f"｜每天最多花 ${s.max_day_usd:g}（今天已花 ${spent_on(recs, day_of(now), s.mode):,.2f}）" if s.max_day_usd else "")
                  + (f"｜日亏损停机线 {money(self.loss_floor() or 0)}（今天已结算 {money(day_pnl(recs, day_of(now)))}"
                     + ("，今天已停机：/resume 解除" if self.loss_stop_why() else "") + "）" if self.loss_floor() is not None else "")

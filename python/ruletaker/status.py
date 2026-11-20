@@ -30,6 +30,7 @@ from .util import LOG, NotOnDisk, clean_error
 
 PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "console.html")
 MAX_BODY = 65_536
+MAX_CONNECTIONS = 32  # requests served at once (more are closed at once: the page asks again in two seconds)
 
 
 def reset_keys(reset: Any) -> list[str] | None | str:
@@ -50,6 +51,7 @@ class StatusServer:
     def __init__(self, taker: Any, host: str, port: int, key: str = ""):
         self.taker, self.host, self.port, self.key = taker, host, port, key
         self.server: asyncio.base_events.Server | None = None
+        self.open = 0
 
     async def start(self) -> None:
         if not self.port:
@@ -73,22 +75,50 @@ class StatusServer:
         given = (query.get("key") or [""])[0] or headers.get("x-status-key", "")
         return hmac.compare_digest(given.encode(), self.key.encode())
 
+    def turned_away(self, method: str, path: str, query: dict, headers: dict) -> tuple[int, str, str] | None:
+        """Whether a request is refused on its head alone (every path but /healthz and the page): the key, the method, a POST's
+        X-RT header — judged before its body is read, so nobody without the key gets the server to take one in."""
+        text = "text/plain; charset=utf-8"
+        if path == "/healthz" or (path in {"/", "/console", "/index.html"} and method == "GET"):
+            return None
+        if not self.allowed(query, headers):
+            return 403, text, "need ?key=STATUS_KEY"
+        if method not in {"GET", "POST"}:
+            return 405, text, "method not allowed"
+        if method == "POST" and headers.get("x-rt") != "1":
+            return 403, text, "POST needs the header X-RT: 1"
+        return None
+
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self.open >= MAX_CONNECTIONS:
+            writer.close()
+            return
+        self.open += 1
+        try:
+            await self.serve_one(reader, writer)
+        finally:
+            self.open -= 1
+
+    async def serve_one(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         extra = ""
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
             lines = head.decode("latin-1").split("\r\n")
             method, target, _ = (lines[0].split(" ") + ["", "", ""])[:3]
             headers = {k.strip().lower(): v.strip() for k, _, v in (line.partition(":") for line in lines[1:] if ":" in line)}
-            length = int(headers.get("content-length") or 0)
-            body = b""
-            if length > MAX_BODY:
-                raise ValueError("body too large")
-            if length > 0:
-                body = await asyncio.wait_for(reader.readexactly(length), 5)
             url = urllib.parse.urlsplit(target)
             query = urllib.parse.parse_qs(url.query)
-            status, kind, text = await self.route(method.upper(), url.path, query, headers, body)
+            refused = self.turned_away(method.upper(), url.path, query, headers)
+            if refused is not None:
+                status, kind, text = refused
+            else:
+                length = int(headers.get("content-length") or 0)
+                body = b""
+                if length > MAX_BODY:
+                    raise ValueError("body too large")
+                if length > 0:
+                    body = await asyncio.wait_for(reader.readexactly(length), 5)
+                status, kind, text = await self.route(method.upper(), url.path, query, headers, body)
             if kind.startswith("text/csv"):
                 extra = "Content-Disposition: attachment; filename=\"ruletaker-records.csv\"\r\n"
         except Exception as error:  # (a malformed request: answered and closed, never the service's problem)

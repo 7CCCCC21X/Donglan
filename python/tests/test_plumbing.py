@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.client
 import json
 import os
@@ -95,6 +96,9 @@ class FakeResponse:
         out, self.body = self.body, b""
         return out
 
+    def isclosed(self) -> bool:
+        return not self.body  # (read whole)
+
 
 class FakeConn:
     made: list["FakeConn"] = []
@@ -118,6 +122,8 @@ class FakeConn:
     def getresponse(self) -> FakeResponse:
         if self.mode == "answer-fail":
             raise http.client.RemoteDisconnected("gone")
+        if self.mode == "400":
+            return FakeResponse(400, b'{"success":false,"message":"Order value too small"}')
         return FakeResponse(body=b'{"ok": 1}')
 
     def close(self) -> None:
@@ -208,6 +214,115 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(len(FakeConn.made), 2)
         self.assertEqual(FakeConn.made[1].requests[0][0], "POST")
 
+
+    def test_an_error_answer_read_whole_keeps_its_connection(self) -> None:
+        FakeConn.script = ["400"]
+        with self.assertRaises(RemoteError) as caught:
+            nethttp.request("https://api.predict.fun/v1/orders", b"{}")
+        self.assertIn("Order value too small", str(caught.exception))
+        FakeConn.made[0].mode = "ok"
+        self.assertEqual(nethttp.request("https://api.predict.fun/v1/x"), b'{"ok": 1}')
+        self.assertEqual(len(FakeConn.made), 1)  # the same connection carried the next request
+
+    def test_a_connection_the_server_let_go_is_never_written(self) -> None:
+        import socket
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        theirs.close()  # (the server hung up while it sat in the pool)
+        gone = FakeConn("api.predict.fun", 443)
+        gone.sock = ours
+        nethttp._POOL[("api.predict.fun", 443)] = [(gone, time.monotonic())]
+        dead = nethttp.HTTP_STATS["dead"]
+        self.assertEqual(nethttp.request("https://api.predict.fun/v1/orders", b"{}"), b'{"ok": 1}')
+        self.assertEqual((gone.requests, len(FakeConn.made[-1].requests)), ([], 1))  # the order went on a fresh one
+        self.assertEqual(nethttp.HTTP_STATS["dead"], dead + 1)
+
+
+# A throwaway CA and its "localhost" certificate (P-256, valid to 2126), for a TLS server on this machine alone (the Rust
+# tests use the same pair).
+TEST_CA = """-----BEGIN CERTIFICATE-----
+MIIBnjCCAUWgAwIBAgIUOqfX6aXo6NlIiI/DvptlFIhyX8AwCgYIKoZIzj0EAwIw
+HDEaMBgGA1UEAwwRcnVsZXRha2VyIHRlc3QgQ0EwIBcNMjYxMTIwMDYwMzE5WhgP
+MjEyNjEwMjcwNjAzMTlaMBwxGjAYBgNVBAMMEXJ1bGV0YWtlciB0ZXN0IENBMFkw
+EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/TgO2tFcIpiObsvu2LeLK3aDmIxodKHl
+dxbZ1Xt361EpsH7nozeyK3UkZ583ZnFBjBR6+cMrLoHl7oN5K8PyDqNjMGEwHQYD
+VR0OBBYEFPrSzeGNxhuXPgc3eXAVfcJa3gKfMB8GA1UdIwQYMBaAFPrSzeGNxhuX
+Pgc3eXAVfcJa3gKfMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgIEMAoG
+CCqGSM49BAMCA0cAMEQCIB/IFr5n3t9cDDMD9NAFADRRORHd7fJh9xXdIYhKt4uo
+AiAXQoqBxdZ2fkVarobJM3UVSJBVCOmjnE55H+iX0IMtxA==
+-----END CERTIFICATE-----"""
+TEST_LEAF = """-----BEGIN CERTIFICATE-----
+MIIBvjCCAWSgAwIBAgIUQm5Da2Rjc+E1VJICNND50UBi67UwCgYIKoZIzj0EAwIw
+HDEaMBgGA1UEAwwRcnVsZXRha2VyIHRlc3QgQ0EwIBcNMjYxMTIwMDYwMzIwWhgP
+MjEyNjEwMjcwNjAzMjBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49
+AgEGCCqGSM49AwEHA0IABALYsYucdVHYBFFJXS9LHP2O1Mm4KFeQfiq5/0l273H2
+5fZEsXC8Nlv5piHCFNh1pTelRddDNyazSuol9UqmjlKjgYkwgYYwFAYDVR0RBA0w
+C4IJbG9jYWxob3N0MAkGA1UdEwQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQM
+MAoGCCsGAQUFBwMBMB0GA1UdDgQWBBTbb1YBSPPUQ29NVnOswtnhTRfzvzAfBgNV
+HSMEGDAWgBT60s3hjcYblz4HN3lwFX3CWt4CnzAKBggqhkjOPQQDAgNIADBFAiEA
+mAh6FOKPfIgRbiy6DyVU2OGedMKZCjcpOrhvgEmFgf8CIDouLX/N6Gejt0V/kN3N
+WjuUKhV0CK7XVYafsCk/NzIt
+-----END CERTIFICATE-----"""
+TEST_LEAF_KEY = """-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg1l5p9ecwhLZ8+qiE
+ugon6QeKhziJ6kufs07JYpM//KihRANCAAQC2LGLnHVR2ARRSV0vSxz9jtTJuChX
+kH4quf9Jdu9x9uX2RLFwvDZb+aYhwhTYdaU3pUXXQzcms0rqJfVKpo5S
+-----END PRIVATE KEY-----"""
+
+
+class PooledConnectionTest(unittest.TestCase):
+    """A pooled connection judged by what the server sent while it sat there (a real TLS 1.3 server here: its session tickets
+    come after the client's side of the handshake is done)."""
+
+    def serve(self, then: str) -> int:
+        import socket
+        import ssl
+        import tempfile
+        import threading
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        cert, key = os.path.join(folder, "leaf.pem"), os.path.join(folder, "leaf.key")
+        with open(cert, "w") as f:
+            f.write(TEST_LEAF + "\n")
+        with open(key, "w") as f:
+            f.write(TEST_LEAF_KEY + "\n")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.load_cert_chain(cert, key)
+        listener = socket.create_server(("127.0.0.1", 0))
+        done = threading.Event()
+        self.addCleanup(done.set)
+
+        def run() -> None:
+            raw, _ = listener.accept()
+            with context.wrap_socket(raw, server_side=True) as tls:
+                if then == "close_notify":
+                    tls.settimeout(0.3)
+                    with contextlib.suppress(OSError):
+                        tls.unwrap()  # (sends its close_notify; the TCP connection left open)
+                elif then == "data":
+                    tls.sendall(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n")
+                done.wait(5)
+            listener.close()
+        threading.Thread(target=run, daemon=True).start()
+        return listener.getsockname()[1]
+
+    def pooled(self, then: str) -> object:
+        import socket
+        import ssl
+        port = self.serve(then)
+        tls = ssl.create_default_context(cadata=TEST_CA).wrap_socket(socket.create_connection(("127.0.0.1", port)),
+                                                                     server_hostname="localhost")
+        self.addCleanup(tls.close)
+        time.sleep(0.2)  # (what the server sent is in)
+        return type("Pooled", (), {"sock": tls})()
+
+    def test_tls_records_of_its_own_leave_it_good_the_end_or_data_do_not(self) -> None:
+        good = self.pooled("")
+        self.assertFalse(nethttp._closed(good))  # the session tickets read, nothing behind them
+        self.assertFalse(nethttp._closed(good))
+        self.assertTrue(nethttp._closed(self.pooled("close_notify")))
+        self.assertTrue(nethttp._closed(self.pooled("data")))
 
 class IndexTest(unittest.TestCase):
     def test_push_and_staleness(self) -> None:
