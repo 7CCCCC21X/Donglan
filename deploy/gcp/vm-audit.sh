@@ -29,17 +29,26 @@ if [ "$dmode" = "750 root:ruletaker" ]; then
 else
   warn "目录 $dir 是 $dmode（应为 750 root:ruletaker）"
 fi
+# a name written twice: the service takes its first line (a key "changed" by adding a line below the old one is not changed)
+dups="$(grep -E '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=' "$F" \
+  | sed -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*).*/\2/' | sort | uniq -d | paste -sd ' ' -)"
+if [ -n "$dups" ]; then
+  warn "设置文件里这些名字写了不止一行，服务只认第一行：${dups}（bash deploy/gcp/rt.sh edit 删掉多余的）"
+else
+  ok "设置文件里没有重复写的名字"
+fi
 if [ -e /tmp/ruletaker.env ]; then
   warn "/tmp/ruletaker.env 还在（上传后没收进 /etc）：sudo shred -u /tmp/ruletaker.env"
 else
   ok "/tmp 里没有残留的设置文件"
 fi
 
-# The key as a fixed-string pattern (its 64 hex digits, with or without 0x), in a file only root reads, gone on exit.
+# The key as a fixed-string pattern (its 64 hex digits, with or without 0x), in a file only root reads, gone on exit: every
+# PREDICT_PRIVATE_KEY line's (should there be more than one), each looked for.
 P="$(mktemp)"
 chmod 600 "$P"
 trap 'shred -u "$P" 2>/dev/null || rm -f "$P"' EXIT
-grep -E '^[[:space:]]*(export[[:space:]]+)?PREDICT_PRIVATE_KEY[[:space:]]*=' "$F" | tail -1 | grep -oiE '[0-9a-f]{64}' | head -1 > "$P"
+grep -E '^[[:space:]]*(export[[:space:]]+)?PREDICT_PRIVATE_KEY[[:space:]]*=' "$F" | grep -oiE '[0-9a-f]{64}' | sort -u > "$P"
 pid=""
 if have systemctl; then
   pid="$(systemctl show -p MainPID --value ruletaker 2>/dev/null || true)"

@@ -119,7 +119,12 @@ function toast(text,bad){const t=$("toast");t.textContent=text;t.className="show
 async function api(path,opts={}){
   const headers={...(opts.headers||{})};if(key)headers["X-Status-Key"]=key;
   if(opts.method==="POST"){headers["X-RT"]="1";headers["Content-Type"]="application/json"}
-  const r=await fetch(path,{...opts,headers,cache:"no-store"});
+  // a request with no answer in time is given up (a tunnel cut halfway leaves it hanging): the next refresh asks again
+  const ms=opts.method==="POST"?95000:8000,ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),ms);
+  let r;
+  try{r=await fetch(path,{...opts,headers,cache:"no-store",signal:ctl.signal})}
+  catch(e){throw new Error(e.name==="AbortError"?Math.round(ms/1000)+" 秒没有答复（通道断了？rt.sh console 会自动重连）":e.message)}
+  finally{clearTimeout(timer)}
   if(r.status===403&&!opts.retried){const k=prompt("请输入状态页口令（STATUS_KEY）");if(k!==null){key=k.trim();try{localStorage.setItem(KEY,key)}catch(e){}return api(path,{...opts,retried:true})}}
   if(!r.ok)throw new Error("HTTP "+r.status+" "+(await r.text()).slice(0,200));
   return r.json()}
@@ -149,7 +154,8 @@ $("t-console").onclick=()=>show("console");$("t-review").onclick=()=>show("revie
 
 // ---------- 控制台 ----------
 let state=null,settingsShown=false;
-async function loadState(){try{state=await api("api/state");renderState(state);$("clock").textContent="更新于 "+bjs(Date.now()).slice(0,8)+"（北京时间）"}catch(e){$("clock").textContent="读不到状态："+e.message}}
+let loading=false;
+async function loadState(){if(loading)return;loading=true;try{state=await api("api/state");renderState(state);$("clock").textContent="更新于 "+bjs(Date.now()).slice(0,8)+"（北京时间）"}catch(e){$("clock").textContent="读不到状态："+e.message}finally{loading=false}}
 function renderState(s){
   const a=s.account||{},t=s.today||{},st=s.stream||{},f=s.fast||{};
   const blocked=s.mode==="on"?(s.blocked||""):"";

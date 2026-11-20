@@ -144,9 +144,9 @@ remind_env() {  # the settings file left in this shell holds the private key: sa
   fi
 }
 
-status_call() {  # GET or POST on the service's own status page, on the VM (127.0.0.1)
-  local method="$1" path="$2"
-  remote "sudo bash -c 'F=/etc/ruletaker/ruletaker.env; K=\$(grep -E \"^STATUS_KEY=\" \$F | tail -1 | cut -d= -f2-); P=\$(grep -E \"^STATUS_PORT=\" \$F | tail -1 | cut -d= -f2-); curl -s -X $method -H \"X-RT: 1\" -H \"X-Status-Key: \$K\" \"http://127.0.0.1:\${P:-8080}$path\"; echo'"
+vm_call() {  # vm_call WORDS...: deploy/gcp/vm-call.sh run on the VM as root (the service's own pages, at 127.0.0.1). The words
+  # are fixed ones of this script (a mode is checked against off|paper|on first) and quoted again for the remote shell.
+  ssh_to "$VM" "$ZONE" --command "sudo bash -s -- $(printf '%q ' "$@")" < "$ROOT/deploy/gcp/vm-call.sh"
 }
 
 cmd="${1:-help}"
@@ -289,8 +289,7 @@ case "$cmd" in
     # told, and 8080 (the default) taken.
     echo "连接虚拟机（${IAP[*]:+走 Google 的 IAP 通道，}要几秒）…"
     err="$(mktemp)"
-    REMOTE_PORT="$(ssh_to "$VM" "$ZONE" --command "sudo grep -E '^STATUS_PORT=' /etc/ruletaker/ruletaker.env | tail -1 | cut -d= -f2-" \
-      2>"$err" | tr -d '[:space:]' || true)"
+    REMOTE_PORT="$(vm_call port 2>"$err" | tr -d '[:space:]' || true)"
     if [ -z "$REMOTE_PORT" ] && grep -qviE 'numpy|increasing_the_tcp|^$|^warning:|To increase the performance|please see|ctions,' "$err"; then
       echo "⚠️ 读设置时 SSH 报错（下面是原话），先按默认端口 8080 接通道试试："
       grep -viE 'numpy|increasing_the_tcp|To increase the performance|please see|ctions,|^warning:$|^$' "$err" | tail -5 | sed 's/^/   /'
@@ -350,17 +349,19 @@ case "$cmd" in
       sleep $((fails * 5 + 2))
     done
     ;;
-  status) status_call GET /status ;;
-  json) status_call GET /status.json ;;
-  pause) status_call POST /pause ;;
-  resume) status_call POST /resume ;;
-  mode) [ -n "${1:-}" ] || die "用法：rt.sh mode off|paper|on"; status_call POST "/mode?to=$1" ;;
+  status) vm_call get /status ;;
+  json) vm_call get /status.json ;;
+  pause) vm_call post /pause ;;
+  resume) vm_call post /resume ;;
+  mode)
+    case "${1:-}" in
+      off|paper|on) vm_call post "/mode?to=$1" ;;
+      *) die "用法：rt.sh mode off|paper|on" ;;
+    esac
+    ;;
   logs) remote "sudo journalctl -u ruletaker -f -n 200 --no-hostname -o cat" ;;
   check|test)  # the running service's own self-check (or order test); the command-line check when the service is not running
-    remote "sudo bash -c 'F=/etc/ruletaker/ruletaker.env; K=\$(grep -E \"^STATUS_KEY=\" \$F | tail -1 | cut -d= -f2-); P=\$(grep -E \"^STATUS_PORT=\" \$F | tail -1 | cut -d= -f2-); \
-      curl -sf -m 90 -X POST -H \"X-RT: 1\" -H \"X-Status-Key: \$K\" -H \"Content-Type: application/json\" -d \"{\\\"action\\\":\\\"$cmd\\\"}\" \"http://127.0.0.1:\${P:-8080}/api/control\" \
-      | python3 -c \"import json,sys; print(json.load(sys.stdin)[\\\"message\\\"])\" \
-      || { [ $cmd = check ] && echo \"（服务没在运行：改用命令行自检）\" && sudo -u ruletaker \$($RUN_ON_VM) check --env \$F; }'"
+    vm_call control "$cmd"
     ;;
   latency) remote "sudo -u ruletaker \$($RUN_ON_VM) latency --env /etc/ruletaker/ruletaker.env" ;;
   restart|stop|start) remote "sudo systemctl $cmd ruletaker && sudo systemctl --no-pager --lines=5 status ruletaker || true" ;;
