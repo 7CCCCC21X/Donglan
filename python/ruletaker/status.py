@@ -55,7 +55,11 @@ class StatusServer:
         if not self.port:
             return
         self.server = await asyncio.start_server(self.handle, self.host, self.port)
-        LOG.info("控制台：http://%s:%d/  状态：http://%s:%d/status", self.host, self.port, self.host, self.port)
+        if self.host in {"127.0.0.1", "localhost", "::1"}:  # (the machine's own address: a browser elsewhere comes through SSH)
+            LOG.info("控制台和状态页在这台机器本机 %s:%d（别的电脑直接打不开；从浏览器看：Cloud Shell 里运行 bash deploy/gcp/rt.sh console）",
+                     self.host, self.port)
+        else:
+            LOG.info("控制台：http://%s:%d/  状态：http://%s:%d/status", self.host, self.port, self.host, self.port)
 
     async def stop(self) -> None:
         if self.server is not None:

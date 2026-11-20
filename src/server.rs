@@ -324,7 +324,14 @@ pub async fn serve(me: Me, host: String, port: u16, key: String) -> Result<(), S
         return Ok(());
     }
     let listener = TcpListener::bind((host.as_str(), port)).await.map_err(|e| format!("控制台端口 {host}:{port} 开不了：{e}"))?;
-    crate::info!("控制台：http://{host}:{port}/  状态：http://{host}:{port}/status");
+    if ["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {
+        // (the machine's own address: a browser elsewhere reaches it through the SSH tunnel alone)
+        crate::info!(
+            "控制台和状态页在这台机器本机 {host}:{port}（别的电脑直接打不开；从浏览器看：Cloud Shell 里运行 bash deploy/gcp/rt.sh console）"
+        );
+    } else {
+        crate::info!("控制台：http://{host}:{port}/  状态：http://{host}:{port}/status");
+    }
     tokio::task::spawn_local(async move {
         loop {
             let Ok((sock, _)) = listener.accept().await else { continue };

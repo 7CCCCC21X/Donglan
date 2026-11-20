@@ -130,6 +130,7 @@ upload_env() {
 
 setup() {
   remote "sudo ${RT_IMPL:+RT_IMPL=$RT_IMPL }bash /opt/ruletaker/deploy/gcp/vm-setup.sh"
+  echo "网页控制台：bash deploy/gcp/rt.sh console（等它显示 ✅ 再点网页预览）｜手机上随时用：Telegram 发 /menu"
 }
 
 # The command line of the version in use on the VM (its subcommands: run, check, latency, plan).
@@ -284,8 +285,18 @@ case "$cmd" in
     # The page on the VM listens on 127.0.0.1 only: an SSH tunnel brings it to this Cloud Shell's port, and Cloud Shell's web
     # preview shows that port in the browser, behind the Google login — no port is opened to the internet.
     LOCAL="${1:-8080}"
-    REMOTE_PORT="$(ssh_to "$VM" "$ZONE" --command "sudo grep -E '^STATUS_PORT=' /etc/ruletaker/ruletaker.env | tail -1 | cut -d= -f2-" 2>/dev/null | tr -d '[:space:]')"
-    REMOTE_PORT="${REMOTE_PORT:-8080}"
+    # The page's port as the settings file has it. A failed look (an SSH hiccup through IAP) never ends the command unsaid:
+    # told, and 8080 (the default) taken.
+    echo "连接虚拟机（${IAP[*]:+走 Google 的 IAP 通道，}要几秒）…"
+    err="$(mktemp)"
+    REMOTE_PORT="$(ssh_to "$VM" "$ZONE" --command "sudo grep -E '^STATUS_PORT=' /etc/ruletaker/ruletaker.env | tail -1 | cut -d= -f2-" \
+      2>"$err" | tr -d '[:space:]' || true)"
+    if [ -z "$REMOTE_PORT" ] && grep -qviE 'numpy|increasing_the_tcp|^$|^warning:|To increase the performance|please see|ctions,' "$err"; then
+      echo "⚠️ 读设置时 SSH 报错（下面是原话），先按默认端口 8080 接通道试试："
+      grep -viE 'numpy|increasing_the_tcp|To increase the performance|please see|ctions,|^warning:$|^$' "$err" | tail -5 | sed 's/^/   /'
+    fi
+    rm -f "$err"
+    case "$REMOTE_PORT" in ''|*[!0-9]*) REMOTE_PORT=8080 ;; esac
     tunnel=""
     trap 'kill_tree "$tunnel"; echo; echo "通道已关闭"; exit 0' INT TERM
     open_tunnel() {  # the tunnel up and the page answering through it: 0; why not: 1 (said)
