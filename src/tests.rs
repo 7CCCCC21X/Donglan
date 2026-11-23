@@ -71,6 +71,9 @@ pub struct FakePredict {
     pub remove_mode: Cell<&'static str>,
     /// the USDT allowance per exchange (wallet::EXCHANGES key); one not named has ``chain_allowed``
     pub allowed_by: RefCell<HashMap<&'static str, u128>>,
+    /// an order taken, then cancelled by Predict at once with nothing filled (its other side the account's own resting order:
+    /// self-trade prevention cancels the taker)
+    pub stp_cancel: Cell<bool>,
 }
 
 impl FakePredict {
@@ -138,7 +141,15 @@ impl FakePredict {
             let filled = ((self.fill_on_create.get() * 1e18) as u128).min(shares);
             let oid = format!("id{}", self.created.borrow().len());
             let hash = order["hash"].as_str().unwrap_or("").to_lowercase();
-            let row = json!({"id": oid, "status": if filled >= shares { "FILLED" } else { "OPEN" }, "amount": shares.to_string(),
+            let status = if self.stp_cancel.get() {
+                "CANCELLED"
+            } else if filled >= shares {
+                "FILLED"
+            } else {
+                "OPEN"
+            };
+            let filled = if self.stp_cancel.get() { 0 } else { filled };
+            let row = json!({"id": oid, "status": status, "amount": shares.to_string(),
                              "amountFilled": filled.to_string(), "order": {"hash": hash}});
             self.orders.borrow_mut().insert(hash.clone(), row.as_object().cloned().unwrap_or_default());
             return Self::ok(json!({"orderId": oid, "orderHash": hash}));
@@ -2066,6 +2077,99 @@ fn an_order_already_filled_when_the_pause_withdraws_it_is_not_withdrawn_twice() 
         assert_eq!(*r.api.removed.borrow(), vec!["id1".to_string()]);
         let told = orders::withdraw_all(&r.me, "服务停止").await;
         assert_eq!(*r.api.removed.borrow(), vec!["id1".to_string()], "{told}"); // (asked once, not again)
+    });
+}
+
+#[test]
+fn an_order_predict_cancelled_itself_is_said_so_one_we_withdrew_is_not() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.stp_cancel.set(true); // (the offer was this account's own: Predict cancels the taker)
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        r.advance(taker::FILL_READ_MS);
+        orders::follow(&r.me).await;
+        let o = r.order(0);
+        assert_eq!((o.s("closed_as").as_str(), o.f("filled")), ("CANCELLED", 0.0), "{o:?}");
+        assert!(r.api.removed.borrow().is_empty(), "nothing of ours to withdraw");
+        let text = {
+            let t = r.me.borrow();
+            let rows = crate::rules::races(&t.recs, "on", 0);
+            crate::rules::race_text(&rows[0])
+        };
+        // (word for word as the Python version says it: tests/test_lost_races.py)
+        assert!(text.contains("Predict 当场就撤了这张单（它记的状态 CANCELLED），不是我们撤的——多半是对面正是这个账户自己的挂单（比如 huice 的预挂），自成交保护撤掉吃单的一方"), "{text}");
+    });
+    run(async {
+        // a rest that waited on the book, withdrawn by us: nothing of the kind said
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        r.advance(taker::FILL_READ_MS);
+        orders::follow(&r.me).await;
+        r.advance(1_000);
+        orders::follow(&r.me).await;
+        let o = r.order(0);
+        assert!(o.t("removed") && !o.t("closed_as"), "{o:?}");
+        let t = r.me.borrow();
+        let rows = crate::rules::races(&t.recs, "on", 0);
+        assert!(!crate::rules::race_text(&rows[0]).contains("当场就撤了"));
+    });
+}
+
+#[test]
+fn a_record_from_before_the_status_was_kept_is_read_the_same_way() {
+    let order = |extra: &[(&str, Value)]| -> Obj {
+        let mut o: Obj = serde_json::from_value(json!({"state": "final", "id": "id1", "shares": 30.0, "filled": 0.0})).unwrap();
+        for (k, v) in extra {
+            o.insert(k.to_string(), v.clone());
+        }
+        o
+    };
+    assert_eq!(crate::rules::closed_by_predict(&order(&[])), json!("?"));
+    assert_eq!(crate::rules::closed_by_predict(&order(&[("state", json!("closing"))])), json!("?"));
+    assert_eq!(crate::rules::closed_by_predict(&order(&[("closed_as", json!("CANCELLED"))])), json!("CANCELLED"));
+    for not_so in [
+        order(&[("removed", json!(5))]),    // withdrawn by us
+        order(&[("filled", json!(30.0))]),  // bought in full
+        order(&[("state", json!("open"))]), // not over
+        order(&[("paper", json!(true))]),   // never sent
+        order(&[("id", json!(""))]),        // never placed
+        order(&[("error", json!("到期后仍显示挂着：按已知成交记"))]),
+    ] {
+        assert_eq!(crate::rules::closed_by_predict(&not_so), Value::Null, "{not_so:?}");
+    }
+}
+
+#[test]
+fn another_program_on_the_same_key_is_seen_in_predict_s_figures() {
+    let shared = "ratelimit-remaining: 1236; ratelimit-limit: 5000; ratelimit-reset: 15; ratelimit-policy: \"rpm\";q=5000;w=60";
+    assert_eq!(crate::http::budget_of(shared), Some((5000, 1236)));
+    assert_eq!(crate::http::budget_of("x-ratelimit-limit: 240; x-ratelimit-remaining: 200"), Some((240, 200)));
+    assert_eq!(crate::http::budget_of("ratelimit-limit: 5000"), None);
+    assert_eq!(crate::http::budget_of(""), None);
+    let (warn, line) = control::key_budget_line(shared, 120).unwrap();
+    assert!(warn, "{line}");
+    assert!(line.contains("用了 3764 次（上限 5000），我们这一分钟发了 120 次"), "{line}");
+    assert!(line.contains("另外约 3644 次是别的程序") && line.contains("RULE_KEY_LEND=off"), "{line}");
+    let (warn, line) = control::key_budget_line("ratelimit-limit: 5000; ratelimit-remaining: 4880", 110).unwrap();
+    assert!(!warn && !line.contains("别的程序"), "{line}");
+    assert_eq!(control::key_budget_line("", 3), None);
+}
+
+#[test]
+fn self_check_counts_the_rate_limits_of_the_last_day() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        assert!(!control::self_check(&r.me).await.contains("限流（429）"));
+        let api = r.me.borrow().api.clone();
+        api.limited.borrow_mut().push_back(crate::util::mono() - 3_600.0);
+        api.limited.borrow_mut().push_back(crate::util::mono() - 90_000.0); // (more than a day ago: not counted)
+        let text = control::self_check(&r.me).await;
+        assert!(text.contains("⚠️ 最近一天被 Predict 限流（429）1 次"), "{text}");
     });
 }
 

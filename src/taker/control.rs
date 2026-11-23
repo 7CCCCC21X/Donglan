@@ -303,6 +303,26 @@ impl Report {
     }
 }
 
+/// The key's use as Predict counts it (its rate-limit headers) against our own requests of the same minute: another program on
+/// the same key shows as the difference (Railway's huice lending it out: RULE_KEY_LEND). (a warning?, the line); None without
+/// Predict's figures.
+pub fn key_budget_line(limits: &str, ours: usize) -> Option<(bool, String)> {
+    let (limit, left) = crate::http::budget_of(limits)?;
+    let used = (limit - left).max(0);
+    let others = used - ours as i64;
+    let text = format!("API Key 额度：Predict 记这一分钟用了 {used} 次（上限 {limit}），我们这一分钟发了 {ours} 次");
+    if others > (limit / 10).max(30) {
+        return Some((
+            true,
+            format!(
+                "{text}：另外约 {others} 次是别的程序在用同一把 Key（多半是 Railway 上的 huice 借用它：删掉那边的 RULE_API_KEY，\
+                 或那边设 RULE_KEY_LEND=off）——一撞上限流，这里所有请求停 20 秒以上，赶上抢单时刻就下不了单"
+            ),
+        ));
+    }
+    Some((false, text))
+}
+
 fn short(addr: &str) -> String {
     if addr.len() < 10 { addr.to_string() } else { format!("{}…{}", &addr[..6], &addr[addr.len() - 4..]) }
 }
@@ -527,12 +547,28 @@ pub async fn self_check(me: &Me) -> String {
                     if net.edge.is_empty() { String::new() } else { format!("｜入口 {}", net.edge) },
                     if took < 150.0 { "" } else { "（偏慢：rt.sh probe 量一下别的区域）" }
                 );
-                if took < 150.0 { r.ok(text) } else { r.warn(text) }
+                if took < 150.0 {
+                    r.ok(text)
+                } else {
+                    r.warn(text)
+                }
+                // (that read's answer brought the key's figures: is anyone else on it?)
+                let ours = api.pacer.borrow().last_minute();
+                if let Some((warn, line)) = key_budget_line(&net.limits, ours) {
+                    if warn { r.warn(line) } else { r.ok(line) }
+                }
             }
             Err(e) => r.no(format!("Predict 读取失败：{}", clean(&e))),
         }
     } else if s.mode != "off" {
         r.no("没有 API Key（RULE_API_KEY / PREDICT_API_KEY）");
+    }
+    let limited = api.limited.borrow().iter().filter(|at| mono() - **at < 86_400.0).count();
+    if limited > 0 {
+        r.warn(format!(
+            "最近一天被 Predict 限流（429）{limited} 次：每次这里所有请求停 {} 秒以上，期间不下新单",
+            crate::predict::PredictApi::BACKOFF_SECONDS
+        ));
     }
     let t = me.borrow();
     if !t.by_market.is_empty() {

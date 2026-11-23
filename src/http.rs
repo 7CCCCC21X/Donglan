@@ -232,6 +232,23 @@ pub struct Net {
     pub limits: String,
 }
 
+/// The key's budget as Predict's last answer gave it (``Net::limits``: "ratelimit-limit: 5000; ratelimit-remaining: 1236; …",
+/// x- prefixed or not): (the limit, what is left of it). None without both.
+pub fn budget_of(limits: &str) -> Option<(i64, i64)> {
+    let (mut limit, mut left) = (None, None);
+    for part in limits.split(';') {
+        let Some((name, value)) = part.split_once(':') else { continue }; // (a policy's own "q=…;w=…" pieces)
+        let digits: String = value.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+        let Ok(n) = digits.parse::<i64>() else { continue };
+        match name.trim().trim_start_matches("x-") {
+            "ratelimit-limit" => limit = Some(n),
+            "ratelimit-remaining" => left = Some(n),
+            _ => {}
+        }
+    }
+    Some((limit?, left?))
+}
+
 /// What became of one request on its way (an order's): from the caller's call to the request handed to the network layer (the
 /// key's budget, a free slot), its new connection's TCP + TLS handshake (none: a warm one reused), when its bytes were all
 /// written (wall ms).

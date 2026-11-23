@@ -57,6 +57,29 @@ def _note_limits(host: str, headers: Any) -> None:
         http_net(host)["limits"] = "; ".join(found)
 
 
+def budget_of(limits: str) -> tuple[int, int] | None:
+    """The key's budget as Predict's last answer gave it (``limits``: "ratelimit-limit: 5000; ratelimit-remaining: 1236; …", x-
+    prefixed or not): (the limit, what is left of it). None without both."""
+    limit = left = None
+    for part in str(limits or "").split(";"):
+        name, sep, value = part.partition(":")
+        if not sep:
+            continue  # (a policy's own "q=…;w=…" pieces)
+        digits = ""
+        for c in value.strip():
+            if not c.isdigit():
+                break
+            digits += c
+        if not digits:
+            continue
+        name = name.strip().removeprefix("x-")
+        if name == "ratelimit-limit":
+            limit = int(digits)
+        elif name == "ratelimit-remaining":
+            left = int(digits)
+    return (limit, left) if limit is not None and left is not None else None
+
+
 def _count(name: str) -> None:
     with _POOL_LOCK:
         HTTP_STATS[name] += 1

@@ -56,6 +56,7 @@ class FakeApi:
         self.pre_send: Any = None
         self.jwt_exp = 0
         self.empty_order_answer = "HTTP 400: order is invalid"
+        self.stp_cancel = False  # an order taken, then cancelled by Predict at once with nothing filled (self-trade prevention)
 
     def fresh(self) -> bool:
         return self.jwt_ok
@@ -117,9 +118,10 @@ class FakeApi:
             raise error
         order = body["data"]["order"]
         shares = int(order["takerAmount"])
-        filled = min(int(self.fill_on_create * 10 ** 18), shares)
+        filled = 0 if self.stp_cancel else min(int(self.fill_on_create * 10 ** 18), shares)
         oid = f"id{len(self.created)}"
-        self.orders[digest.lower()] = {"id": oid, "status": "FILLED" if filled >= shares else "OPEN", "amount": str(shares),
+        status = "CANCELLED" if self.stp_cancel else "FILLED" if filled >= shares else "OPEN"
+        self.orders[digest.lower()] = {"id": oid, "status": status, "amount": str(shares),
                                        "amountFilled": str(filled), "order": {"hash": digest}}
         if self.lose_answer:
             raise RemoteError("网络错误 (TimeoutError: timed out)")

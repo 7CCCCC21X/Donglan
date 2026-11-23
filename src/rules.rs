@@ -565,6 +565,7 @@ pub fn races(recs: &Recs, mode: &str, since_ms: i64) -> Vec<Obj> {
                 "trip".into(),
                 opt_i(if both("answered_wall", "sent_wall") { Some(o.i("answered_wall") - o.i("sent_wall")) } else { None }),
             );
+            x.insert("closed".into(), closed_by_predict(o));
             x.insert("queued".into(), o.get("queued_ms").cloned().unwrap_or(Value::Null));
             x.insert("connect".into(), o.get("connect_ms").cloned().unwrap_or(Value::Null));
             x.insert(
@@ -582,6 +583,18 @@ pub fn races(recs: &Recs, mode: &str, since_ms: i64) -> Vec<Obj> {
 
 fn sec(ms: i64) -> String {
     format!("{:.2} 秒", ms as f64 / 1000.0)
+}
+
+/// Predict closed this order itself, short of its shares, and never withdrawn by us (an unfilled rest is withdrawn only at a
+/// follow, from FILL_READ_MS after the answer): the status it gave then — "?" for a record from before it was kept; Null
+/// otherwise. The usual cause: the other side was this account's own resting order, and self-trade prevention cancels the
+/// taker.
+pub fn closed_by_predict(o: &Obj) -> Value {
+    let done = matches!(o.state(), "final" | "closing");
+    if o.t("paper") || !done || o.t("removed") || !o.t("id") || o.t("error") || o.f("filled") >= o.f("shares") - DUST {
+        return Value::Null;
+    }
+    json!(if o.t("closed_as") { o.s("closed_as") } else { "?".to_string() })
 }
 
 pub fn race_text(row: &Obj) -> String {
@@ -685,6 +698,13 @@ pub fn race_text(row: &Obj) -> String {
                 piece += &format!("［排队 {} ms、{link}、写出→应答 {r} ms］", g(o.f("queued").round()));
             }
             parts.push(piece);
+        }
+        if let Some(status) = o.get("closed").and_then(Value::as_str) {
+            parts.push(format!(
+                "Predict 当场就撤了这张单{}，不是我们撤的——多半是对面正是这个账户自己的挂单（比如 huice 的预挂），\
+                 自成交保护撤掉吃单的一方",
+                if status == "?" { String::new() } else { format!("（它记的状态 {status}）") }
+            ));
         }
         text += &format!("｜第 {i} 张 要 {} 成交 {}", g(o.f("shares")), g(o.f("filled")));
         if o.t("seen") {

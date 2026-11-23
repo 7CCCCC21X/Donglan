@@ -180,6 +180,23 @@ def paid(rec: dict, resolution: dict, won: int | None) -> float | None:
     return up if rec.get("side") == "up" else 1 - up
 
 
+def key_budget_line(limits: str, ours: int) -> tuple[bool, str] | None:
+    """The key's use as Predict counts it (its rate-limit headers) against our own requests of the same minute: another program
+    on the same key shows as the difference (Railway's huice lending it out: RULE_KEY_LEND). (a warning?, the line); None
+    without Predict's figures."""
+    budget = nethttp.budget_of(limits)
+    if budget is None:
+        return None
+    limit, left = budget
+    used = max(limit - left, 0)
+    others = used - ours
+    text = f"API Key 额度：Predict 记这一分钟用了 {used} 次（上限 {limit}），我们这一分钟发了 {ours} 次"
+    if others > max(limit // 10, 30):
+        return True, (f"{text}：另外约 {others} 次是别的程序在用同一把 Key（多半是 Railway 上的 huice 借用它：删掉那边的 RULE_API_KEY，"
+                      "或那边设 RULE_KEY_LEND=off）——一撞上限流，这里所有请求停 20 秒以上，赶上抢单时刻就下不了单")
+    return False, text
+
+
 def placed_or_not(error: BaseException) -> str:
     """What a failed order request tells about the order: "not_sent" (a local gate, the key's cooldown, a 429), "rejected"
     (Predict refused it outright: a 4xx that is no conflict nor a duplicate), "unknown" (a timeout, a lost answer, a 5xx, a
@@ -1845,6 +1862,10 @@ class RuleTaker:
         if float(order.get("filled") or 0) >= float(order["shares"]) - DUST:
             order["state"] = "final"
             return
+        if order_final(row, float(order["shares"])) and not order.get("removed") and not order.get("closed_as"):
+            # closed on Predict's side, never by us (a rest is withdrawn only here, at a follow): its word kept — an order
+            # meeting the account's own resting one is cancelled as the taker (self-trade prevention), nothing bought
+            order["closed_as"] = str(row.get("status") or "") or "?"
         if order_final(row, float(order["shares"])) or order.get("removed"):
             order["left_ms"] = int(order.get("left_ms") or now)
             if now - order["left_ms"] >= LATE_FILL_MS or late:
@@ -2240,10 +2261,17 @@ class RuleTaker:
                 net = nethttp.HTTP_NET.get(getattr(self.api, "host", "")) or {}
                 (ok if took < 150 else warn)(f"Predict 读取：一次往返 {took:.0f} ms" + (f"｜入口 {net['edge']}" if net.get("edge") else "")
                                               + ("" if took < 150 else "（偏慢：rt.sh probe 量一下别的区域）"))
+                # (that read's answer brought the key's figures: is anyone else on it?)
+                line = key_budget_line(net.get("limits") or "", self.api.pacer.last_minute())
+                if line:
+                    (warn if line[0] else ok)(line[1])
             except Exception as error:
                 no(f"Predict 读取失败：{clean_error(error) or type(error).__name__}")
         elif s.mode != "off":
             no("没有 API Key（RULE_API_KEY / PREDICT_API_KEY）")
+        limited = sum(1 for at in list(getattr(self.api, "limited", ())) if time.monotonic() - at < 86_400)
+        if limited:
+            warn(f"最近一天被 Predict 限流（429）{limited} 次：每次这里所有请求停 {PredictApi.BACKOFF_SECONDS} 秒以上，期间不下新单")
         if self.by_market:
             if self.stream.connected and self.stream.alive():
                 lag = statistics.median(self.stream.lags) if self.stream.lags else None

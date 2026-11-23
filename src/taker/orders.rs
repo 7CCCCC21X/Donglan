@@ -113,6 +113,12 @@ pub async fn follow_order(me: &Me, key: &str, hash: &str, now: i64) -> crate::ut
             o.insert("state".into(), json!("final"));
             break 'read None;
         }
+        if order_final(&row, shares) && !o.t("removed") && !o.t("closed_as") {
+            // closed on Predict's side, never by us (a rest is withdrawn only here, at a follow): its word kept — an order
+            // meeting the account's own resting one is cancelled as the taker (self-trade prevention), nothing bought
+            let status = row.s("status");
+            o.insert("closed_as".into(), json!(if status.is_empty() { "?".to_string() } else { status }));
+        }
         if order_final(&row, shares) || o.t("removed") {
             let left = if o.t("left_ms") { o.i("left_ms") } else { now };
             o.insert("left_ms".into(), json!(left));

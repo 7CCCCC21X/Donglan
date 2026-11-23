@@ -306,10 +306,22 @@ def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
                         "presigned": bool(o.get("presigned")),
                         "open_wait": o.get("open_wait"), "open_reads": o.get("open_reads"),
                         "trip": int(o["answered_wall"]) - int(o["sent_wall"]) if o.get("answered_wall") and o.get("sent_wall") else None,
+                        "closed": closed_by_predict(o),
                         "queued": o.get("queued_ms"), "connect": o.get("connect_ms"),
                         "reply": int(o["answered_wall"]) - int(o["wrote_wall"]) if o.get("answered_wall") and o.get("wrote_wall") else None}
                        for o in orders]})
     return sorted(rows, key=lambda x: -x["start_ms"])
+
+
+def closed_by_predict(o: dict) -> str | None:
+    """Predict closed this order itself, short of its shares, and never withdrawn by us (an unfilled rest is withdrawn only at a
+    follow, from FILL_READ_MS after the answer): the status it gave then — "?" for a record from before it was kept; None
+    otherwise. The usual cause: the other side was this account's own resting order, and self-trade prevention cancels the
+    taker."""
+    if (o.get("paper") or o.get("state") not in {"final", "closing"} or o.get("removed") or not o.get("id") or o.get("error")
+            or float(o.get("filled") or 0) >= float(o.get("shares") or 0) - DUST):
+        return None
+    return str(o.get("closed_as") or "?")
 
 
 def race_text(row: dict) -> str:
@@ -348,6 +360,10 @@ def race_text(row: dict) -> str:
                 link = f"新建连接 {round(float(o['connect'])):g} ms" if o.get("connect") else "复用连接"
                 piece += f"［排队 {round(float(o.get('queued') or 0)):g} ms、{link}、写出→应答 {o['reply']} ms］"
             parts.append(piece)
+        if o.get("closed"):
+            said = "" if o["closed"] == "?" else f"（它记的状态 {o['closed']}）"
+            parts.append(f"Predict 当场就撤了这张单{said}，不是我们撤的——多半是对面正是这个账户自己的挂单（比如 huice 的预挂），"
+                         "自成交保护撤掉吃单的一方")
         text += (f"｜第 {i} 张 要 {o['shares']:g} 成交 {o['filled']:g}" + (f"（当时盘口上 {o['seen']:g} 份）" if o["seen"] else "")
                  + ("：" + "、".join(parts) if parts else ""))
     return text
