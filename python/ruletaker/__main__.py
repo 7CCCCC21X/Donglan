@@ -50,7 +50,7 @@ def rest_verdict(poll_s: float, rest_ages: list, lags: list, n_rest: int, n_push
     """What the REST-against-push comparison says, in words — never a verdict from reads too sparse to catch a change first."""
     if poll_s > SPARSE_POLL_S:
         return (f"→ REST 每 {poll_s:.2f} 秒才读一次，太稀，比不出谁更新（读得这么稀，推送自然多半先到）：这把 Key 不和别的程序共用时，"
-                "把 PREDICT_RATE_PER_MIN 按它的额度调高（5000 的 Key 设 4000，这里约每 60 ms 读一次）再量")
+                "这次测量单独给个速率再量：bash deploy/gcp/rt.sh latency 4000（5000 的 Key；REST 约每 60 ms 读一次，设置不动）")
     fresher = len(rest_ages) >= 5 and bool(lags) and min(rest_ages) + 15 < min(lags)
     if fresher or (n_rest >= 5 and n_rest > 2 * n_push):
         return "→ REST 的盘口比推送新：开场前那几秒加快 REST 读取有用（设置 RULE_VERIFY_MS，见 README）"

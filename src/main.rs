@@ -702,7 +702,7 @@ pub fn rest_verdict(poll_s: f64, rest_ages: &[f64], lags: &[f64], n_rest: usize,
     if poll_s > SPARSE_POLL_S {
         return format!(
             "→ REST 每 {poll_s:.2} 秒才读一次，太稀，比不出谁更新（读得这么稀，推送自然多半先到）：这把 Key 不和别的程序共用时，\
-             把 PREDICT_RATE_PER_MIN 按它的额度调高（5000 的 Key 设 4000，这里约每 60 ms 读一次）再量"
+             这次测量单独给个速率再量：bash deploy/gcp/rt.sh latency 4000（5000 的 Key；REST 约每 60 ms 读一次，设置不动）"
         );
     }
     let low = |xs: &[f64]| xs.iter().copied().fold(f64::INFINITY, f64::min);

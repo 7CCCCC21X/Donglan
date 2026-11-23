@@ -104,7 +104,7 @@ class PushTimingTest(unittest.TestCase):
     def test_rest_is_judged_against_the_push_only_from_reads_dense_enough(self) -> None:
         from ruletaker.__main__ import rest_verdict
         sparse = rest_verdict(1.09, [41.0] * 5, [13.0], 7, 34)  # every 1.09 s: the push comes first nearly always
-        self.assertTrue("太稀" in sparse and "PREDICT_RATE_PER_MIN" in sparse, sparse)
+        self.assertTrue("太稀" in sparse and "rt.sh latency 4000" in sparse, sparse)
         self.assertIn("REST 的盘口比推送新", rest_verdict(0.06, [20.0] * 5, [60.0], 0, 0))
         self.assertIn("REST 不比推送新", rest_verdict(0.06, [80.0] * 5, [20.0], 1, 10))
         self.assertIn("样本太少", rest_verdict(0.06, [], [20.0], 1, 1))

@@ -2196,7 +2196,7 @@ fn rest_is_judged_against_the_push_only_from_reads_dense_enough() {
     use crate::rest_verdict;
     // read every 1.09 s (a 220-a-minute key's quarter): the push comes first nearly always, whichever is fresher
     let sparse = rest_verdict(1.09, &[41.0; 5], &[13.0], 7, 34);
-    assert!(sparse.contains("太稀") && sparse.contains("PREDICT_RATE_PER_MIN"), "{sparse}");
+    assert!(sparse.contains("太稀") && sparse.contains("rt.sh latency 4000"), "{sparse}");
     assert!(rest_verdict(0.06, &[20.0; 5], &[60.0], 0, 0).contains("REST 的盘口比推送新"));
     assert!(rest_verdict(0.06, &[80.0; 5], &[20.0], 1, 10).contains("REST 不比推送新"));
     assert!(rest_verdict(0.06, &[], &[20.0], 1, 1).contains("样本太少"));

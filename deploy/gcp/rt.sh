@@ -17,7 +17,8 @@
 #   bash deploy/gcp/rt.sh logs            看实时日志（Ctrl+C 退出）
 #   bash deploy/gcp/rt.sh check           自检：登录、账户、余额、授权、下单接口、推送、记录（和 Telegram /check 一样）
 #   bash deploy/gcp/rt.sh test            挂单测试：挂一张约 $1 的低价单、查到、撤掉（和 Telegram /test 一样）
-#   bash deploy/gcp/rt.sh latency         量这台机器到 Predict 的延迟（只读）
+#   bash deploy/gcp/rt.sh latency [速率]  量这台机器到 Predict 的延迟（只读）；速率＝这次测量用的每分钟请求数（例 4000：REST 每 60 ms
+#                                         读一次，和推送比谁先到），不写就按设置文件的 PREDICT_RATE_PER_MIN；只给这次用，服务不动
 #   bash deploy/gcp/rt.sh pause|resume    暂停 / 恢复开新单
 #   bash deploy/gcp/rt.sh mode off|paper|on   运行中切换模式（不会高于设置文件里的 RULE_TAKER）
 #   bash deploy/gcp/rt.sh restart|stop|start|ssh
@@ -386,8 +387,16 @@ case "$cmd" in
   check|test)  # the running service's own self-check (or order test); the command-line check when the service is not running
     vm_call control "$cmd"
     ;;
-  # (RULE_TAKER=off: a measurement needs no private key, and is not handed one)
-  latency) remote "cd / && sudo -u ruletaker env RULE_TAKER=off \$($RUN_ON_VM) latency --env /etc/ruletaker/ruletaker.env" ;;
+  latency)
+    # (RULE_TAKER=off: a measurement needs no private key, and is not handed one. A rate given here is this measurement's
+    # alone — the REST reads use a quarter of it — and the service's own settings stay as they are)
+    rate="${1:-}"
+    case "$rate" in
+      '') ;;
+      *[!0-9]*) die "用法：rt.sh latency [每分钟请求数]（只给这次测量用，例：4000；不写就按设置文件里的 PREDICT_RATE_PER_MIN）" ;;
+    esac
+    remote "cd / && sudo -u ruletaker env RULE_TAKER=off ${rate:+PREDICT_RATE_PER_MIN=$rate }\$($RUN_ON_VM) latency --env /etc/ruletaker/ruletaker.env"
+    ;;
   restart|stop|start) remote "sudo systemctl $cmd ruletaker && sudo systemctl --no-pager --lines=5 status ruletaker || true" ;;
   ssh) ssh_to "$VM" "$ZONE" ;;
   probe)
