@@ -79,5 +79,36 @@ class KeyBudgetTest(unittest.TestCase):
         self.assertIn("⚠️ 最近一天被 Predict 限流（429）1 次", after)
 
 
+class PushTimingTest(unittest.TestCase):
+    def test_the_extra_push_connections_are_timed_against_the_first(self) -> None:
+        from fakes import QuietStream
+        from ruletaker.stream import BookStream
+
+        async def go() -> tuple:
+            s = BookStream("", 3, connect=QuietStream.never)
+            s.wanted = {"m1"}
+            book = lambda v: {"version": v, "updateTimestampMs": int(time.time() * 1000), "bids": [], "asks": [["0.55", "10"]]}
+            s.take("m1", book(1), 0)
+            time.sleep(0.005)
+            s.take("m1", book(1), 1)  # the same book, 5 ms on, through connection 1
+            s.take("m1", book(1), 1)  # (again through it: counted once)
+            s.take("m1", book(2), 2)  # a newer one, first through connection 2
+            s.take("m1", book(2), 0)
+            return s.hedge(), list(s.conns[1].behind), BookStream("", 1, connect=QuietStream.never).hedge()
+        (firsts, behind, copies), late, single = run(go())
+        self.assertEqual((firsts, copies), ([1, 0, 1], 2))
+        self.assertTrue(behind is not None and behind >= 0)
+        self.assertGreaterEqual(late[0], 4.0, late)
+        self.assertIsNone(single)  # (one: nothing to compare)
+
+    def test_rest_is_judged_against_the_push_only_from_reads_dense_enough(self) -> None:
+        from ruletaker.__main__ import rest_verdict
+        sparse = rest_verdict(1.09, [41.0] * 5, [13.0], 7, 34)  # every 1.09 s: the push comes first nearly always
+        self.assertTrue("太稀" in sparse and "PREDICT_RATE_PER_MIN" in sparse, sparse)
+        self.assertIn("REST 的盘口比推送新", rest_verdict(0.06, [20.0] * 5, [60.0], 0, 0))
+        self.assertIn("REST 不比推送新", rest_verdict(0.06, [80.0] * 5, [20.0], 1, 10))
+        self.assertIn("样本太少", rest_verdict(0.06, [], [20.0], 1, 1))
+
+
 if __name__ == "__main__":
     unittest.main()

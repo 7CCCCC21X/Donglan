@@ -162,6 +162,17 @@ impl Taker {
         if self.first_ticks != 0 {
             parts.push(format!("推送当场处理 {} 次", self.first_ticks));
         }
+        if let Some((firsts, behind, copies)) = self.stream.hedge() {
+            let each: Vec<String> = firsts.iter().map(u64::to_string).collect();
+            parts.push(format!(
+                "推送 {} 条连接：各自先到 {} 次{}",
+                firsts.len(),
+                each.join("/"),
+                behind
+                    .map(|b| format!("，同一份盘口后到的比先到的晚 中位 {b:.1} ms（{copies} 次；这就是多开连接省下的）"))
+                    .unwrap_or_default()
+            ));
+        }
         if self.index_looks != 0 || self.index_late != 0 {
             parts.push(format!(
                 "盘中由指数带来的检查 {} 次{}",

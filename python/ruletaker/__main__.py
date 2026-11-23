@@ -41,6 +41,24 @@ def gce_zone(timeout: float = 1.0) -> str:
         return ""
 
 
+# REST read at most this often to judge it against the push: sparser, a read lands between a change and its push too seldom for
+# the push not to come first nearly always, whatever either one's freshness.
+SPARSE_POLL_S = 0.2
+
+
+def rest_verdict(poll_s: float, rest_ages: list, lags: list, n_rest: int, n_push: int) -> str:
+    """What the REST-against-push comparison says, in words — never a verdict from reads too sparse to catch a change first."""
+    if poll_s > SPARSE_POLL_S:
+        return (f"→ REST 每 {poll_s:.2f} 秒才读一次，太稀，比不出谁更新（读得这么稀，推送自然多半先到）：这把 Key 不和别的程序共用时，"
+                "把 PREDICT_RATE_PER_MIN 按它的额度调高（5000 的 Key 设 4000，这里约每 60 ms 读一次）再量")
+    fresher = len(rest_ages) >= 5 and bool(lags) and min(rest_ages) + 15 < min(lags)
+    if fresher or (n_rest >= 5 and n_rest > 2 * n_push):
+        return "→ REST 的盘口比推送新：开场前那几秒加快 REST 读取有用（设置 RULE_VERIFY_MS，见 README）"
+    if len(rest_ages) >= 5 or n_rest + n_push >= 5:
+        return "→ REST 不比推送新：加快 REST 读取没用，RULE_VERIFY_MS 不用改"
+    return "→ 样本太少，判断不了：换个盘口活跃的时段再量"
+
+
 def load_env(env_file: str | None) -> dict:
     env = dict(os.environ)
     for path in [env_file] if env_file else ["/etc/ruletaker/ruletaker.env", ".env"]:
@@ -331,11 +349,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
         lead = lambda xs: f"{len(xs)} 次" + (f"（中位早 {statistics.median(xs):.0f} ms）" if xs else "")
         if rest_ahead or push_ahead:
             print(f"同一份盘口两边都看到 {len(rest_ahead) + len(push_ahead)} 次：REST 先到 {lead(rest_ahead)}，推送先到 {lead(push_ahead)}")
-        fresher = len(rest_ages) >= 5 and lags and min(rest_ages) + 15 < min(lags)
-        print("→ REST 的盘口比推送新：开场前那几秒加快 REST 读取有用（设置 RULE_VERIFY_MS，见 README）"
-              if fresher or (len(rest_ahead) >= 5 and len(rest_ahead) > 2 * len(push_ahead)) else
-              "→ REST 不比推送新：加快 REST 读取没用，RULE_VERIFY_MS 不用改" if len(rest_ages) >= 5 or len(rest_ahead) + len(push_ahead) >= 5 else
-              "→ 样本太少，判断不了：换个盘口活跃的时段再量")
+        print(rest_verdict(poll_s, rest_ages, lags, len(rest_ahead), len(push_ahead)))
     limits = (http.HTTP_NET.get(host) or {}).get("limits", "")
     print(f"接口限额（Predict 答复里写的）：{limits}——按它设 PREDICT_RATE_PER_MIN（留一成余量）" if limits else
           "接口限额：Predict 的答复里没有写，按 Predict 给这把 Key 的额度设 PREDICT_RATE_PER_MIN（留一成余量）")

@@ -178,10 +178,10 @@ class QuietStream(BookStream):
         self.fake_alive = True
         self.last: dict[str, tuple] = {}
 
-    def take(self, mid: str, data: Any) -> None:
+    def take(self, mid: str, data: Any, n: int = 0) -> None:
         from ruletaker.predict import predict_levels
         self.last[mid] = (predict_levels(data.get("bids"), True), predict_levels(data.get("asks"), False))
-        super().take(mid, data)
+        super().take(mid, data, n)
 
     async def never(self, url: str, headers: dict) -> Any:
         await asyncio.sleep(3600)

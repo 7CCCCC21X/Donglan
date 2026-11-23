@@ -2684,6 +2684,11 @@ class RuleTaker:
             parts.append(f"预先签好 {self.presigned} 张，下单时用上 {self.presign_hits} 张")
         if self.first_ticks:
             parts.append(f"推送当场处理 {self.first_ticks} 次")
+        hedge = self.stream.hedge() if hasattr(self.stream, "hedge") else None
+        if hedge:
+            firsts, behind, copies = hedge
+            parts.append(f"推送 {len(firsts)} 条连接：各自先到 {'/'.join(str(f) for f in firsts)} 次"
+                         + (f"，同一份盘口后到的比先到的晚 中位 {behind:.1f} ms（{copies} 次；这就是多开连接省下的）" if behind is not None else ""))
         if self.index_looks or self.index_late:
             parts.append(f"盘中由指数带来的检查 {self.index_looks} 次" + (f"（另有 {self.index_late} 次指数到达时已超过 {INDEX_FRESH_MS / 1000:g} 秒）" if self.index_late else ""))
         return "速度：" + "｜".join(parts)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import statistics
 import time
 from typing import Any, Callable
 
@@ -52,6 +53,9 @@ class BookStream:
         # market id -> (version, the server's update time — updateTimestampMs, 0 when absent) of the book applied last: shared
         # by the connections — a frame older than it is dropped, whichever connection brings it
         self.versions: dict[str, tuple[int, int]] = {}
+        # market id -> [the version brought last, when (monotonic), by which connection, the connections that have brought it
+        # (a bit each)]: the copies the other connections bring later say what the extra connections save (RULE_WS_CONNECTIONS)
+        self.arrived: dict[str, list] = {}
         self.changed: set[str] = set()       # markets whose book changed since the taker last looked
         self.arrivals = 0
         self.pushed = asyncio.Event()
@@ -120,8 +124,9 @@ class BookStream:
             return old is not None
         return False
 
-    def take(self, mid: str, data: Any) -> None:
-        """A pushed book: kept (an older version dropped, a side left out keeps its own), the taker told when it changed."""
+    def take(self, mid: str, data: Any, n: int = 0) -> None:
+        """A pushed book (as connection ``n`` brought it): kept (an older version dropped, a side left out keeps its own), the
+        taker told when it changed."""
         if mid not in self.wanted or not isinstance(data, dict):
             return
         version = data.get("version")
@@ -134,6 +139,8 @@ class BookStream:
             if held is not None and version < held[0] and not (stamp and held[1] and stamp > held[1]):
                 return
             self.versions[mid] = (int(version), stamp)
+            if len(self.conns) > 1:
+                self.clock_arrival(n, mid, int(version))
         old = self.books.get(mid)
         bids = predict_levels(data.get("bids"), True) if isinstance(data.get("bids"), list) else (old[0] if old else ())
         asks = predict_levels(data.get("asks"), False) if isinstance(data.get("asks"), list) else (old[1] if old else ())
@@ -148,8 +155,31 @@ class BookStream:
             self.arrivals += 1
             self.told(mid)
 
+    def clock_arrival(self, n: int, mid: str, version: int) -> None:
+        """Which connection brought this version first; a later copy of it from another one, how much later."""
+        now, bit = time.monotonic(), 1 << min(n, 7)
+        a = self.arrived.get(mid)
+        if a is not None and a[0] == version:
+            if not a[3] & bit:
+                a[3] |= bit
+                if n < len(self.conns):
+                    self.conns[n].behind.append((now - a[1]) * 1000)
+            return
+        self.arrived[mid] = [version, now, n, bit]
+        if n < len(self.conns):
+            self.conns[n].firsts += 1
+
+    def hedge(self) -> tuple[list[int], float | None, int] | None:
+        """With more than one connection: how many books each brought first, and how much later the others brought the same book
+        (ms, the median; None before any) with how many such copies — what the extra connections save. None with one."""
+        if len(self.conns) < 2:
+            return None
+        behind = [b for c in self.conns for b in c.behind]
+        return [c.firsts for c in self.conns], (statistics.median(behind) if behind else None), len(behind)
+
     def forget(self, mid: str) -> None:
         if all(mid not in c.subscribed for c in self.conns):
+            self.arrived.pop(mid, None)
             self.books.pop(mid, None)
             self.versions.pop(mid, None)
             self.stamps.pop(mid, None)
@@ -179,6 +209,8 @@ class _Conn:
         self.request_id = 0
         self.ws: Any = None
         self.connects = 0
+        self.firsts = 0                                      # books this connection brought first (with more than one)
+        self.behind: collections.deque = collections.deque(maxlen=300)  # how much later (ms) it brought one another had brought first
         self.frames = 0
         self.last_frame = 0.0
         self.error = ""
@@ -296,7 +328,7 @@ class _Conn:
             topic = str(msg.get("topic") or "")
             if topic.startswith(TOPIC):
                 if (mid := topic[len(TOPIC):]) in self.subscribed:
-                    self.stream.take(mid, msg.get("data"))
+                    self.stream.take(mid, msg.get("data"), self.n)
             elif topic == HEARTBEAT:
                 await ws.send(dumps({"method": "heartbeat", "data": msg.get("data")}))
         elif kind == "R":

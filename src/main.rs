@@ -509,20 +509,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
                 lead(n_push, &mut push_ahead)
             );
         }
-        let fresher = rest_ages.len() >= 5 && !lags.is_empty() && {
-            let low = |xs: &[f64]| xs.iter().copied().fold(f64::INFINITY, f64::min);
-            low(&rest_ages) + 15.0 < low(&lags)
-        };
-        println!(
-            "{}",
-            if fresher || (n_rest >= 5 && n_rest > 2 * n_push) {
-                "→ REST 的盘口比推送新：开场前那几秒加快 REST 读取有用（设置 RULE_VERIFY_MS，见 README）"
-            } else if rest_ages.len() >= 5 || n_rest + n_push >= 5 {
-                "→ REST 不比推送新：加快 REST 读取没用，RULE_VERIFY_MS 不用改"
-            } else {
-                "→ 样本太少，判断不了：换个盘口活跃的时段再量"
-            }
-        );
+        println!("{}", rest_verdict(poll_s, &rest_ages, &lags, n_rest, n_push));
     }
     let limits = pool.net_of(&host).limits;
     println!(
@@ -704,6 +691,29 @@ fn plan(config: &Config, days: i64) -> i32 {
         );
     }
     0
+}
+
+/// REST read at most this often to judge it against the push: sparser, a read lands between a change and its push too seldom
+/// for the push not to come first nearly always, whatever either one's freshness.
+pub const SPARSE_POLL_S: f64 = 0.2;
+
+/// What the REST-against-push comparison says, in words — never a verdict from reads too sparse to catch a change first.
+pub fn rest_verdict(poll_s: f64, rest_ages: &[f64], lags: &[f64], n_rest: usize, n_push: usize) -> String {
+    if poll_s > SPARSE_POLL_S {
+        return format!(
+            "→ REST 每 {poll_s:.2} 秒才读一次，太稀，比不出谁更新（读得这么稀，推送自然多半先到）：这把 Key 不和别的程序共用时，\
+             把 PREDICT_RATE_PER_MIN 按它的额度调高（5000 的 Key 设 4000，这里约每 60 ms 读一次）再量"
+        );
+    }
+    let low = |xs: &[f64]| xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let fresher = rest_ages.len() >= 5 && !lags.is_empty() && low(rest_ages) + 15.0 < low(lags);
+    if fresher || (n_rest >= 5 && n_rest > 2 * n_push) {
+        "→ REST 的盘口比推送新：开场前那几秒加快 REST 读取有用（设置 RULE_VERIFY_MS，见 README）".into()
+    } else if rest_ages.len() >= 5 || n_rest + n_push >= 5 {
+        "→ REST 不比推送新：加快 REST 读取没用，RULE_VERIFY_MS 不用改".into()
+    } else {
+        "→ 样本太少，判断不了：换个盘口活跃的时段再量".into()
+    }
 }
 
 fn usage() -> &'static str {

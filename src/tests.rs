@@ -2174,6 +2174,35 @@ fn self_check_counts_the_rate_limits_of_the_last_day() {
 }
 
 #[test]
+fn the_extra_push_connections_are_timed_against_the_first() {
+    let s = crate::stream::BookStream::with_url("", 3, "wss://unused");
+    s.want(&["m1".to_string()].into_iter().collect());
+    let book = |v: i64| json!({"version": v, "updateTimestampMs": crate::util::now_ms(), "bids": [], "asks": [["0.55", "10"]]});
+    s.take_from(0, "m1", &book(1));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    s.take_from(1, "m1", &book(1)); // the same book, 5 ms on, through connection 1
+    s.take_from(1, "m1", &book(1)); // (again through it: counted once)
+    s.take_from(2, "m1", &book(2)); // a newer one, first through connection 2
+    s.take_from(0, "m1", &book(2));
+    let (firsts, behind, copies) = s.hedge().unwrap();
+    assert_eq!((firsts, copies), (vec![1, 0, 1], 2));
+    assert!(behind.is_some_and(|b| b >= 0.0));
+    assert!(s.conns[1].behind.borrow()[0] >= 4.0, "{:?}", s.conns[1].behind.borrow());
+    assert!(crate::stream::BookStream::with_url("", 1, "wss://unused").hedge().is_none()); // (one: nothing to compare)
+}
+
+#[test]
+fn rest_is_judged_against_the_push_only_from_reads_dense_enough() {
+    use crate::rest_verdict;
+    // read every 1.09 s (a 220-a-minute key's quarter): the push comes first nearly always, whichever is fresher
+    let sparse = rest_verdict(1.09, &[41.0; 5], &[13.0], 7, 34);
+    assert!(sparse.contains("太稀") && sparse.contains("PREDICT_RATE_PER_MIN"), "{sparse}");
+    assert!(rest_verdict(0.06, &[20.0; 5], &[60.0], 0, 0).contains("REST 的盘口比推送新"));
+    assert!(rest_verdict(0.06, &[80.0; 5], &[20.0], 1, 10).contains("REST 不比推送新"));
+    assert!(rest_verdict(0.06, &[], &[20.0], 1, 1).contains("样本太少"));
+}
+
+#[test]
 fn the_record_keeps_the_shares_as_signed() {
     run(async {
         let r = rig(start() - 3_600_000, &[]);

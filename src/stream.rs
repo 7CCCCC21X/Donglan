@@ -73,6 +73,10 @@ pub struct ConnState {
     request_id: Cell<i64>,
     pub connected: Cell<bool>,
     pub connects: Cell<u64>,
+    /// books this connection brought first (with more than one connection)
+    pub firsts: Cell<u64>,
+    /// how much later (ms) this connection brought a book another one had brought first
+    pub behind: RefCell<VecDeque<f64>>,
     pub frames: Cell<u64>,
     pub last_frame: Cell<f64>,
     pub error: RefCell<String>,
@@ -94,6 +98,9 @@ pub struct BookStream {
     /// market id -> the version and the server's update time (updateTimestampMs, 0 when absent) of the book applied last —
     /// shared by the connections: a frame older than it is dropped, whichever connection brings it
     versions: RefCell<HashMap<String, (i64, i64)>>,
+    /// market id -> the version brought last, when (monotonic), by which connection, and the connections that have brought it
+    /// (a bit each): the copies the other connections bring later say what the extra connections save (RULE_WS_CONNECTIONS)
+    arrived: RefCell<HashMap<String, (i64, f64, usize, u8)>>,
     /// markets whose book changed since the taker last looked
     pub changed: RefCell<HashSet<String>>,
     pub arrivals: Cell<u64>,
@@ -128,6 +135,7 @@ impl BookStream {
             wanted: RefCell::new(BTreeSet::new()),
             books: RefCell::new(HashMap::new()),
             versions: RefCell::new(HashMap::new()),
+            arrived: RefCell::new(HashMap::new()),
             changed: RefCell::new(HashSet::new()),
             arrivals: Cell::new(0),
             pushed: Event::new(),
@@ -239,6 +247,11 @@ impl BookStream {
 
     /// A pushed book: kept (an older version dropped, a side left out keeps its own), the taker told when it changed.
     pub fn take(&self, mid: &str, data: &Value) {
+        self.take_from(0, mid, data);
+    }
+
+    /// A pushed book as connection ``n`` brought it.
+    pub fn take_from(&self, n: usize, mid: &str, data: &Value) {
         if !self.wanted.borrow().contains(mid) || !data.is_object() {
             return;
         }
@@ -256,6 +269,9 @@ impl BookStream {
                 }
             }
             versions.insert(mid.to_string(), (v as i64, stamp));
+            if self.conns.len() > 1 {
+                self.clock_arrival(n, mid, v as i64);
+            }
         }
         let changed = {
             let mut books = self.books.borrow_mut();
@@ -291,8 +307,45 @@ impl BookStream {
         }
     }
 
+    /// Which connection brought this version first; a later copy of it from another one, how much later.
+    fn clock_arrival(&self, n: usize, mid: &str, version: i64) {
+        let now = mono();
+        let bit = 1u8 << n.min(7);
+        let mut arrived = self.arrived.borrow_mut();
+        match arrived.get_mut(mid) {
+            Some(a) if a.0 == version => {
+                if a.3 & bit == 0 {
+                    a.3 |= bit;
+                    if let Some(c) = self.conns.get(n) {
+                        push_cap(&mut c.behind.borrow_mut(), (now - a.1) * 1000.0, 300);
+                    }
+                }
+            }
+            _ => {
+                arrived.insert(mid.to_string(), (version, now, n, bit));
+                if let Some(c) = self.conns.get(n) {
+                    c.firsts.set(c.firsts.get() + 1);
+                }
+            }
+        }
+    }
+
+    /// With more than one connection: how many books each brought first, and how much later the others brought the same book
+    /// (ms, the median; None before any) with how many such copies — what the extra connections save. None with one.
+    pub fn hedge(&self) -> Option<(Vec<u64>, Option<f64>, usize)> {
+        if self.conns.len() < 2 {
+            return None;
+        }
+        let firsts = self.conns.iter().map(|c| c.firsts.get()).collect();
+        let mut behind: Vec<f64> =
+            self.conns.iter().flat_map(|c| c.behind.borrow().iter().copied().collect::<Vec<_>>()).collect();
+        let copies = behind.len();
+        Some((firsts, crate::util::median(&mut behind), copies))
+    }
+
     pub fn forget(&self, mid: &str) {
         if self.conns.iter().all(|c| !c.subscribed.borrow().contains(mid)) {
+            self.arrived.borrow_mut().remove(mid);
             self.books.borrow_mut().remove(mid);
             self.versions.borrow_mut().remove(mid);
             self.stamps.borrow_mut().remove(mid);
@@ -486,7 +539,7 @@ impl BookStream {
                 if let Some(mid) = topic.strip_prefix(TOPIC) {
                     let subscribed = c.subscribed.borrow().contains(mid);
                     if subscribed {
-                        self.take(mid, obj.get("data").unwrap_or(&Value::Null));
+                        self.take_from(n, mid, obj.get("data").unwrap_or(&Value::Null));
                     }
                 } else if topic == HEARTBEAT {
                     let echo =
