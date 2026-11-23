@@ -9,6 +9,8 @@
 #   RT_IMPL=python bash deploy/gcp/rt.sh update   换回 Python 版（备用）；RT_IMPL=rust 再换回 Rust 版（记录、设置都通用）
 #   bash deploy/gcp/rt.sh env [文件]      上传新的设置文件（默认 ./ruletaker.env）并重启
 #   bash deploy/gcp/rt.sh edit            直接在虚拟机上改设置文件（nano），检查无误才重启——私钥不用再留在 Cloud Shell
+#   bash deploy/gcp/rt.sh set 名 [值]     改一项设置，不用编辑器（手机上也能用）：例 rt.sh set RULE_WS_CONNECTIONS 3；不写值就
+#                                         隐藏输入（填 Key 用）。检查无误才重启，不认的值把设置文件恢复原样
 #   bash deploy/gcp/rt.sh key             换私钥：在这里粘贴（不显示），先核对它是不是 PREDICT_ACCOUNT 的控制钥匙，对了才在虚拟机上
 #                                         加密保存、重启服务（私钥不在设置文件里：update / env / edit 会把设置文件里的明文自动收走）
 #   bash deploy/gcp/rt.sh audit           私钥安全体检（只读）：私钥只在该在的地方、权限、加固、谁能登录
@@ -253,6 +255,27 @@ case "$cmd" in
       elif sudo -u ruletaker \$($RUN_ON_VM) plan --env /etc/ruletaker/ruletaker.env >/dev/null; then \
         sudo systemctl restart ruletaker && echo '已保存，服务已重启'; \
       else echo '!! 设置文件有误（见上面），服务没有重启、还在按原来的设置运行：再运行 bash deploy/gcp/rt.sh edit 改正'; fi" -- -t
+    ;;
+  set)
+    # One setting changed from anywhere — a phone too (nano wants a Ctrl key a phone has not): every line of it replaced on the
+    # VM, checked the way the service reads it, the service restarted; a value the service refuses puts the file back as it was
+    # (vm-key.sh put). No value given: asked for without being shown (a key) — either way carried over SSH's standard input,
+    # never on a command line.
+    name="${1:-}"
+    [[ "$name" =~ ^[A-Z][A-Z0-9_]*$ ]] \
+      || die "用法：rt.sh set 设置名 值（例：rt.sh set RULE_WS_CONNECTIONS 3）；不写值就隐藏输入（填 Key 用：rt.sh set RULE_API_KEY_2）"
+    [ "$name" != PREDICT_PRIVATE_KEY ] || die "私钥用 bash deploy/gcp/rt.sh key 换（会加密保存，不放进设置文件）"
+    ssh_to "$VM" "$ZONE" --command "grep -q '^  put)' /opt/ruletaker/deploy/gcp/vm-key.sh" \
+      || die "虚拟机上的版本还没有这个命令：先运行 bash deploy/gcp/rt.sh update"
+    if [ $# -ge 2 ]; then
+      value="$2"
+    else
+      value=""
+      IFS= read -r -s -p "$name 的值（屏幕上不显示）：" value || true
+      echo
+    fi
+    printf '%s\n' "$value" | ssh_to "$VM" "$ZONE" --command "sudo bash /opt/ruletaker/deploy/gcp/vm-key.sh put $name"
+    value=""
     ;;
   key)
     # A new private key: pasted here without being shown (not echoed, not in the shell's history, never on a command line),

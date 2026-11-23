@@ -362,6 +362,41 @@ exec env PYTHONPATH={python} {sys.executable} -m ruletaker "$@"
             return text[text.index("\n", start):text.index("\n}\n", start)]
         self.assertEqual(reading(KEYSH), reading(CALL))
 
+    def test_put_replaces_a_setting_everywhere_or_adds_it(self) -> None:
+        # (rt.sh set: one setting from a phone, no editor)
+        self.settings("RULE_TAKER=paper\nPREDICT_API_KEY=k\nRULE_WS_CONNECTIONS=1   # 推送连接\nexport RULE_WS_CONNECTIONS=2\n"
+                      "# RULE_WS_CONNECTIONS=9 (a comment)\nPREDICT_RATE_PER_MIN=220\n")
+        code, out = self.key_sh("put", "RULE_WS_CONNECTIONS", stdin="3\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("✅ RULE_WS_CONNECTIONS 已写进设置文件", out)
+        # every line of it gone (the service reads only the first), the new one in the first one's place; comments stay
+        self.assertEqual(self.read(), "RULE_TAKER=paper\nPREDICT_API_KEY=k\nRULE_WS_CONNECTIONS=3\n"
+                                      "# RULE_WS_CONNECTIONS=9 (a comment)\nPREDICT_RATE_PER_MIN=220\n")
+        self.assertEqual(load_env_file(self.env_file)["RULE_WS_CONNECTIONS"], "3")
+        self.assertEqual(stat.S_IMODE(os.stat(self.env_file).st_mode), 0o640)
+        with open(self.log) as f:
+            self.assertIn("systemctl restart ruletaker", f.read())
+        # a setting not there yet: added at the end — a key's value never printed
+        code, out = self.key_sh("put", "RULE_API_KEY_2", stdin="spare-key-123\n")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.read().endswith("PREDICT_RATE_PER_MIN=220\nRULE_API_KEY_2=spare-key-123\n"), self.read())
+        self.assertNotIn("spare-key-123", out)
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.env_file))), ["ruletaker.env"])  # (no copy left behind)
+
+    def test_put_refuses_what_the_service_would_not_take_and_leaves_the_file(self) -> None:
+        before = "RULE_TAKER=paper\nPREDICT_API_KEY=k\n"
+        self.settings(before)
+        for name, value, said in (("RULE_TAKER", "maybe", "设置文件已恢复原样"), ("RULE_WS_CONNECTIONS", "3 4", "不能有空格"),
+                                  ("RULE_GOLD", "on#x", "不能有"), ("bad-name", "1", "设置名只能是"),
+                                  ("PREDICT_PRIVATE_KEY", A, "rt.sh key")):
+            code, out = self.key_sh("put", name, stdin=value + "\n")
+            self.assertNotEqual(code, 0, name)
+            self.assertIn(said, out, name)
+            self.assertEqual(self.read(), before, name)
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.env_file))), ["ruletaker.env"])
+        with open(self.log) as f:
+            self.assertNotIn("restart", f.read())
+
     def test_apply_after_an_edit(self) -> None:
         # a key pasted into the settings file the old way: taken in, the settings checked, the service restarted
         self.settings(f"RULE_TAKER=paper\nPREDICT_API_KEY=k\nPREDICT_PRIVATE_KEY={B}\n")

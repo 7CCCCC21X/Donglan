@@ -179,11 +179,14 @@ bash deploy/gcp/rt.sh env
 | `bash deploy/gcp/rt.sh update` | 代码更新后：`git pull` 再运行它，重新上传、跑测试、重启（设置不动） |
 | `bash deploy/gcp/rt.sh env` | 上传改好的 `ruletaker.env` 并重启 |
 | `bash deploy/gcp/rt.sh edit` | 直接在虚拟机上改设置文件（nano，`Ctrl+O` 回车保存、`Ctrl+X` 退出），检查无误才重启——私钥不用留在 Cloud Shell。设置文件里**看不到私钥**（加密保存着）；照老习惯贴进去一行 `PREDICT_PRIVATE_KEY=…`，保存后也会被收进加密保存、从文件里删掉 |
+| `bash deploy/gcp/rt.sh set 设置名 值` | **改一项设置，不用编辑器**（手机上也能用）：例 `rt.sh set RULE_WS_CONNECTIONS 3`。同名的行全部换掉（服务只认第一行），没有就加在最后；检查无误才重启，服务不认的值把设置文件恢复原样、照旧运行。不写值就隐藏输入，填 Key 用：`rt.sh set RULE_API_KEY_2`。值里不能有空格、引号、`#`；私钥不行（用 `rt.sh key`） |
 | `bash deploy/gcp/rt.sh key` | **换私钥**：在 Cloud Shell 里粘贴（屏幕不显示、不进命令历史），先在链上核对它是不是 `PREDICT_ACCOUNT` 的控制钥匙，对了才在虚拟机上加密保存、重启服务；不对什么都不改 |
 | `bash deploy/gcp/rt.sh audit` | 私钥安全体检（只读）：私钥是不是加密保存、明文还在不在任何文件里、权限、日志、加固、谁能登录（私钥本身不会显示） |
 | `bash deploy/gcp/rt.sh restart` / `stop` / `start` | 重启 / 停止 / 启动服务 |
 | `bash deploy/gcp/rt.sh ssh` | 登录虚拟机 |
 | `bash deploy/gcp/rt.sh probe asia-southeast1-b` | 在别的区域临时开一台小机器量推送延迟和读盘口，量完自动删除（只带 API Key，从虚拟机读）；怎么比见“为什么是东京、怎么确认” |
+
+**在手机上**：装 Google Cloud App（iOS / Android），首页右上角的 Cloud Shell 和电脑上的一样，`~/Donglan` 也在，上面这些命令照用；改设置用 `rt.sh set`（手机键盘没有 Ctrl 键，`rt.sh edit` 里的 nano 存不了盘）。**虚拟机页面上的“暂停 / 停止 / 重置 / 删除实例”是整台机器的操作，不是暂停吃单**——点了机器就停了（删除连记录一起没了）；暂停吃单用 Telegram `/pause` 或 `rt.sh pause`。
 
 停止或重启时，服务会先等在途订单的应答（最多 25 秒）、撤掉还挂着的单，再退出。
 

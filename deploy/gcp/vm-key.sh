@@ -11,6 +11,8 @@
 #   bash vm-key.sh apply      after the settings file was edited (rt.sh edit): move, check the settings, restart the service
 #   bash vm-key.sh set        a new key from standard input (rt.sh key): its address, and on chain whether it controls
 #                             PREDICT_ACCOUNT, checked before anything changes; kept encrypted; the service restarted on it
+#   bash vm-key.sh put NAME   one setting (its value from standard input; rt.sh set) replaced — every line of it — or added,
+#                             checked the way the service reads it, the service restarted; a check that fails puts the file back
 #   bash vm-key.sh run ARGS   the service's command line (plan, check, …) run the way the service runs: its user, its key
 #   bash vm-key.sh status     where the key is kept (never the key)
 #
@@ -171,6 +173,32 @@ strip_plain() {  # strip_plain [KEY]: the settings file without its plain key �
   shred -u "$F.old" 2>/dev/null || rm -f "$F.old"
 }
 
+put_setting() {  # put_setting NAME: every line setting NAME (as the service reads names) gone, NAME=<the value in SCRATCH/value>
+  # in the first one's place, else at the end; the old file kept as F.prev (a hard link) to put back or overwrite after
+  local name="$1" tmp
+  tmp="$(mktemp "$(dirname "$F")/.ruletaker.env.XXXXXX")" || return 1
+  awk -v want="$name" -v vfile="$SCRATCH/value" '
+    BEGIN { v = ""; getline v < vfile }
+    {
+      line = $0
+      gsub(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/, "", line)
+      name = ""
+      if (line != "" && substr(line, 1, 1) != "#" && index(line, "=") > 0) {
+        if (substr(line, 1, 7) == "export ") line = substr(line, 8)
+        name = substr(line, 1, index(line, "=") - 1)
+        gsub(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/, "", name)
+      }
+      if (name == want) {
+        if (!done) { print want "=" v; done = 1 }
+        next
+      }
+      print
+    }
+    END { if (!done) print want "=" v }' "$F" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod --reference="$F" "$tmp" && chown --reference="$F" "$tmp" || { rm -f "$tmp"; return 1; }
+  ln -f "$F" "$F.prev" && mv -f "$tmp" "$F" || { rm -f "$tmp" "$F.prev"; return 1; }
+}
+
 has_plain_lines() {  # the settings file names PREDICT_PRIVATE_KEY anywhere (a line of its own, commented out or not)
   grep -qE '^[[:space:]]*#*[[:space:]]*(export[[:space:]]+)?PREDICT_PRIVATE_KEY[[:space:]]*=' "$F" 2>/dev/null
 }
@@ -259,6 +287,32 @@ case "${1:-}" in
     [[ "$BEFORE" =~ ^0x[0-9a-fA-F]{40}$ ]] && [ "$BEFORE" != "$ADDR" ] && echo "   （换掉了原来加密保存的那把：签名地址 $BEFORE）"
     restart || exit 1
     ;;
+  put)
+    # (rt.sh set: from anywhere, a phone too — nano wants a Ctrl key a phone has not)
+    name="${2:-}"
+    [[ "$name" =~ ^[A-Z][A-Z0-9_]*$ ]] || { echo "❌ 设置名只能是大写字母、数字和下划线（例：RULE_WS_CONNECTIONS）：什么都没改"; exit 2; }
+    [ "$name" != PREDICT_PRIVATE_KEY ] || { echo "❌ 私钥用 bash deploy/gcp/rt.sh key 换（会加密保存，不放进设置文件）：什么都没改"; exit 2; }
+    [ -f "$F" ] || { echo "❌ 没有设置文件 $F：什么都没改"; exit 1; }
+    IFS= read -r value || true
+    value="${value%$'\r'}"
+    case "$value" in
+      *[[:space:]]*|*[[:cntrl:]]*|*\"*|*\'*|*#*|*\\*)
+        echo "❌ 值里不能有空格、引号、#、反斜杠：什么都没改"; exit 2 ;;
+    esac
+    printf '%s' "$value" > "$SCRATCH/value"   # (read by awk from a root-only file in memory: never on a command line)
+    value=""
+    put_setting "$name" || { echo "❌ 设置文件没写成：什么都没改"; exit 1; }
+    if run_cli plan --env "$F" > /dev/null; then
+      shred -u "$F.prev" 2>/dev/null || rm -f "$F.prev"
+      echo "✅ $name 已写进设置文件"
+      restart && echo "服务按新设置运行"
+    else
+      ln -f "$F" "$F.bad" && mv -f "$F.prev" "$F"
+      shred -u "$F.bad" 2>/dev/null || rm -f "$F.bad"
+      echo "!! 这个值服务不认（原因见上面）：设置文件已恢复原样，服务没有重启、照旧运行"
+      exit 1
+    fi
+    ;;
   run)
     shift
     run_cli "$@"
@@ -274,7 +328,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "用法：bash vm-key.sh move | apply | set（私钥从标准输入）| run 参数… | status"
+    echo "用法：bash vm-key.sh move | apply | set（私钥从标准输入）| put 设置名（值从标准输入）| run 参数… | status"
     exit 2
     ;;
 esac
