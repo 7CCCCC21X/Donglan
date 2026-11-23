@@ -70,7 +70,7 @@ RT_IMPL=rust bash deploy/gcp/rt.sh update     # 换回 Rust 版
 2. **API Key 用一把专用的**（`RULE_API_KEY`）。Predict 按 Key 限流（每把有自己的每分钟额度：普通 240 次，高级的更多），两个进程用同一把 Key 会一起撞 429、一起停 20 秒。
    - 最好在 developers.predict.fun 再申请一把新的给这里用。
    - 如果把 Railway 上的 `RULE_API_KEY` 拿过来用，**要把 Railway 上的 `RULE_API_KEY` 删掉**（或者那边设 `RULE_KEY_LEND=off`）：Railway 上规则吃单关掉以后，那把 Key 会被一直借给盘口和预挂（`RULE_KEY_LEND`），这边再用就会撞限流。
-   - 撞一次限流（429），这边**所有请求停 20 秒以上、期间不下新单**，赶上抢单时刻这一场就丢了。自检（`/check`、`rt.sh check`）有一行“API Key 额度”：拿 Predict 回答里的额度（这一分钟这把 Key 一共用了多少）和这边自己发的次数比，多出来的就是别的程序在用这把 Key，会 ⚠️ 提示；最近一天被限流过几次也写在那里。
+   - 撞一次限流（429），这边**所有请求停 20 秒以上、期间不下新单**，赶上抢单时刻这一场就丢了。再申请一两把 Key 填进 `RULE_API_KEY_2`、`RULE_API_KEY_3` 当备用：在用的那把一被限流，同一个请求当场换下一把再发，不用停。自检（`/check`、`rt.sh check`）有一行“API Key 额度”：拿 Predict 回答里的额度（这一分钟这把 Key 一共用了多少）和这边自己发的次数比，多出来的就是别的程序在用这把 Key，会 ⚠️ 提示；最近一天被限流过几次也写在那里。
 3. **账户：用同一个 Predict 账户，还是单独开一个？**
    - **同一个账户**（最省事，私钥和充值地址照抄）：
      - 赢的份额由 Railway 上的自动领取（`LIVE_AUTO_REDEEM=on`）一起领掉——这边不做领取。
@@ -409,6 +409,7 @@ shred -u ruletaker.env
 | `RULE_TAKER` | `off` | off / paper（只记录）/ on（真实吃单） |
 | `LIVE_TRADING_ALLOWED` | 不设 = 允许 | 硬开关：只有不设或写 `on` / `1` / `true` / `yes` 才允许真实下单 |
 | `RULE_API_KEY` / `PREDICT_API_KEY` | | Predict API Key（专用的那把填 `RULE_API_KEY`） |
+| `RULE_API_KEY_2`、`RULE_API_KEY_3`（…到 `_9`） | 空 | 备用 API Key：在用的那把被限流（429）时，同一个请求当场换下一把再发（下单也一样：429 是 Predict 什么都没做就拒绝，不会下成两张），之后就用这把；只有每一把都在冷却时才整体停 20 秒。`/check` 逐把试一次，填错的当场标 ❌；状态的“网络”一行写现在用第几把。推送连接仍用主 Key |
 | `PREDICT_PRIVATE_KEY` / `PREDICT_ACCOUNT` | | 签名私钥 / 网站账户的充值地址（普通钱包留空）。私钥第一次部署时照常填；到了虚拟机上会自动收走、加密保存，以后换用 `rt.sh key` |
 | `PREDICT_CHAIN_ID` / `BSC_RPC_URL` | 56 / 公共节点 | 链和节点 |
 | `RULE_*_CENTS`、`RULE_*_LIVE_CENTS` | 见上表 | 每条规则的盘前 / 盘中最高价，0 = 不做 |

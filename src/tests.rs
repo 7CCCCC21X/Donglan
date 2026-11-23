@@ -13,7 +13,7 @@ use base64::Engine;
 use futures_util::future::LocalBoxFuture;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub const KEY: &str = "0x4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c";
@@ -74,6 +74,10 @@ pub struct FakePredict {
     /// an order taken, then cancelled by Predict at once with nothing filled (its other side the account's own resting order:
     /// self-trade prevention cancels the taker)
     pub stp_cancel: Cell<bool>,
+    /// API keys whose every request Predict refuses with a 429 (its budget spent), before anything is done
+    pub limited_keys: RefCell<HashSet<String>>,
+    /// API keys Predict does not know (401)
+    pub unknown_keys: RefCell<HashSet<String>>,
 }
 
 impl FakePredict {
@@ -225,6 +229,13 @@ impl Transport for FakePredict {
             if req.url.contains("bsc") || req.url.contains("rpc") {
                 return self.rpc(req.payload.as_deref().map(Vec::as_slice).unwrap_or(b"{}"));
             }
+            let key = req.headers.iter().find(|(h, _)| h == "x-api-key").map(|(_, v)| v.clone()).unwrap_or_default();
+            if self.limited_keys.borrow().contains(&key) {
+                return Err(RemoteError::retry("HTTP 429: Rate limit exceeded", 30)); // (refused before anything is done)
+            }
+            if self.unknown_keys.borrow().contains(&key) {
+                return Err(RemoteError::new("HTTP 401: Invalid API key"));
+            }
             let path = req.url.split("/v1").nth(1).unwrap_or("").to_string();
             let method = if req.payload.is_some() { "POST" } else { "GET" };
             if method == "POST" && path == "/orders" {
@@ -306,7 +317,10 @@ pub fn rig_full(
     let config = Config::from_env(&env_of(pairs)).unwrap();
     let wallet = Rc::new(Wallet::new(KEY, 56, "").unwrap());
     let transport: Rc<dyn Transport> = api.clone();
-    let predict = Rc::new(PredictApi::new("https://api.predict.fun/v1", "k", Some(wallet.clone()), 0.0, transport.clone()));
+    let predict = Rc::new(
+        PredictApi::new("https://api.predict.fun/v1", "k", Some(wallet.clone()), 0.0, transport.clone())
+            .with_spares(&config.api_spares),
+    );
     let chain = Rc::new(Chain::new("https://bsc-rpc.test/", wallet.clone(), transport));
     let stream = Rc::new(BookStream::new("", 1));
     stream.fake_alive.set(Some(true));
@@ -2235,6 +2249,66 @@ fn the_menu_has_the_speed_test() {
         .collect();
     assert!(buttons.contains(&"c:/speed".to_string()), "{buttons:?}");
     assert!(buttons.contains(&"c:/test".to_string()) && buttons.contains(&"m:".to_string()));
+}
+
+#[test]
+fn a_429_on_the_key_in_use_sends_the_request_again_through_a_spare() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[("RULE_API_KEY_2", "B"), ("RULE_API_KEY_3", "C")]);
+        r.found().await;
+        let api = r.me.borrow().api.clone();
+        assert_eq!(api.keys, vec!["k", "B", "C"]);
+        r.api.limited_keys.borrow_mut().insert("k".into()); // (the main key's budget spent by someone else)
+        // a read: refused on the main key, answered through the first spare — no pause
+        assert!(api.orderbook(MID).await.is_ok());
+        assert_eq!(api.active.get(), 1);
+        assert!(api.cooling() <= 0.0 && api.key_cooling(0) > 0.0);
+        assert_eq!(api.switches.borrow().len(), 1);
+        assert_eq!(api.limited.borrow().len(), 1);
+        // an order at the race: refused on its key too, sent again through the next free one — placed once
+        r.api.limited_keys.borrow_mut().insert("B".into());
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        assert_eq!(r.created().len(), 1, "{:?}", r.created());
+        assert_eq!(api.active.get(), 2);
+        assert!(!crate::rules::never_placed(r.order(0).state()), "{:?}", r.order(0));
+        let status = r.me.borrow().status();
+        assert!(status.contains("API Key 在用第 3 把（共 3 把"), "{status}");
+        // every key spent: the pause as before (no new order meanwhile)
+        r.api.limited_keys.borrow_mut().insert("C".into());
+        assert!(api.key_cooling(2) <= 0.0, "C free until it is refused too");
+        assert!(api.orderbook(MID).await.is_err());
+        assert!(api.cooling() > 0.0);
+        assert!(r.me.borrow().block(0.0, None).contains("限流冷却中"));
+    });
+}
+
+#[test]
+fn the_self_check_tries_each_spare_key() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[("RULE_API_KEY_2", "B"), ("RULE_API_KEY_3", "WRONGKEY")]);
+        r.found().await;
+        r.api.unknown_keys.borrow_mut().insert("WRONGKEY".into());
+        let text = control::self_check(&r.me).await;
+        assert!(text.contains("API Key：主用 + 备用 2 把，现在用第 1 把｜第 2 把（…B）可用"), "{text}");
+        assert!(text.contains("❌ 备用 API Key 被 Predict 拒绝：第 3 把（…GKEY）"), "{text}");
+        assert!(!text.contains("WRONGKEY"), "never the whole key: {text}");
+    });
+}
+
+#[test]
+fn the_spare_keys_are_read_from_the_settings() {
+    let c = Config::from_env(&env_of(&[
+        ("RULE_API_KEY_2", " B "),
+        ("RULE_API_KEY_3", ""),
+        ("RULE_API_KEY_4", "k"), // (the main key again: left out)
+        ("RULE_API_KEY_5", "B"), // (a repeat: left out)
+        ("RULE_API_KEY_9", "C"),
+    ]))
+    .unwrap();
+    assert_eq!(c.api_spares, vec!["B", "C"]);
+    assert!(c.secrets_line().contains("spare_api_keys=2"), "{}", c.secrets_line());
+    assert!(!format!("{c:?}").contains("\"B\""));
 }
 
 #[test]

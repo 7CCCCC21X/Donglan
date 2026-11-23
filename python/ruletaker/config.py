@@ -178,6 +178,9 @@ class Config:
     trading_allowed: bool = True
     api_key: str = dataclasses.field(default="", repr=False)  # RULE_API_KEY, else PREDICT_API_KEY (secrets: never in a repr)
     own_key: bool = False             # the key is RULE_API_KEY (one of the taker's own)
+    # the spare keys (RULE_API_KEY_2 … RULE_API_KEY_9, in that order; empty ones and repeats of the main one left out): a 429 on
+    # the key in use moves the requests to the next free one
+    api_spares: tuple = dataclasses.field(default=(), repr=False)
     private_key: str = dataclasses.field(default="", repr=False)
     key_kept: str = ""                # where the key came from: "stored" (kept encrypted on this machine), "settings" (the
                                       # settings file: plain text), "both" (the same key in both: the plain copy is to go), "" (none)
@@ -264,6 +267,7 @@ class Config:
             rules=rules,
             trading_allowed=allowed(e.get("LIVE_TRADING_ALLOWED")),
             api_key=key, own_key=bool(own) and own != shared,
+            api_spares=tuple(dict.fromkeys(k for k in (str(e.get(f"RULE_API_KEY_{n}", "")).strip() for n in range(2, 10)) if k and k != key)),
             private_key=private_key, key_kept=key_kept, key_store=stored.store, account=account,
             chain_id=int(bounded(e, "PREDICT_CHAIN_ID", 56, 1, 10 ** 9)),
             rpc_url=str(e.get("BSC_RPC_URL", "")).strip().rstrip("/"),
@@ -289,7 +293,7 @@ class Config:
     def secrets_line(self) -> str:
         """Which secrets are set (never their values): the deploy's first log line."""
         return (f"secrets configured: predict_api_key={bool(self.api_key)} own_rule_key={self.own_key} "
-                f"predict_private_key={bool(self.private_key)} predict_account={bool(self.account)} "
+                f"spare_api_keys={len(self.api_spares)} predict_private_key={bool(self.private_key)} predict_account={bool(self.account)} "
                 f"telegram_token={bool(self.telegram_token)} telegram_command_token={bool(self.telegram_command_token)} "
                 f"telegram_commands={self.telegram_commands} status_key={bool(self.status_key)} mode={self.rules.mode} "
                 f"trading_allowed={self.trading_allowed} private_key_kept={self.key_kept or 'none'}")

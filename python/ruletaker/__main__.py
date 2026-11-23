@@ -375,7 +375,7 @@ async def check(config: Config, probe_order: bool = True) -> int:
         return 0
     wallet = Wallet(config.private_key, config.chain_id, config.account)
     print(f"钱包：{wallet.kind}｜下单账户 {wallet.maker}" + (f"｜签名钱包 {wallet.signer}" if wallet.predict_account else ""))
-    api = PredictApi(API_BASES.get(config.chain_id, PREDICT_REST), config.api_key, wallet, config.rate_per_min)
+    api = PredictApi(API_BASES.get(config.chain_id, PREDICT_REST), config.api_key, wallet, config.rate_per_min).with_spares(config.api_spares)
     chain = Chain(config.rpc_url or RPC_URLS.get(config.chain_id, RPC_URLS[56]), wallet)
     ok = True
     try:

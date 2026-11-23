@@ -610,7 +610,8 @@ async fn check(config: Config, probe_order: bool) -> i32 {
         Some(wallet.clone()),
         config.rate_per_min,
         live.clone(),
-    );
+    )
+    .with_spares(&config.api_spares);
     let rpc = if config.rpc_url.is_empty() { predict::rpc_url(config.chain_id).to_string() } else { config.rpc_url.clone() };
     let chain = predict::Chain::new(&rpc, wallet.clone(), live);
     let mut ok = true;

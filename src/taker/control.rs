@@ -324,6 +324,12 @@ pub fn key_budget_line(limits: &str, ours: usize) -> Option<(bool, String)> {
     Some((false, text))
 }
 
+/// The last four characters of a key: enough to tell which one is meant, too few to use.
+pub fn key_tail(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    chars[chars.len().saturating_sub(4)..].iter().collect()
+}
+
 fn short(addr: &str) -> String {
     if addr.len() < 10 { addr.to_string() } else { format!("{}…{}", &addr[..6], &addr[addr.len() - 4..]) }
 }
@@ -563,6 +569,39 @@ pub async fn self_check(me: &Me) -> String {
         }
     } else if s.mode != "off" {
         r.no("没有 API Key（RULE_API_KEY / PREDICT_API_KEY）");
+    }
+    // the spare keys: each asked once now (a read through it alone), so one Predict refuses is found here, not in a race
+    if api.keys.len() > 1 {
+        let path = format!("/categories/btc-updown-15m-{}", (now - now % 900_000) / 1000);
+        let mut fine = vec![];
+        let mut refused = vec![];
+        for k in 1..api.keys.len() {
+            let name = format!("第 {} 把（…{}）", k + 1, key_tail(&api.keys[k]));
+            match api.try_key(k, &path).await {
+                Ok(ms) => fine.push(format!("{name}可用 {ms:.0} ms")),
+                Err(e) if e.status() == 404 => fine.push(format!("{name}可用")), // (that quarter not listed yet: the key passed)
+                Err(e) => refused.push(format!("{name}：{}", clean(&e))),
+            }
+        }
+        let switched = api.switches.borrow().iter().filter(|(at, _, _)| mono() - at < 86_400.0).count();
+        let cooling: Vec<String> = (0..api.keys.len())
+            .filter(|k| api.key_cooling(*k) > 0.0)
+            .map(|k| format!("第 {} 把还要冷却 {} 秒", k + 1, api.key_cooling(k) as i64 + 1))
+            .collect();
+        let text = format!(
+            "API Key：主用 + 备用 {} 把，现在用第 {} 把{}{}{}",
+            api.keys.len() - 1,
+            api.active.get() + 1,
+            if fine.is_empty() { String::new() } else { format!("｜{}", fine.join("、")) },
+            if cooling.is_empty() { String::new() } else { format!("｜{}", cooling.join("、")) },
+            if switched > 0 { format!("｜最近一天被限流换了 {switched} 次 Key") } else { String::new() }
+        );
+        if refused.is_empty() {
+            r.ok(text);
+        } else {
+            r.warn(text);
+            r.no(format!("备用 API Key 被 Predict 拒绝：{}（rt.sh edit 改正或删掉这一行）", refused.join("；")));
+        }
     }
     let limited = api.limited.borrow().iter().filter(|at| mono() - **at < 86_400.0).count();
     if limited > 0 {

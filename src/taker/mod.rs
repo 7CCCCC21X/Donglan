@@ -353,13 +353,16 @@ impl Taker {
         };
         let live: Rc<dyn crate::predict::Transport> = Rc::new(crate::predict::Live);
         let api = api.unwrap_or_else(|| {
-            Rc::new(PredictApi::new(
-                crate::predict::api_base(config.chain_id),
-                &config.api_key,
-                wallet.clone(),
-                config.rate_per_min,
-                live.clone(),
-            ))
+            Rc::new(
+                PredictApi::new(
+                    crate::predict::api_base(config.chain_id),
+                    &config.api_key,
+                    wallet.clone(),
+                    config.rate_per_min,
+                    live.clone(),
+                )
+                .with_spares(&config.api_spares),
+            )
         });
         let chain = match chain {
             Some(c) => c,

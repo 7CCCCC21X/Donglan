@@ -244,7 +244,18 @@ pub struct Created {
 
 pub struct PredictApi {
     pub base: String,
+    /// the main key (the first of ``keys``)
     pub api_key: String,
+    /// the keys, the main one first, then the spares (RULE_API_KEY_2, _3, …): a 429 on the one in use sends the same request
+    /// again at once through the next free one, and that one is used from then on; every request waits only when all are
+    /// cooling
+    pub keys: Vec<String>,
+    /// the key in use (an index into ``keys``)
+    pub active: Cell<usize>,
+    /// per key: monotonic time its 429 cooling ends
+    blocked: RefCell<Vec<f64>>,
+    /// (monotonic, from, to): each time a 429 moved the requests to another key
+    pub switches: RefCell<VecDeque<(f64, usize, usize)>>,
     pub wallet: Option<Rc<Wallet>>,
     pub host: String,
     pub pacer: RefCell<Pacer>,
@@ -258,7 +269,6 @@ pub struct PredictApi {
     gate: Semaphore,
     read_gate: Semaphore,
     pub writes_inflight: Cell<i64>,
-    pub blocked_until: Cell<f64>,
     pub calls: Cell<u64>,
     pub limited: RefCell<VecDeque<f64>>,
     /// (method, ms): the request alone, after the pace and the gate
@@ -283,6 +293,10 @@ impl PredictApi {
         PredictApi {
             base,
             api_key: api_key.to_string(),
+            keys: vec![api_key.to_string()],
+            active: Cell::new(0),
+            blocked: RefCell::new(vec![0.0]),
+            switches: RefCell::new(VecDeque::new()),
             wallet,
             host,
             pacer: RefCell::new(Pacer::new(per_min)),
@@ -295,7 +309,6 @@ impl PredictApi {
             gate: Semaphore::new(Self::PARALLEL),
             read_gate: Semaphore::new(Self::READ_PARALLEL),
             writes_inflight: Cell::new(0),
-            blocked_until: Cell::new(0.0),
             calls: Cell::new(0),
             limited: RefCell::new(VecDeque::new()),
             trips: RefCell::new(VecDeque::new()),
@@ -306,10 +319,28 @@ impl PredictApi {
         }
     }
 
+    /// The spare keys after the main one (empty ones and repeats left out).
+    pub fn with_spares(mut self, spares: &[String]) -> PredictApi {
+        for k in spares {
+            let k = k.trim();
+            if !k.is_empty() && !self.keys.iter().any(|x| x == k) {
+                self.keys.push(k.to_string());
+            }
+        }
+        *self.blocked.borrow_mut() = vec![0.0; self.keys.len()];
+        self
+    }
+
     pub fn headers(&self) -> Vec<(String, String)> {
+        self.headers_for(self.active.get())
+    }
+
+    /// The headers a request through key ``k`` carries (the sign-in's token with it).
+    pub fn headers_for(&self, k: usize) -> Vec<(String, String)> {
         let mut out = vec![];
-        if !self.api_key.is_empty() {
-            out.push(("x-api-key".to_string(), self.api_key.clone()));
+        let key = self.keys.get(k).map(String::as_str).unwrap_or(self.api_key.as_str());
+        if !key.is_empty() {
+            out.push(("x-api-key".to_string(), key.to_string()));
         }
         let jwt = self.jwt.borrow();
         if !jwt.is_empty() {
@@ -318,8 +349,49 @@ impl PredictApi {
         out
     }
 
+    /// Seconds until a key is free again: none cooling (or a spare free) — zero or less.
     pub fn cooling(&self) -> f64 {
-        self.blocked_until.get() - mono()
+        let now = mono();
+        self.blocked.borrow().iter().map(|until| until - now).fold(f64::INFINITY, f64::min)
+    }
+
+    /// Seconds key ``k`` still cools (zero or less: free).
+    pub fn key_cooling(&self, k: usize) -> f64 {
+        self.blocked.borrow().get(k).map(|until| until - mono()).unwrap_or(0.0)
+    }
+
+    /// One read through key ``k`` alone (a spare checked before it is needed): its round trip, ms — or why Predict refused it.
+    /// Outside the budget and the cooling: the self-check's, a handful a check.
+    pub async fn try_key(&self, k: usize, path: &str) -> Res<f64> {
+        let began = mono();
+        let req = Req {
+            url: format!("{}{path}", self.base),
+            payload: None,
+            timeout: API_TIMEOUT,
+            headers: self.headers_for(k),
+            gate: None,
+            trace: None,
+        };
+        let raw = self.transport.request(req).await?;
+        let answer: Value = serde_json::from_slice(&raw).map_err(|_| RemoteError::new("Predict 接口未返回有效 JSON"))?;
+        match answer.get("success") {
+            None | Some(Value::Bool(true)) => Ok((mono() - began) * 1000.0),
+            _ => Err(RemoteError::new(http_error_text(&answer))),
+        }
+    }
+
+    /// The key a request goes through: the one in use while it is free, else the next free one (then in use from now on).
+    fn pick_key(&self) -> usize {
+        let n = self.keys.len().max(1);
+        let now = mono();
+        let blocked = self.blocked.borrow();
+        let at = self.active.get().min(n - 1);
+        let k = (0..n).map(|i| (at + i) % n).find(|k| blocked.get(*k).is_none_or(|until| *until <= now)).unwrap_or(at);
+        if k != at {
+            self.active.set(k);
+            push_cap(&mut self.switches.borrow_mut(), (now, at, k), 100);
+        }
+        k
     }
 
     fn cooling_error(left: f64) -> RemoteError {
@@ -425,19 +497,43 @@ impl PredictApi {
         if let Some(t) = &trace {
             t.queued_ms.set((began - t.entered.get()) * 1000.0);
         }
-        let req = Req { url: format!("{}{path}", self.base), payload, timeout, headers: self.headers(), gate, trace };
-        match self.transport.request(req).await {
-            Ok(raw) => Ok((raw, began)),
-            Err(error) => {
-                if error.retry_after > 0 || error.status() == 429 {
-                    let until = mono() + (error.retry_after as f64).max(Self::BACKOFF_SECONDS);
-                    self.blocked_until.set(self.blocked_until.get().max(until));
-                    if error.status() == 429 {
-                        push_cap(&mut self.limited.borrow_mut(), mono(), 500);
-                        self.pacer.borrow_mut().note_429();
+        let mut tried = 0;
+        loop {
+            let k = self.pick_key();
+            let req = Req {
+                url: format!("{}{path}", self.base),
+                payload: payload.clone(),
+                timeout,
+                headers: self.headers_for(k),
+                gate: gate.clone(),
+                trace: trace.clone(),
+            };
+            match self.transport.request(req).await {
+                Ok(raw) => return Ok((raw, began)),
+                Err(error) => {
+                    if error.retry_after > 0 || error.status() == 429 {
+                        let until = mono() + (error.retry_after as f64).max(Self::BACKOFF_SECONDS);
+                        let mut blocked = self.blocked.borrow_mut();
+                        for (i, b) in blocked.iter_mut().enumerate() {
+                            // a 429 is this key's budget spent; any other wait asked for is the whole server's: every key
+                            if i == k || error.status() != 429 {
+                                *b = b.max(until);
+                            }
+                        }
+                        drop(blocked);
+                        if error.status() == 429 {
+                            push_cap(&mut self.limited.borrow_mut(), mono(), 500);
+                            self.pacer.borrow_mut().note_429();
+                            // refused before anything was done (an order too: nothing placed): the same request again at once
+                            // through a spare that is free — an order's own check before its bytes go judges it again
+                            tried += 1;
+                            if tried < self.keys.len() && self.cooling() <= 0.0 {
+                                continue;
+                            }
+                        }
                     }
+                    return Err(error);
                 }
-                Err(error)
             }
         }
     }

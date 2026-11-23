@@ -150,7 +150,12 @@ class PredictApi:
         self._auth_lock: tuple[Any, asyncio.Lock] | None = None
         self._gates: tuple[Any, asyncio.Semaphore, asyncio.Semaphore] | None = None
         self.writes_inflight = 0
-        self.blocked_until = 0.0
+        # the keys, the main one first, then the spares (RULE_API_KEY_2, _3, …): a 429 on the one in use sends the same request
+        # again at once through the next free one, used from then on; every request waits only when all are cooling
+        self.keys: list[str] = [api_key]
+        self.active = 0                        # the key in use (an index into keys)
+        self._blocked: list[float] = [0.0]     # per key: monotonic time its 429 cooling ends
+        self.switches: collections.deque = collections.deque(maxlen=100)  # (monotonic, from, to): each move to another key
         self.calls = 0
         self.limited: collections.deque = collections.deque(maxlen=500)
         self.trips: collections.deque = collections.deque(maxlen=300)  # (method, ms): the request alone, after the pace and the gate
@@ -165,16 +170,68 @@ class PredictApi:
             self._gates = (loop, asyncio.Semaphore(self.PARALLEL), asyncio.Semaphore(self.READ_PARALLEL))
         return self._gates[1], self._gates[2]
 
+    def with_spares(self, spares: Any) -> "PredictApi":
+        """The spare keys after the main one (empty ones and repeats left out)."""
+        for k in spares or ():
+            k = str(k).strip()
+            if k and k not in self.keys:
+                self.keys.append(k)
+        self._blocked = [0.0] * len(self.keys)
+        return self
+
+    @property
+    def blocked_until(self) -> float:
+        """Monotonic time a key is free again: the soonest of their coolings."""
+        return min(self._blocked)
+
+    @blocked_until.setter
+    def blocked_until(self, until: float) -> None:
+        self._blocked = [until] * len(self.keys)
+
     def headers(self) -> dict[str, str]:
+        return self.headers_for(self.active)
+
+    def headers_for(self, k: int) -> dict[str, str]:
+        """The headers a request through key ``k`` carries (the sign-in's token with it)."""
         out = {}
-        if self.api_key:
-            out["x-api-key"] = self.api_key
+        key = self.keys[k] if 0 <= k < len(self.keys) else self.api_key
+        if key:
+            out["x-api-key"] = key
         if self.jwt:
             out["Authorization"] = f"Bearer {self.jwt}"
         return out
 
     def cooling(self) -> float:
+        """Seconds until a key is free again: none cooling (or a spare free) — zero or less."""
         return self.blocked_until - time.monotonic()
+
+    def key_cooling(self, k: int) -> float:
+        """Seconds key ``k`` still cools (zero or less: free)."""
+        return (self._blocked[k] - time.monotonic()) if 0 <= k < len(self._blocked) else 0.0
+
+    def pick_key(self) -> int:
+        """The key a request goes through: the one in use while it is free, else the next free one (then in use from now on)."""
+        n, now = max(len(self.keys), 1), time.monotonic()
+        at = min(self.active, n - 1)
+        k = next((k for k in ((at + i) % n for i in range(n)) if k >= len(self._blocked) or self._blocked[k] <= now), at)
+        if k != at:
+            self.active = k
+            self.switches.append((now, at, k))
+        return k
+
+    async def try_key(self, k: int, path: str) -> float:
+        """One read through key ``k`` alone (a spare checked before it is needed): its round trip, ms — or why Predict refused it
+        (RemoteError). Outside the budget and the cooling: the self-check's, a handful a check."""
+        began = time.perf_counter()
+        raw = await asyncio.get_running_loop().run_in_executor(READ_POOL, functools.partial(
+            http.request, self.base + path, None, API_TIMEOUT, self.headers_for(k)))
+        try:
+            answer = loads(raw) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            raise RemoteError("Predict 接口未返回有效 JSON") from None
+        if not isinstance(answer, dict) or answer.get("success", True) is not True:
+            raise RemoteError(http_error_text(answer) if isinstance(answer, dict) else type(answer).__name__)
+        return (time.perf_counter() - began) * 1000
 
     async def call(self, method: str, path: str, payload: Any = None, timeout: float = API_TIMEOUT, priority: bool = False,
                    check: str = "") -> Any:
@@ -222,17 +279,29 @@ class PredictApi:
         gate = self.thread_gate(loop, check) if check and self.before_send is not None else None
         began = time.perf_counter()
         traced = {"trace": self.traces[check]} if check in self.traces else {}
-        try:
-            raw = await loop.run_in_executor(WRITE_POOL if write else READ_POOL, functools.partial(
-                http.request, self.base + path, payload, timeout, self.headers(), **({"gate": gate} if gate else {}), **traced))
-        except RemoteError as error:
-            if error.retry_after or http_status(error) == 429:
-                self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS))
-                if http_status(error) == 429:
-                    self.limited.append(time.monotonic())
-                    self.pacer.note_429()
-            raise
-        return raw, began
+        tried = 0
+        while True:
+            k = self.pick_key()
+            try:
+                raw = await loop.run_in_executor(WRITE_POOL if write else READ_POOL, functools.partial(
+                    http.request, self.base + path, payload, timeout, self.headers_for(k), **({"gate": gate} if gate else {}), **traced))
+            except RemoteError as error:
+                if error.retry_after or http_status(error) == 429:
+                    until = time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS)
+                    # a 429 is this key's budget spent; any other wait asked for is the whole server's: every key
+                    for i in range(len(self._blocked)):
+                        if i == k or http_status(error) != 429:
+                            self._blocked[i] = max(self._blocked[i], until)
+                    if http_status(error) == 429:
+                        self.limited.append(time.monotonic())
+                        self.pacer.note_429()
+                        # refused before anything was done (an order too: nothing placed): the same request again at once
+                        # through a spare that is free — an order's own check before its bytes go judges it again
+                        tried += 1
+                        if tried < len(self.keys) and self.cooling() <= 0:
+                            continue
+                raise
+            return raw, began
 
     def thread_gate(self, loop: asyncio.AbstractEventLoop, check: str) -> Callable[[], str]:
         """before_send for the request's own thread: judged again when the request had to wait there — a new connection's TCP +

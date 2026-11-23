@@ -205,6 +205,13 @@ impl Taker {
         if !net.edge.is_empty() {
             parts.push(format!("入口 {}", net.edge));
         }
+        if self.api.keys.len() > 1 {
+            parts.push(format!(
+                "API Key 在用第 {} 把（共 {} 把，被限流就换下一把）",
+                self.api.active.get() + 1,
+                self.api.keys.len()
+            ));
+        }
         let read_mid = median(&mut reads.clone());
         if !reads.is_empty() {
             parts.push(format!("读一次 {}", spread(&mut reads)));

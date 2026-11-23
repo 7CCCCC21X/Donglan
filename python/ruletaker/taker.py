@@ -186,6 +186,11 @@ def paid(rec: dict, resolution: dict, won: int | None) -> float | None:
 SPEED_CLEAR_MS = 3 * 60_000
 
 
+def key_tail(key: str) -> str:
+    """The last four characters of a key: enough to tell which one is meant, too few to use."""
+    return str(key)[-4:]
+
+
 def key_budget_line(limits: str, ours: int) -> tuple[bool, str] | None:
     """The key's use as Predict counts it (its rate-limit headers) against our own requests of the same minute: another program
     on the same key shows as the difference (Railway's huice lending it out: RULE_KEY_LEND). (a warning?, the line); None
@@ -291,7 +296,7 @@ class RuleTaker:
         self.lookup_s = TEST_LOOKUP_S
         self.wallet = wallet if wallet is not None else (Wallet(config.private_key, config.chain_id, config.account) if config.private_key else None)
         base = API_BASES.get(config.chain_id, PREDICT_REST)
-        self.api = api if api is not None else PredictApi(base, config.api_key, self.wallet, config.rate_per_min)
+        self.api = api if api is not None else PredictApi(base, config.api_key, self.wallet, config.rate_per_min).with_spares(config.api_spares)
         self.api.before_send = self.before_send
         self.chain = chain if chain is not None else (Chain(config.rpc_url or RPC_URLS.get(config.chain_id, RPC_URLS[56]), self.wallet)
                                                      if self.wallet is not None else None)
@@ -2278,6 +2283,29 @@ class RuleTaker:
                 no(f"Predict 读取失败：{clean_error(error) or type(error).__name__}")
         elif s.mode != "off":
             no("没有 API Key（RULE_API_KEY / PREDICT_API_KEY）")
+        # the spare keys: each asked once now (a read through it alone), so one Predict refuses is found here, not in a race
+        keys = list(getattr(self.api, "keys", ()))
+        if len(keys) > 1:
+            path = f"/categories/btc-updown-15m-{(now - now % 900_000) // 1000}"
+            fine, refused = [], []
+            for k in range(1, len(keys)):
+                name = f"第 {k + 1} 把（…{key_tail(keys[k])}）"
+                try:
+                    fine.append(f"{name}可用 {await self.api.try_key(k, path):.0f} ms")
+                except Exception as error:
+                    if http_status(error) == 404:
+                        fine.append(f"{name}可用")  # (that quarter not listed yet: the key passed)
+                    else:
+                        refused.append(f"{name}：{clean_error(error) or type(error).__name__}")
+            switched = sum(1 for at, _, _ in list(self.api.switches) if time.monotonic() - at < 86_400)
+            cooling = [f"第 {k + 1} 把还要冷却 {int(self.api.key_cooling(k)) + 1} 秒" for k in range(len(keys)) if self.api.key_cooling(k) > 0]
+            text = (f"API Key：主用 + 备用 {len(keys) - 1} 把，现在用第 {self.api.active + 1} 把" + (f"｜{'、'.join(fine)}" if fine else "")
+                    + (f"｜{'、'.join(cooling)}" if cooling else "") + (f"｜最近一天被限流换了 {switched} 次 Key" if switched else ""))
+            if refused:
+                warn(text)
+                no(f"备用 API Key 被 Predict 拒绝：{'；'.join(refused)}（rt.sh edit 改正或删掉这一行）")
+            else:
+                ok(text)
         limited = sum(1 for at in list(getattr(self.api, "limited", ())) if time.monotonic() - at < 86_400)
         if limited:
             warn(f"最近一天被 Predict 限流（429）{limited} 次：每次这里所有请求停 {PredictApi.BACKOFF_SECONDS} 秒以上，期间不下新单")
@@ -2752,6 +2780,9 @@ class RuleTaker:
             parts.append(f"到 {host} 新建连接 {spread(connect)}（TCP+TLS，2～3 个来回）")
         if net.get("edge"):
             parts.append(f"入口 {net['edge']}")
+        keys = list(getattr(self.api, "keys", ()))
+        if len(keys) > 1:
+            parts.append(f"API Key 在用第 {self.api.active + 1} 把（共 {len(keys)} 把，被限流就换下一把）")
         if reads:
             parts.append(f"读一次 {spread(reads)}")
         if writes:

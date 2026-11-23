@@ -268,6 +268,9 @@ pub struct Config {
     pub trading_allowed: bool,
     pub api_key: String,
     pub own_key: bool,
+    /// the spare keys (RULE_API_KEY_2 … RULE_API_KEY_9, in that order; empty ones and repeats of the main one left out): a 429
+    /// on the key in use moves the requests to the next free one
+    pub api_spares: Vec<String>,
     pub private_key: String,
     /// where the private key came from: "stored" (kept encrypted on this machine), "settings" (the settings file: plain text),
     /// "both" (the same key in both: the plain copy is to go), "" (none)
@@ -307,6 +310,7 @@ impl Default for Config {
             trading_allowed: true,
             api_key: String::new(),
             own_key: false,
+            api_spares: vec![],
             private_key: String::new(),
             key_kept: "",
             key_store: false,
@@ -425,6 +429,16 @@ impl Config {
             rules,
             trading_allowed: allowed(e.get("LIVE_TRADING_ALLOWED").map(String::as_str)),
             own_key: !own.is_empty() && own != shared,
+            api_spares: {
+                let mut spares: Vec<String> = vec![];
+                for n in 2..=9 {
+                    let k = get(e, &format!("RULE_API_KEY_{n}"), "").trim().to_string();
+                    if !k.is_empty() && k != key && !spares.contains(&k) {
+                        spares.push(k);
+                    }
+                }
+                spares
+            },
             api_key: key,
             private_key,
             key_kept,
@@ -464,10 +478,12 @@ impl Config {
     /// (Also what a ``{:?}`` of the whole configuration shows: see the Debug below.)
     pub fn secrets_line(&self) -> String {
         format!(
-            "secrets configured: predict_api_key={} own_rule_key={} predict_private_key={} predict_account={} telegram_token={} \
-             telegram_command_token={} telegram_commands={} status_key={} mode={} trading_allowed={} private_key_kept={}",
+            "secrets configured: predict_api_key={} own_rule_key={} spare_api_keys={} predict_private_key={} predict_account={} \
+             telegram_token={} telegram_command_token={} telegram_commands={} status_key={} mode={} trading_allowed={} \
+             private_key_kept={}",
             py_bool(!self.api_key.is_empty()),
             py_bool(self.own_key),
+            self.api_spares.len(),
             py_bool(!self.private_key.is_empty()),
             py_bool(!self.account.is_empty()),
             py_bool(!self.telegram_token.is_empty()),

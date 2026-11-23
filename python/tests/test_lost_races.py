@@ -143,5 +143,76 @@ class SpeedCommandTest(unittest.TestCase):
         self.assertTrue("c:/test" in buttons and "m:" in buttons)
 
 
+class SpareKeyTest(unittest.TestCase):
+    def test_a_429_on_the_key_in_use_sends_the_request_again_through_a_spare(self) -> None:
+        from ruletaker.predict import PredictApi
+        from ruletaker.util import RemoteError
+        limited: set = {"k"}
+        created: list = []
+
+        def fake_request(url, payload=None, timeout=15, headers=None, gate=None, trace=None):
+            if (headers or {}).get("x-api-key") in limited:
+                raise RemoteError("HTTP 429: Rate limit exceeded", 30)  # (refused before anything is done)
+            if payload is not None:
+                created.append(payload)
+            return b'{"success": true, "data": {}}'
+
+        async def go() -> tuple:
+            api = PredictApi("https://api.predict.fun/v1", "k", None, 0).with_spares(["B", " ", "k", "C"])
+            saved = nethttp.request
+            nethttp.request = fake_request
+            try:
+                out = [list(api.keys)]
+                await api.call("GET", "/markets/1/orderbook")  # a read: answered through the first spare, no pause
+                out += [api.active, api.cooling() <= 0, api.key_cooling(0) > 0, len(api.switches), len(api.limited)]
+                limited.add("B")
+                await api.call("POST", "/orders", b'{"data": {"order": 1}}', priority=True)  # an order: placed once, through C
+                out += [len(created), api.active]
+                limited.add("C")  # every key spent: the pause as before
+                try:
+                    await api.call("GET", "/markets/1/orderbook")
+                    out.append("answered")
+                except RemoteError:
+                    out.append("refused")
+                out.append(api.cooling() > 0)
+                return out
+            finally:
+                nethttp.request = saved
+        keys, active, free, cooling0, switches, limits, placed, active2, last, all_cooling = run(go())
+        self.assertEqual(keys, ["k", "B", "C"])
+        self.assertEqual((active, free, cooling0, switches, limits), (1, True, True, 1, 1))
+        self.assertEqual((placed, active2), (1, 2))
+        self.assertEqual((last, all_cooling), ("refused", True))
+
+    def test_the_self_check_tries_each_spare_key(self) -> None:
+        import collections
+        from ruletaker.util import RemoteError
+
+        async def go() -> str:
+            taker, api, chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            api.keys, api.active, api.switches = ["k", "B", "WRONGKEY"], 0, collections.deque()
+            api.key_cooling = lambda k: 0.0
+
+            async def try_key(k: int, path: str) -> float:
+                if api.keys[k] == "WRONGKEY":
+                    raise RemoteError("HTTP 401: Invalid API key")
+                return 12.0
+            api.try_key = try_key
+            return await taker.self_check()
+        text = run(go())
+        self.assertIn("API Key：主用 + 备用 2 把，现在用第 1 把｜第 2 把（…B）可用 12 ms", text)
+        self.assertIn("❌ 备用 API Key 被 Predict 拒绝：第 3 把（…GKEY）", text)
+        self.assertNotIn("WRONGKEY", text)  # never the whole key
+
+    def test_the_spare_keys_are_read_from_the_settings(self) -> None:
+        from ruletaker.config import Config
+        c = Config.from_env({"PREDICT_API_KEY": "k", "RULE_API_KEY_2": " B ", "RULE_API_KEY_3": "", "RULE_API_KEY_4": "k",
+                             "RULE_API_KEY_5": "B", "RULE_API_KEY_9": "C"})
+        self.assertEqual(c.api_spares, ("B", "C"))
+        self.assertIn("spare_api_keys=2", c.secrets_line())
+        self.assertNotIn("'B'", repr(c))
+
+
 if __name__ == "__main__":
     unittest.main()
