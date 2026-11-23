@@ -157,10 +157,30 @@ vm_call() {  # vm_call WORDS...: deploy/gcp/vm-call.sh run on the VM as root (th
 
 cmd="${1:-help}"
 shift || true
+# gcloud signed in first: without it every SSH to the VM fails, and what fails after reads like another problem (an upload cut
+# short, a command "not there yet"). Cloud Shell in Google's phone app often starts that way.
+case "$cmd" in
+  help|-h|--help) ;;
+  *)
+    if [ -z "$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null)" ]; then
+      die "gcloud 还没登录（手机 App 里的 Cloud Shell 常这样），连不上虚拟机：先运行 gcloud auth login——点它给的链接，用你的 Google 账号登录，把页面上的验证码粘贴回来按回车，再重跑这条命令"
+    fi
+    ;;
+esac
 case "$cmd" in
   help|-h|--help|probe) ;;
   *) iap_mode ;;
 esac
+
+vm_has() {  # vm_has TEST: yes / no on the VM; dies, saying so, when the VM cannot be reached (gcloud's own words above it)
+  local said
+  said="$(ssh_to "$VM" "$ZONE" --command "if $1; then echo yes; else echo no; fi" | tr -d '[:space:]' || true)"
+  case "$said" in
+    yes) return 0 ;;
+    no) return 1 ;;
+    *) die "连不上虚拟机 $VM（原因见上面 gcloud / SSH 的报错），什么都没改" ;;
+  esac
+}
 case "$cmd" in
   deploy)
     if gcloud compute instances describe "$VM" "${G[@]}" "${Z[@]}" >/dev/null 2>&1; then
@@ -265,7 +285,7 @@ case "$cmd" in
     [[ "$name" =~ ^[A-Z][A-Z0-9_]*$ ]] \
       || die "用法：rt.sh set 设置名 值（例：rt.sh set RULE_WS_CONNECTIONS 3）；不写值就隐藏输入（填 Key 用：rt.sh set RULE_API_KEY_2）"
     [ "$name" != PREDICT_PRIVATE_KEY ] || die "私钥用 bash deploy/gcp/rt.sh key 换（会加密保存，不放进设置文件）"
-    ssh_to "$VM" "$ZONE" --command "grep -q '^  put)' /opt/ruletaker/deploy/gcp/vm-key.sh" \
+    vm_has "grep -q '^  put)' /opt/ruletaker/deploy/gcp/vm-key.sh" \
       || die "虚拟机上的版本还没有这个命令：先运行 bash deploy/gcp/rt.sh update"
     if [ $# -ge 2 ]; then
       value="$2"
@@ -282,7 +302,7 @@ case "$cmd" in
     # carried over the SSH channel's standard input to vm-key.sh on the VM — which checks it (its address, and on chain whether
     # it controls PREDICT_ACCOUNT) before anything changes, keeps it encrypted, takes any plain copy out of the settings file
     # and restarts the service on it.
-    ssh_to "$VM" "$ZONE" --command "test -f /opt/ruletaker/deploy/gcp/vm-key.sh" \
+    vm_has "test -f /opt/ruletaker/deploy/gcp/vm-key.sh" \
       || die "虚拟机上的版本还不会加密保存私钥：先运行 bash deploy/gcp/rt.sh update（它会顺便把设置文件里的私钥收进加密保存）"
     echo "换私钥：粘贴新的私钥（64 位十六进制，0x 可省）后按回车。屏幕上不会显示，也不会进命令历史。"
     echo "（先核对它在链上是不是 PREDICT_ACCOUNT 的控制钥匙，不对就什么都不改；对了才加密保存、重启服务——别在抢单前后几分钟做）"
