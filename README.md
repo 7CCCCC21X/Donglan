@@ -186,7 +186,7 @@ bash deploy/gcp/rt.sh env
 | `bash deploy/gcp/rt.sh ssh` | 登录虚拟机 |
 | `bash deploy/gcp/rt.sh probe asia-southeast1-b` | 在别的区域临时开一台小机器量推送延迟和读盘口，量完自动删除（只带 API Key，从虚拟机读）；怎么比见“为什么是东京、怎么确认” |
 
-**在手机上**：装 Google Cloud App（iOS / Android），首页右上角的 Cloud Shell 和电脑上的一样，`~/Donglan` 也在，上面这些命令照用；改设置用 `rt.sh set`（手机键盘没有 Ctrl 键，`rt.sh edit` 里的 nano 存不了盘）。**虚拟机页面上的“暂停 / 停止 / 重置 / 删除实例”是整台机器的操作，不是暂停吃单**——点了机器就停了（删除连记录一起没了）；暂停吃单用 Telegram `/pause` 或 `rt.sh pause`。
+**在手机上**：装 Google Cloud App（iOS / Android），App 里的 Cloud Shell（终端图标 `>_`）和电脑上的一样，`~/Donglan` 也在，上面这些命令照用；改设置用 `rt.sh set`（手机键盘没有 Ctrl 键，`rt.sh edit` 里的 nano 存不了盘）。**虚拟机页面上的“暂停 / 停止 / 重置 / 删除实例”是整台机器的操作，不是暂停吃单**——点了机器就停了（删除连记录一起没了）；暂停吃单用 Telegram `/pause` 或 `rt.sh pause`。
 
 停止或重启时，服务会先等在途订单的应答（最多 25 秒）、撤掉还挂着的单，再退出。
 
