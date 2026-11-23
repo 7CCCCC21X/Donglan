@@ -199,7 +199,7 @@ fn spread(xs: &[f64]) -> String {
 }
 
 /// How long the probe watches the pushed books for their delay (s).
-const PUSH_SECONDS: f64 = 45.0;
+pub(crate) const PUSH_SECONDS: f64 = 45.0;
 
 /// A book's top five levels a side, as text: the same book read over REST and pushed compares equal.
 fn book_sig(data: &serde_json::Value) -> String {
@@ -234,8 +234,30 @@ fn delays(xs: &[f64]) -> String {
 /// BTC quarter-hour books (its own timestamp to here) — what a race is decided on before an order leaves.
 async fn latency(config: Config, rounds: usize) -> i32 {
     let base = predict::api_base(config.chain_id).to_string();
-    probe(config, rounds, &base, stream::PREDICT_WS_URL, PUSH_SECONDS).await;
+    probe(config, rounds, &base, stream::PREDICT_WS_URL, PUSH_SECONDS, &Say::printing()).await;
     0
+}
+
+/// Where ``probe`` writes its report: printed as it goes (the command line), or kept (Telegram's /speed).
+pub struct Say {
+    pub lines: RefCell<Vec<String>>,
+    echo: bool,
+}
+
+impl Say {
+    pub fn printing() -> Say {
+        Say { lines: RefCell::new(vec![]), echo: true }
+    }
+    pub fn keeping() -> Say {
+        Say { lines: RefCell::new(vec![]), echo: false }
+    }
+    pub fn line(&self, text: impl Into<String>) {
+        let text = text.into();
+        if self.echo {
+            println!("{text}");
+        }
+        self.lines.borrow_mut().push(text);
+    }
 }
 
 /// What ``probe`` measured (ms): the reads' round trips, Predict's push delays, Binance's; the age of each new book a REST read
@@ -253,17 +275,17 @@ pub(crate) struct Probe {
 
 /// ``latency`` on the API at ``base`` and the push connection at ``ws_url`` (stand-ins, for the tests; the Binance index at
 /// the configuration's BINANCE_WS_URL).
-pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &str, push_seconds: f64) -> Probe {
+pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &str, push_seconds: f64, say: &Say) -> Probe {
     let host = http::Url::parse(base).map(|u| u.host).unwrap_or_default();
     let headers: Vec<(&str, &str)> =
         if config.api_key.is_empty() { vec![] } else { vec![("x-api-key", config.api_key.as_str())] };
     let zone = if config.region.is_empty() { gce_zone().await } else { config.region.clone() };
-    println!(
+    say.line(format!(
         "Predict 网络延迟探测（只读，不下单）｜区域 {}｜版本 {VERSION}（Rust）{}",
         if zone.is_empty() { "未知" } else { &zone },
         if config.api_key.is_empty() { "｜没有设置 API Key：可能被拒绝" } else { "" }
-    );
-    println!("（约 1 分钟，其间占这把 Key 每分钟额度的四分之一左右：别在抢单时段跑）");
+    ));
+    say.line("（约 1 分钟，其间占这把 Key 每分钟额度的四分之一左右：别在抢单时段跑）");
     let pool = http::http();
     let now = now_ms();
     let slug = format!("btc-updown-15m-{}", (now - now % 900_000) / 1000);
@@ -273,12 +295,12 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
         Ok(answer) => {
             let first = (mono() - began) * 1000.0;
             market_id = predict::predict_markets(&answer).first().map(|m| util::Py::s(m, "id")).unwrap_or_default();
-            println!(
+            say.line(format!(
                 "第一次请求（含新建连接）{first:.0} ms｜市场 {slug} → {}",
                 if market_id.is_empty() { "没找到" } else { &market_id }
-            );
+            ));
         }
-        Err(e) => println!("读市场失败：{}", clean_error(&e)),
+        Err(e) => say.line(format!("读市场失败：{}", clean_error(&e))),
     }
     // (the next quarter hour's market too: twice the books to time)
     let next = format!("btc-updown-15m-{}", (now - now % 900_000) / 1000 + 900);
@@ -304,7 +326,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
     }
     let net = pool.net_of(&host);
     let connect: Vec<f64> = net.connect.iter().copied().collect();
-    println!(
+    say.line(format!(
         "{}{}{}",
         if !reads.is_empty() || refused.is_empty() {
             format!("读盘口 {} 次（同一条连接）：{}", reads.len(), spread(&reads))
@@ -313,7 +335,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
         },
         if connect.is_empty() { String::new() } else { format!("｜新建连接（TCP+TLS）{}", spread(&connect)) },
         if net.edge.is_empty() { String::new() } else { format!("｜入口 {}", net.edge) }
-    );
+    ));
     let ws_headers: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
     // Predict's push connection, and at the same time the Binance index the in-play rules buy on, and the first watched book
     // read over REST (a quarter of the key's budget): which of the two shows a new book first
@@ -362,7 +384,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
         match stream::ws_connect(ws_url, &ws_headers).await {
             Err(e) => {
                 watched_out.set(true);
-                println!("推送连接失败：{}", clean_error(&e))
+                say.line(format!("推送连接失败：{}", clean_error(&e)))
             }
             Ok(ws) => {
                 let open = (mono() - began) * 1000.0;
@@ -399,10 +421,10 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
                         let ask = serde_json::json!({"method": "subscribe", "requestId": i + 1, "params": [format!("predictOrderbook/{mid}")]});
                         subscribed &= sink.send(Message::text(ask.to_string())).await.is_ok();
                     }
-                    println!("看 {} 个 BTC 15 分钟盘口 {push_seconds:.0} 秒，量推送延迟…", watched.len());
+                    say.line(format!("看 {} 个 BTC 15 分钟盘口 {push_seconds:.0} 秒，量推送延迟…", watched.len()));
                     watching.set(true);
                     let mut seen = std::collections::HashSet::new();
-                    while subscribed {
+                    while subscribed && mono() < began + push_seconds {
                         let left = began + push_seconds - mono();
                         if left <= 0.0 {
                             break;
@@ -442,32 +464,26 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
                 }
                 watched_out.set(true);
                 let _ = sink.close().await;
-                println!(
+                say.line(format!(
                     "推送连接：握手 {open:.0} ms｜ping 来回 {}{}",
                     spread(&pings),
                     book_ms.map(|b| format!("｜订阅到第一份盘口 {b:.0} ms")).unwrap_or_default()
-                );
-                println!(
-                    "{}",
-                    match lags.len() {
-                        0 => "推送延迟：没量到（盘口这段时间没变，或推送没连上）：换个时段再量".to_string(),
-                        n if n < 5 => format!("推送延迟：盘口只变了 {n} 次，量不准（{}）：换个时段再量", delays(&lags)),
-                        n => format!("推送延迟（Predict 盘口时间戳 → 这里收到，{n} 次盘口变化）：{}", delays(&lags)),
-                    }
-                );
+                ));
+                say.line(match lags.len() {
+                    0 => "推送延迟：没量到（盘口这段时间没变，或推送没连上）：换个时段再量".to_string(),
+                    n if n < 5 => format!("推送延迟：盘口只变了 {n} 次，量不准（{}）：换个时段再量", delays(&lags)),
+                    n => format!("推送延迟（Predict 盘口时间戳 → 这里收到，{n} 次盘口变化）：{}", delays(&lags)),
+                });
             }
         }
         lags
     };
     let (lags, index, (rest_reads, stamped, rest_ages)) = tokio::join!(predict, index_delays(&index_url, push_seconds), rest);
-    println!(
-        "{}",
-        match &index {
-            Err(e) => format!("币安指数：连不上（{e}）——这个区域做不了盘中规则（币安合约不对部分地区开放）"),
-            Ok(xs) if xs.len() < 5 => format!("币安指数：{push_seconds:.0} 秒只收到 {} 次，量不准：换个时段再量", xs.len()),
-            Ok(xs) => format!("币安指数推送延迟（XAUUSDT 每秒一次，币安时间戳 → 这里收到，{} 次）：{}", xs.len(), delays(xs)),
-        }
-    );
+    say.line(match &index {
+        Err(e) => format!("币安指数：连不上（{e}）——这个区域做不了盘中规则（币安合约不对部分地区开放）"),
+        Ok(xs) if xs.len() < 5 => format!("币安指数：{push_seconds:.0} 秒只收到 {} 次，量不准：换个时段再量", xs.len()),
+        Ok(xs) => format!("币安指数推送延迟（XAUUSDT 每秒一次，币安时间戳 → 这里收到，{} 次）：{}", xs.len(), delays(xs)),
+    });
     // the same book seen both ways (neither side's first book: that is the book as it stood, not a change)
     let (mut rest_ahead, mut push_ahead) = (vec![], vec![]);
     for (sig, (at_rest, first_rest)) in rest_first.borrow().iter() {
@@ -479,7 +495,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
         }
     }
     if rest_reads > 0 {
-        println!(
+        say.line(format!(
             "REST 读盘口（每 {poll_s:.2} 秒一次，{rest_reads} 次）：{}",
             if stamped == 0 {
                 "答复里没有盘口时间戳".to_string()
@@ -492,7 +508,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
                     if lags.is_empty() { "没量到".to_string() } else { fastest(&lags) }
                 )
             }
-        );
+        ));
         let (n_rest, n_push) = (rest_ahead.len(), push_ahead.len());
         if n_rest + n_push > 0 {
             let lead = |n: usize, xs: &mut Vec<f64>| {
@@ -502,29 +518,26 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
                     format!("{n} 次（中位早 {:.0} ms）", util::median(xs).unwrap_or(0.0))
                 }
             };
-            println!(
+            say.line(format!(
                 "同一份盘口两边都看到 {} 次：REST 先到 {}，推送先到 {}",
                 n_rest + n_push,
                 lead(n_rest, &mut rest_ahead),
                 lead(n_push, &mut push_ahead)
-            );
+            ));
         }
-        println!("{}", rest_verdict(poll_s, &rest_ages, &lags, n_rest, n_push));
+        say.line(rest_verdict(poll_s, &rest_ages, &lags, n_rest, n_push));
     }
     let limits = pool.net_of(&host).limits;
-    println!(
-        "{}",
-        if limits.is_empty() {
-            "接口限额：Predict 的答复里没有写，按 Predict 给这把 Key 的额度设 PREDICT_RATE_PER_MIN（留一成余量）".to_string()
-        } else {
-            format!("接口限额（Predict 答复里写的）：{limits}——按它设 PREDICT_RATE_PER_MIN（留一成余量）")
-        }
-    );
-    println!(
+    say.line(if limits.is_empty() {
+        "接口限额：Predict 的答复里没有写，按 Predict 给这把 Key 的额度设 PREDICT_RATE_PER_MIN（留一成余量）".to_string()
+    } else {
+        format!("接口限额（Predict 答复里写的）：{limits}——按它设 PREDICT_RATE_PER_MIN（留一成余量）")
+    });
+    say.line(
         "怎么看：抢单时卖单从出现到我们看到，就是“推送延迟”这一段（东京实测中位 66～85 ms）——比区域主要看它，越小越近。\
          盘中规则另看“币安指数推送延迟”：换区域时它也会变，两项一起比。\
          “读盘口”代表不了下单：东京读一次约 12 ms，下单往返约 49 ms（下单在 Predict 那边走得更远）。下单往返只能用私钥量：\
-         在候选区域临时部署一台只记录模式的机器跑 rt.sh test（README“为什么是东京、怎么确认”）。各区域请在同一时段量。"
+         在候选区域临时部署一台只记录模式的机器跑 rt.sh test（README“为什么是东京、怎么确认”）。各区域请在同一时段量。",
     );
     Probe { reads, lags, index: index.unwrap_or_default(), rest_ages, rest_ahead, push_ahead }
 }

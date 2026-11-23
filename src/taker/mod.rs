@@ -295,6 +295,8 @@ pub struct Taker {
     pub lookup_s: f64,
     /// an order test under way (one at a time: a second asked meanwhile is told so, not run)
     pub testing: bool,
+    /// a /speed measurement under way (one at a time)
+    pub speeding: bool,
     /// the last day of the CME holiday calendar (CME_CLOSED_DAYS / CME_EARLY_DAYS, as set at the start), and the Beijing day
     /// its running out was last told
     pub cal_last: Option<crate::util::Date>,
@@ -460,6 +462,7 @@ impl Taker {
             flush_wait_s: 10.0,
             lookup_s: control::TEST_LOOKUP_S,
             testing: false,
+            speeding: false,
             cal_last: crate::clock::calendar().last_day(),
             cal_told: String::new(),
         };

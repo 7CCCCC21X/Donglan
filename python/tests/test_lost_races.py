@@ -110,5 +110,38 @@ class PushTimingTest(unittest.TestCase):
         self.assertIn("样本太少", rest_verdict(0.06, [], [20.0], 1, 1))
 
 
+class SpeedCommandTest(unittest.TestCase):
+    def test_speed_test_keeps_out_of_the_races_and_runs_one_at_a_time(self) -> None:
+        async def go() -> list:
+            out = []
+            # a per-second stretch all day: never measured in it
+            taker, *_ = make_taker(START - 10 * 3_600_000, RULE_FAST_HOURS="00:00-23:59")
+            out.append(await taker.speed_test(""))
+            out.append(taker.speeding)
+            # clear of the races: a rate that is not one is refused before anything is measured
+            taker, *_ = make_taker(START - 10 * 3_600_000)
+            for bad in ("abc", "0", "9000"):
+                out.append(await taker.speed_test(bad))
+            # one at a time: asked while one is under way, told so (nothing measured)
+            taker.speeding = True
+            out.append(await taker.speed_test("4000"))
+            out.append(await taker.command("/help", ""))
+            return out
+        busy, speeding, *bad, again, help_text = run(go())
+        self.assertTrue("正在抢单时段" in busy and "/speed" in busy, busy)
+        self.assertFalse(speeding)
+        for said in bad:
+            self.assertIn("用法：/speed", said)
+        self.assertIn("测速正在进行", again)
+        self.assertIn("/speed 测速", help_text)
+
+    def test_the_menu_has_the_speed_test(self) -> None:
+        from ruletaker.notify import Telegram
+        _, keyboard = Telegram("", (), admin=42, commands=True, command_token="CMD").menu_card()
+        buttons = [b["callback_data"] for row in keyboard["inline_keyboard"] for b in row]
+        self.assertIn("c:/speed", buttons)
+        self.assertTrue("c:/test" in buttons and "m:" in buttons)
+
+
 if __name__ == "__main__":
     unittest.main()

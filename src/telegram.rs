@@ -110,7 +110,17 @@ fn needs_yes(cmd: &str) -> bool {
 }
 
 fn button_command(cmd: &str) -> bool {
-    matches!(cmd, "/status" | "/check" | "/pause" | "/mode off" | "/mode paper") || needs_yes(cmd)
+    matches!(cmd, "/status" | "/check" | "/speed" | "/pause" | "/mode off" | "/mode paper") || needs_yes(cmd)
+}
+
+/// What is said at once for a command that takes a while (its answer comes later); "" for the others.
+fn under_way(command: &str) -> &'static str {
+    match command {
+        "/check" => "🔎 自检中，结果几秒后发来…",
+        "/test" => "🧪 挂单测试中（约 $1 的低价单，挂上就撤），结果几秒后发来…",
+        "/speed" => "📶 测速中（只读，不下单，约 1 分钟），结果稍后发来…",
+        _ => "",
+    }
 }
 
 /// The card asking for the "yes" (valid CONFIRM_S seconds).
@@ -322,7 +332,8 @@ impl Telegram {
                 b(tick("on", "真实吃单"), "c:/mode on")
             ],
             [b("⚙️ 设置".into(), "g:"), b("📈 复盘".into(), "v:30")],
-            [b("🧪 挂单测试".into(), "c:/test"), b("🔄 刷新".into(), "m:")],
+            [b("🧪 挂单测试".into(), "c:/test"), b("📶 测速".into(), "c:/speed")],
+            [b("🔄 刷新".into(), "m:")],
         ]);
         (format!("📋 规则吃单菜单\n{head}"), json!({"inline_keyboard": keyboard}))
     }
@@ -639,10 +650,9 @@ impl Telegram {
         let me = self.clone();
         let args = args.trim().to_string();
         spawn(async move {
-            if command == "/check" {
-                me.reply("🔎 自检中，结果几秒后发来…", (chat, thread));
-            } else if command == "/test" {
-                me.reply("🧪 挂单测试中（约 $1 的低价单，挂上就撤），结果几秒后发来…", (chat, thread));
+            let first = under_way(&command);
+            if !first.is_empty() {
+                me.reply(first, (chat, thread));
             }
             let reply = handler(command, args).await;
             if !reply.is_empty() {
@@ -770,10 +780,9 @@ impl Telegram {
                 // the card's ✅ gone before the command runs (the menu back in its place; refreshed again when it is done)
                 me.edit_card(chat, message_id, me.menu_card()).await;
             }
-            if command == "/check" {
-                me.reply("🔎 自检中，结果几秒后发来…", (chat, thread));
-            } else if command == "/test" {
-                me.reply("🧪 挂单测试中（约 $1 的低价单，挂上就撤），结果几秒后发来…", (chat, thread));
+            let first = under_way(command);
+            if !first.is_empty() {
+                me.reply(first, (chat, thread));
             }
             let handler = me.handler.borrow().clone();
             if let Some(handler) = handler {

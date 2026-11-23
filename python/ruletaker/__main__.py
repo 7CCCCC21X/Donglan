@@ -180,11 +180,13 @@ def delays(xs: list[float]) -> str:
     return f"中位 {statistics.median(v):.0f} ms（最快 {v[0]:.0f}，九成在 {v[int((len(v) - 1) * 0.9)]:.0f} 以内）"
 
 
-async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_SECONDS, base: str = "", ws_url: str = "") -> dict:
+async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_SECONDS, base: str = "", ws_url: str = "",
+                  say: Any = print) -> dict:
     """Read-only: a first request (a new connection: its handshake), ``rounds`` reads of an order book on that connection, the
     push connection's handshake, its ping there and back, and for ``push_seconds`` the delay of every change Predict pushes of
     the BTC quarter-hour books (its own timestamp to here) — what a race is decided on before an order leaves. Compare the push
-    delay between regions: the smaller, the nearer to Predict's books."""
+    delay between regions: the smaller, the nearer to Predict's books. ``say``: where each line of the report goes (printed;
+    Telegram's /speed keeps them)."""
     from . import http
     from .predict import API_BASES, PREDICT_REST, READ_POOL, predict_markets
     from .stream import PREDICT_WS_URL, ws_connect
@@ -194,8 +196,8 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     spread = lambda xs: f"中位 {statistics.median(xs):.1f} ms（最快 {min(xs):.1f}，最慢 {max(xs):.1f}）" if xs else "没量到"
     zone = config.region or await asyncio.to_thread(gce_zone)
     found: dict = {"region": zone, "reads": [], "pings": [], "first": None, "ws_open": None, "ws_book": None, "lags": [], "index": []}
-    print(f"Predict 网络延迟探测（只读，不下单）｜区域 {zone or '未知'}｜版本 {VERSION}" + ("" if config.api_key else "｜没有设置 API Key：可能被拒绝"))
-    print("（约 1 分钟，其间占这把 Key 每分钟额度的四分之一左右：别在抢单时段跑）")
+    say(f"Predict 网络延迟探测（只读，不下单）｜区域 {zone or '未知'}｜版本 {VERSION}" + ("" if config.api_key else "｜没有设置 API Key：可能被拒绝"))
+    say("（约 1 分钟，其间占这把 Key 每分钟额度的四分之一左右：别在抢单时段跑）")
     loop = asyncio.get_running_loop()
     now = int(time.time() * 1000)
     slug, market_id = f"btc-updown-15m-{(now - now % 900_000) // 1000}", ""
@@ -205,9 +207,9 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
         found["first"] = (time.perf_counter() - began) * 1000
         markets = predict_markets(answer)
         market_id = markets[0]["id"] if markets else ""
-        print(f"第一次请求（含新建连接）{found['first']:.0f} ms｜市场 {slug} → {market_id or '没找到'}")
+        say(f"第一次请求（含新建连接）{found['first']:.0f} ms｜市场 {slug} → {market_id or '没找到'}")
     except Exception as error:
-        print(f"读市场失败：{clean_error(error) or type(error).__name__}")
+        say(f"读市场失败：{clean_error(error) or type(error).__name__}")
     watched = [market_id] if market_id else []
     try:  # (the next quarter hour's market too: twice the books to time)
         nxt = f"btc-updown-15m-{(now - now % 900_000) // 1000 + 900}"
@@ -230,7 +232,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
         await asyncio.sleep(0.4)
     net = http.HTTP_NET.get(host) or {}
     connect = list(net.get("connect") or ())
-    print((f"读盘口 {len(found['reads'])} 次（同一条连接）：{spread(found['reads'])}" if found["reads"] or not refused else
+    say((f"读盘口 {len(found['reads'])} 次（同一条连接）：{spread(found['reads'])}" if found["reads"] or not refused else
            f"读盘口被拒绝（{why}），{len(refused)} 次被拒的应答来回 {spread(refused)}——也是一次往返，可以拿来比")
           + (f"｜新建连接（TCP+TLS）{spread(connect)}" if connect else "") + (f"｜入口 {net['edge']}" if net.get("edge") else ""))
     # Predict's push connection, and at the same time the Binance index the in-play rules buy on, and the first watched book
@@ -288,7 +290,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
                 began = time.perf_counter()
                 for i, mid in enumerate(watched, 1):
                     await ws.send(json.dumps({"method": "subscribe", "requestId": i, "params": [f"predictOrderbook/{mid}"]}))
-                print(f"看 {len(watched)} 个 BTC 15 分钟盘口 {push_seconds:.0f} 秒，量推送延迟…")
+                say(f"看 {len(watched)} 个 BTC 15 分钟盘口 {push_seconds:.0f} 秒，量推送延迟…")
                 watching.set()
                 seen: set = set()
                 while (left := began + push_seconds - time.perf_counter()) > 0:
@@ -318,21 +320,21 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
         finally:
             watched_out.set()
             await ws.close()
-        print(f"推送连接：握手 {found['ws_open']:.0f} ms｜ping 来回 {spread(found['pings'])}"
+        say(f"推送连接：握手 {found['ws_open']:.0f} ms｜ping 来回 {spread(found['pings'])}"
               + (f"｜订阅到第一份盘口 {found['ws_book']:.0f} ms" if found["ws_book"] is not None else ""))
         lags = found["lags"]
-        print("推送延迟：没量到（盘口这段时间没变，或推送没连上）：换个时段再量" if not lags else
+        say("推送延迟：没量到（盘口这段时间没变，或推送没连上）：换个时段再量" if not lags else
               f"推送延迟：盘口只变了 {len(lags)} 次，量不准（{delays(lags)}）：换个时段再量" if len(lags) < 5 else
               f"推送延迟（Predict 盘口时间戳 → 这里收到，{len(lags)} 次盘口变化）：{delays(lags)}")
     except Exception as error:
-        print(f"推送连接失败：{clean_error(error) or type(error).__name__}")
+        say(f"推送连接失败：{clean_error(error) or type(error).__name__}")
     watched_out.set()
     try:
         found["index"] = xs = await index
-        print(f"币安指数：{push_seconds:.0f} 秒只收到 {len(xs)} 次，量不准：换个时段再量" if len(xs) < 5 else
+        say(f"币安指数：{push_seconds:.0f} 秒只收到 {len(xs)} 次，量不准：换个时段再量" if len(xs) < 5 else
               f"币安指数推送延迟（XAUUSDT 每秒一次，币安时间戳 → 这里收到，{len(xs)} 次）：{delays(xs)}")
     except Exception as error:
-        print(f"币安指数：连不上（{clean_error(error) or type(error).__name__}）——这个区域做不了盘中规则（币安合约不对部分地区开放）")
+        say(f"币安指数：连不上（{clean_error(error) or type(error).__name__}）——这个区域做不了盘中规则（币安合约不对部分地区开放）")
     rest_count, stamped, rest_ages = await rest
     # the same book seen both ways (neither side's first book: that is the book as it stood, not a change)
     rest_ahead, push_ahead = [], []
@@ -343,17 +345,17 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     found.update(rest_ages=rest_ages, rest_ahead=rest_ahead, push_ahead=push_ahead)
     lags = found["lags"]
     if rest_count:
-        print(f"REST 读盘口（每 {poll_s:.2f} 秒一次，{rest_count} 次）：" + (
+        say(f"REST 读盘口（每 {poll_s:.2f} 秒一次，{rest_count} 次）：" + (
             "答复里没有盘口时间戳" if not stamped else "盘口没变过" if not rest_ages else
             f"新盘口从 Predict 时间戳到这里 {fastest(rest_ages)}（含读的间隔，看最快的）；推送 {fastest(lags) if lags else '没量到'}"))
         lead = lambda xs: f"{len(xs)} 次" + (f"（中位早 {statistics.median(xs):.0f} ms）" if xs else "")
         if rest_ahead or push_ahead:
-            print(f"同一份盘口两边都看到 {len(rest_ahead) + len(push_ahead)} 次：REST 先到 {lead(rest_ahead)}，推送先到 {lead(push_ahead)}")
-        print(rest_verdict(poll_s, rest_ages, lags, len(rest_ahead), len(push_ahead)))
+            say(f"同一份盘口两边都看到 {len(rest_ahead) + len(push_ahead)} 次：REST 先到 {lead(rest_ahead)}，推送先到 {lead(push_ahead)}")
+        say(rest_verdict(poll_s, rest_ages, lags, len(rest_ahead), len(push_ahead)))
     limits = (http.HTTP_NET.get(host) or {}).get("limits", "")
-    print(f"接口限额（Predict 答复里写的）：{limits}——按它设 PREDICT_RATE_PER_MIN（留一成余量）" if limits else
+    say(f"接口限额（Predict 答复里写的）：{limits}——按它设 PREDICT_RATE_PER_MIN（留一成余量）" if limits else
           "接口限额：Predict 的答复里没有写，按 Predict 给这把 Key 的额度设 PREDICT_RATE_PER_MIN（留一成余量）")
-    print("怎么看：抢单时卖单从出现到我们看到，就是“推送延迟”这一段（东京实测中位 66～85 ms）——比区域主要看它，越小越近。"
+    say("怎么看：抢单时卖单从出现到我们看到，就是“推送延迟”这一段（东京实测中位 66～85 ms）——比区域主要看它，越小越近。"
           "盘中规则另看“币安指数推送延迟”：换区域时它也会变，两项一起比。"
           "“读盘口”代表不了下单：东京读一次约 12 ms，下单往返约 49 ms（下单在 Predict 那边走得更远）。下单往返只能用私钥量："
           "在候选区域临时部署一台只记录模式的机器跑 rt.sh test（README“为什么是东京、怎么确认”）。各区域请在同一时段量。")

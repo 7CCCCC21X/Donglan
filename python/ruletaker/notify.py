@@ -50,7 +50,14 @@ def needs_yes(cmd: str) -> bool:
 
 
 def button_command(cmd: str) -> bool:
-    return cmd in {"/status", "/check", "/pause", "/mode off", "/mode paper"} or needs_yes(cmd)
+    return cmd in {"/status", "/check", "/speed", "/pause", "/mode off", "/mode paper"} or needs_yes(cmd)
+
+
+UNDER_WAY = {  # what is said at once for a command that takes a while (its answer comes later)
+    "/check": "🔎 自检中，结果几秒后发来…",
+    "/test": "🧪 挂单测试中（约 $1 的低价单，挂上就撤），结果几秒后发来…",
+    "/speed": "📶 测速中（只读，不下单，约 1 分钟），结果稍后发来…",
+}
 
 
 def confirm_card(cmd: str, now_s: int) -> tuple[str, dict]:
@@ -170,7 +177,8 @@ class Telegram:
                     [b("⏸ 暂停", "c:/pause"), b("▶️ 恢复", "c:/resume")],
                     [b(tick("off", "关"), "c:/mode off"), b(tick("paper", "只记录"), "c:/mode paper"), b(tick("on", "真实吃单"), "c:/mode on")],
                     [b("⚙️ 设置", "g:"), b("📈 复盘", "v:30")],
-                    [b("🧪 挂单测试", "c:/test"), b("🔄 刷新", "m:")]]
+                    [b("🧪 挂单测试", "c:/test"), b("📶 测速", "c:/speed")],
+                    [b("🔄 刷新", "m:")]]
         return f"📋 规则吃单菜单\n{head}", {"inline_keyboard": keyboard}
 
     def view(self) -> list:
@@ -443,8 +451,8 @@ class Telegram:
         await self.edit_card(chat, message_id, self.menu_card())
 
     async def answer(self, command: str, args: str, chat: tuple) -> None:
-        if command in {"/check", "/test"}:
-            self.reply("🔎 自检中，结果几秒后发来…" if command == "/check" else "🧪 挂单测试中（约 $1 的低价单，挂上就撤），结果几秒后发来…", chat)
+        if command in UNDER_WAY:
+            self.reply(UNDER_WAY[command], chat)
         try:
             reply = await self.handler(command, args)
         except Exception as error:

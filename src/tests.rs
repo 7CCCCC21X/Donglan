@@ -2203,6 +2203,41 @@ fn rest_is_judged_against_the_push_only_from_reads_dense_enough() {
 }
 
 #[test]
+fn speed_test_keeps_out_of_the_races_and_runs_one_at_a_time() {
+    run(async {
+        // a per-second stretch all day: never measured in it
+        let r = rig(start() - 10 * 3_600_000, &[("RULE_FAST_HOURS", "00:00-23:59")]);
+        let said = control::speed_test(&r.me, "").await;
+        assert!(said.contains("正在抢单时段") && said.contains("/speed"), "{said}");
+        assert!(!r.me.borrow().speeding);
+        // clear of the races: a rate that is not one is refused before anything is measured
+        let r = rig(start() - 10 * 3_600_000, &[]);
+        for bad in ["abc", "0", "9000"] {
+            assert!(control::speed_test(&r.me, bad).await.contains("用法：/speed"), "{bad}");
+        }
+        // one at a time: asked while one is under way, told so (nothing measured)
+        r.me.borrow_mut().speeding = true;
+        assert!(control::speed_test(&r.me, "4000").await.contains("测速正在进行"));
+        assert!(control::command(&r.me, "/help", "").await.contains("/speed 测速"));
+    });
+}
+
+#[test]
+fn the_menu_has_the_speed_test() {
+    let fake = FakeTelegram::new(|_| Ok(br#"{"ok":true,"result":true}"#.to_vec()));
+    let tg = Rc::new(crate::telegram::Telegram::new("", &[], 42, true, true, "222:commands", fake));
+    let (_, keyboard) = tg.menu_card();
+    let buttons: Vec<String> = keyboard["inline_keyboard"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|row| row.as_array().unwrap().iter().map(|b| b["callback_data"].as_str().unwrap_or("").to_string()))
+        .collect();
+    assert!(buttons.contains(&"c:/speed".to_string()), "{buttons:?}");
+    assert!(buttons.contains(&"c:/test".to_string()) && buttons.contains(&"m:".to_string()));
+}
+
+#[test]
 fn the_record_keeps_the_shares_as_signed() {
     run(async {
         let r = rig(start() - 3_600_000, &[]);
@@ -2417,7 +2452,8 @@ fn the_probe_times_each_pushed_change_and_answers_the_heartbeat() {
         ];
         let config = Config::from_env(&env_of(&pairs)).unwrap();
         let base = format!("http://127.0.0.1:{api_port}/v1");
-        let p = crate::probe(config, 2, &base, &format!("ws://127.0.0.1:{ws_port}/ws"), 1.0).await;
+        let say = crate::Say::keeping();
+        let p = crate::probe(config, 2, &base, &format!("ws://127.0.0.1:{ws_port}/ws"), 1.0, &say).await;
         assert_eq!(p.reads.len(), 2);
         assert_eq!(p.lags.len(), 12, "{:?}", p.lags); // two markets × six changes; the books as they stood (5 s old) not counted
         assert!(p.lags.iter().all(|l| (35.0..400.0).contains(l)), "{:?}", p.lags);

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import dataclasses
 import datetime as dt
 import gc
 import hashlib
@@ -178,6 +179,11 @@ def paid(rec: dict, resolution: dict, won: int | None) -> float | None:
     if up is None:
         return None
     return up if rec.get("side") == "up" else 1 - up
+
+
+# How close to a race (a per-second stretch, the makers' moment, a window's last minutes) /speed still runs: it takes a quarter of
+# the key's budget for about a minute.
+SPEED_CLEAR_MS = 3 * 60_000
 
 
 def key_budget_line(limits: str, ours: int) -> tuple[bool, str] | None:
@@ -339,6 +345,7 @@ class RuleTaker:
         self.journal_cut = False
         self.journal_syncs = 0       # the journal made durable behind the orders (journal_sync), so many times
         self.testing = False         # an order test under way (one at a time: a second asked meanwhile is told so, not run)
+        self.speeding = False        # a /speed measurement under way (one at a time)
         # the last day of the CME holiday calendar (CME_CLOSED_DAYS / CME_EARLY_DAYS, as set at the start), and the Beijing day
         # its running out was last told
         self.cal_last = CALENDAR.last_day()
@@ -2122,7 +2129,9 @@ class RuleTaker:
             return settings_text(self.settings_view())
         if command == "/test":
             return await self.order_test()
-        return ("命令：/menu 按钮菜单｜/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜"
+        if command == "/speed":
+            return await self.speed_test(args)
+        return ("命令：/menu 按钮菜单｜/status 状态｜/check 自检｜/test 挂单测试｜/speed 测速｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜"
                 "/settings 设置｜/set 设置名 数值｜/review 复盘｜/id")
 
     # -- the self-check and the order test (Telegram /check /test, the control page's buttons, rt.sh check / test) --
@@ -2319,6 +2328,44 @@ class RuleTaker:
     TEST_MAX_PRICE = D("0.02")   # the order test's bid: 2¢ at the most, and a cent under the best bid — never at or above the best ask
     TEST_USD = 1.0               # ...for about a dollar (Predict's least order)
     TEST_SECONDS = 600           # ...signed to expire ten minutes on, whatever happens to the cancel
+
+    async def speed_test(self, args: str = "") -> str:
+        """/speed: the measurement ``python -m ruletaker latency`` makes, run here (read-only, about a minute) and its report sent
+        back — the push delay, the REST reads against the pushes, Binance's index, the key's figures — and the service's own push
+        connections beside it. With a rate (/speed 4000) the REST reads take a quarter of that, this once. Never in a race or
+        within SPEED_CLEAR_MS of one (the key's budget is the race's); one at a time."""
+        busy = self.busy_in(self.now())
+        if busy is not None and busy < SPEED_CLEAR_MS:
+            return ("⏳ 正在抢单时段：不测速（它要占这把 Key 四分之一的额度），过了再发 /speed" if busy <= 0 else
+                    f"⏳ {busy // 60_000 + 1} 分钟后就是抢单时段：不测速（它要占这把 Key 四分之一的额度），过了再发 /speed")
+        config = self.config
+        if args.strip():
+            try:
+                rate = float(args.strip())
+            except ValueError:
+                rate = 0.0
+            if not 1 <= rate <= 6000:
+                return "用法：/speed，或 /speed 4000（4000 = 这次测量用的每分钟请求数，1～6000；设置不动）"
+            config = dataclasses.replace(config, rate_per_min=rate)
+        if self.speeding:
+            return "⏳ 测速正在进行，等它的结果（同一时间只测一次）"
+        self.speeding = True
+        lines: list[str] = []
+        try:
+            import importlib  # (the command line's own measurement: one code for both)
+            await importlib.import_module("ruletaker.__main__").latency(config, say=lines.append)
+        finally:
+            self.speeding = False
+        hedge = self.stream.hedge() if hasattr(self.stream, "hedge") else None
+        if hedge is None:
+            lines.append("服务自己的推送：1 条连接（RULE_WS_CONNECTIONS=3 开 3 条，谁先送到用谁的；开了以后这里写省了多少）")
+        elif hedge[1] is None:
+            lines.append(f"服务自己的推送：{len(hedge[0])} 条连接，还没有可比的盘口")
+        else:
+            firsts, behind, copies = hedge
+            lines.append(f"服务自己的推送：{len(firsts)} 条连接，各自先到 {'/'.join(str(f) for f in firsts)} 次，同一份盘口后到的比先到的晚 中位 "
+                         f"{behind:.1f} ms（{copies} 次；这就是多开连接省下的）")
+        return "📶 测速结果\n" + "\n".join(lines)
 
     async def order_test(self) -> str:
         """The real order path end to end with about a dollar for a few seconds (huice's /live test): a LIMIT buy of Up far under

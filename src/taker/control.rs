@@ -275,8 +275,9 @@ pub async fn command(me: &Me, command: &str, args: &str) -> String {
         }
         "/settings" => settings_text(&me.borrow().settings_view()),
         "/test" => order_test(me).await,
+        "/speed" => speed_test(me, args).await,
         _ => {
-            "命令：/menu 按钮菜单｜/status 状态｜/check 自检｜/test 挂单测试｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜/settings 设置｜/set 设置名 数值｜/review 复盘｜/id"
+            "命令：/menu 按钮菜单｜/status 状态｜/check 自检｜/test 挂单测试｜/speed 测速｜/pause 暂停｜/resume 恢复｜/mode off|paper|on｜/settings 设置｜/set 设置名 数值｜/review 复盘｜/id"
                 .into()
         }
     }
@@ -715,6 +716,69 @@ pub async fn order_test(me: &Me) -> String {
     }
     let _done = TestUnderWay(me.clone());
     run_order_test(me).await
+}
+
+/// How close to a race (a per-second stretch, the makers' moment, a window's last minutes) /speed still runs: it takes a quarter
+/// of the key's budget for about a minute.
+pub const SPEED_CLEAR_MS: i64 = 3 * 60_000;
+
+/// /speed: the measurement ``ruletaker latency`` makes, run here (read-only, about a minute) and its report sent back — the push
+/// delay, the REST reads against the pushes, Binance's index, the key's figures — and the service's own push connections beside
+/// it. With a rate (/speed 4000) the REST reads take a quarter of that, this once. Never in a race or within SPEED_CLEAR_MS of
+/// one (the key's budget is the race's); one at a time.
+pub async fn speed_test(me: &Me, args: &str) -> String {
+    let (mut config, busy) = {
+        let t = me.borrow();
+        (t.config.clone(), t.busy_in(t.now()))
+    };
+    if let Some(ms) = busy.filter(|ms| *ms < SPEED_CLEAR_MS) {
+        return if ms <= 0 {
+            "⏳ 正在抢单时段：不测速（它要占这把 Key 四分之一的额度），过了再发 /speed".into()
+        } else {
+            format!("⏳ {} 分钟后就是抢单时段：不测速（它要占这把 Key 四分之一的额度），过了再发 /speed", ms / 60_000 + 1)
+        };
+    }
+    let rate = args.trim();
+    if !rate.is_empty() {
+        match rate.parse::<f64>() {
+            Ok(r) if (1.0..=6000.0).contains(&r) => config.rate_per_min = r,
+            _ => return "用法：/speed，或 /speed 4000（4000 = 这次测量用的每分钟请求数，1～6000；设置不动）".into(),
+        }
+    }
+    if std::mem::replace(&mut me.borrow_mut().speeding, true) {
+        return "⏳ 测速正在进行，等它的结果（同一时间只测一次）".into();
+    }
+    let _done = SpeedUnderWay(me.clone());
+    let say = crate::Say::keeping();
+    let base = crate::predict::api_base(config.chain_id).to_string();
+    crate::probe(config, 10, &base, crate::stream::PREDICT_WS_URL, crate::PUSH_SECONDS, &say).await;
+    let mut lines = say.lines.take();
+    // the service's own pushes beside it: what its extra connections save
+    let hedge = me.borrow().stream.hedge();
+    lines.push(match hedge {
+        None => "服务自己的推送：1 条连接（RULE_WS_CONNECTIONS=3 开 3 条，谁先送到用谁的；开了以后这里写省了多少）".into(),
+        Some((firsts, None, _)) => format!("服务自己的推送：{} 条连接，还没有可比的盘口", firsts.len()),
+        Some((firsts, Some(behind), copies)) => {
+            let each: Vec<String> = firsts.iter().map(u64::to_string).collect();
+            format!(
+                "服务自己的推送：{} 条连接，各自先到 {} 次，同一份盘口后到的比先到的晚 中位 {behind:.1} ms（{copies} 次；这就是多开连接省下的）",
+                firsts.len(),
+                each.join("/")
+            )
+        }
+    });
+    format!("📶 测速结果\n{}", lines.join("\n"))
+}
+
+/// The speed test's mark, taken off however it ends.
+struct SpeedUnderWay(Me);
+
+impl Drop for SpeedUnderWay {
+    fn drop(&mut self) {
+        if let Ok(mut t) = self.0.try_borrow_mut() {
+            t.speeding = false;
+        }
+    }
 }
 
 /// The order test's mark, taken off however the test ends (its answer, an early return, the task dropped).
