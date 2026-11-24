@@ -70,6 +70,7 @@ RT_IMPL=rust bash deploy/gcp/rt.sh update     # 换回 Rust 版
 2. **API Key 用一把专用的**（`RULE_API_KEY`）。Predict 按 Key 限流（每把有自己的每分钟额度：普通 240 次，高级的更多），两个进程用同一把 Key 会一起撞 429、一起停 20 秒。
    - 最好在 developers.predict.fun 再申请一把新的给这里用。
    - 如果把 Railway 上的 `RULE_API_KEY` 拿过来用，**要把 Railway 上的 `RULE_API_KEY` 删掉**（或者那边设 `RULE_KEY_LEND=off`）：Railway 上规则吃单关掉以后，那把 Key 会被一直借给盘口和预挂（`RULE_KEY_LEND`），这边再用就会撞限流。
+   - **huice 的主 Key（Railway 上的 `PREDICT_API_KEY`）和这边是同一把**时，删 `RULE_API_KEY` 没用：给这边换一把别的程序都不用的 Key。先 `bash deploy/gcp/rt.sh set PREDICT_RATE_PER_MIN 220`（新 Key 是普通额度 240 也不会超），再 `bash deploy/gcp/rt.sh set RULE_API_KEY`（隐藏输入，粘贴新 Key；`RULE_API_KEY` 优先于 `PREDICT_API_KEY`，原来那行不用动），然后 `/check` 看“API Key 额度”那行的上限：是 5000 这种高额度，再把 `PREDICT_RATE_PER_MIN` 调回去（比如 1000）。原来那把留给 huice，别再填进这边的备用 Key。
    - 撞一次限流（429），这边**所有请求停 20 秒以上、期间不下新单**，赶上抢单时刻这一场就丢了。再申请一两把 Key 填进 `RULE_API_KEY_2`、`RULE_API_KEY_3` 当备用：在用的那把一被限流，同一个请求当场换下一把再发，不用停。自检（`/check`、`rt.sh check`）有一行“API Key 额度”：拿 Predict 回答里的额度（这一分钟这把 Key 一共用了多少）和这边自己发的次数比，多出来的就是别的程序在用这把 Key，会 ⚠️ 提示；最近一天被限流过几次也写在那里。
 3. **账户：用同一个 Predict 账户，还是单独开一个？**
    - **同一个账户**（最省事，私钥和充值地址照抄）：

@@ -206,8 +206,10 @@ def key_budget_line(limits: str, ours: int) -> tuple[bool, str] | None:
     others = used - ours
     text = f"API Key 额度：Predict 记这一分钟用了 {used} 次（上限 {limit}），我们这一分钟发了 {ours} 次"
     if others > max(limit // 10, 30):
-        return True, (f"{text}：另外约 {others} 次是别的程序在用同一把 Key（多半是 Railway 上的 huice 借用它：删掉那边的 RULE_API_KEY，"
-                      "或那边设 RULE_KEY_LEND=off）——一撞上限流，这里所有请求停 20 秒以上，赶上抢单时刻就下不了单")
+        return True, (f"{text}：另外约 {others} 次是别的程序在用同一把 Key（多半是 Railway 上的 huice：它的主 Key 就是这把的话，"
+                      "这边换一把别的程序不用的——先 rt.sh set PREDICT_RATE_PER_MIN 220，再 rt.sh set RULE_API_KEY；"
+                      "是它的 RULE_API_KEY 借用这把的话，删掉那边的 RULE_API_KEY，或那边设 RULE_KEY_LEND=off）"
+                      "——一撞上限流，这里所有请求停 20 秒以上，赶上抢单时刻就下不了单")
     return False, text
 
 

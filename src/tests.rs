@@ -2284,7 +2284,9 @@ fn another_program_on_the_same_key_is_seen_in_predict_s_figures() {
     let (warn, line) = control::key_budget_line(shared, 120).unwrap();
     assert!(warn, "{line}");
     assert!(line.contains("用了 3764 次（上限 5000），我们这一分钟发了 120 次"), "{line}");
-    assert!(line.contains("另外约 3644 次是别的程序") && line.contains("RULE_KEY_LEND=off"), "{line}");
+    // (word for word as the Python version says it: tests/test_lost_races.py — both cases huice's: its main key the same one,
+    // or its RULE_API_KEY lent out)
+    assert_eq!(line, "API Key 额度：Predict 记这一分钟用了 3764 次（上限 5000），我们这一分钟发了 120 次：另外约 3644 次是别的程序在用同一把 Key（多半是 Railway 上的 huice：它的主 Key 就是这把的话，这边换一把别的程序不用的——先 rt.sh set PREDICT_RATE_PER_MIN 220，再 rt.sh set RULE_API_KEY；是它的 RULE_API_KEY 借用这把的话，删掉那边的 RULE_API_KEY，或那边设 RULE_KEY_LEND=off）——一撞上限流，这里所有请求停 20 秒以上，赶上抢单时刻就下不了单");
     let (warn, line) = control::key_budget_line("ratelimit-limit: 5000; ratelimit-remaining: 4880", 110).unwrap();
     assert!(!warn && !line.contains("别的程序"), "{line}");
     assert_eq!(control::key_budget_line("", 3), None);
