@@ -25,6 +25,21 @@ pub fn dg(d: Decimal) -> String {
     d.to_string()
 }
 
+/// An order's signed expiry (s) for a window's line — its start before it, its end in its course: EXPIRY_BEFORE_S before the
+/// line; once that is too soon for Predict (under PREDICT_EXPIRY_MIN_S + EXPIRY_SLACK_S from now: the last two minutes),
+/// late enough for the last order that may still go out (`stop_ms` before the line) — one value for all of them, so an order
+/// signed beforehand is still the one the look signs. It then outlasts the line; what does not fill at once is withdrawn at
+/// the follow, FILL_READ_MS after the answer, as always.
+pub fn expiry_for(line_ms: i64, stop_ms: i64, now_ms: i64) -> i64 {
+    let line = line_ms.div_euclid(1000);
+    let early = line - EXPIRY_BEFORE_S;
+    if early * 1000 - now_ms >= (PREDICT_EXPIRY_MIN_S + EXPIRY_SLACK_S) * 1000 {
+        early
+    } else {
+        line - stop_ms.div_euclid(1000) + PREDICT_EXPIRY_MIN_S + EXPIRY_SLACK_S
+    }
+}
+
 impl Taker {
     pub fn new_record(&self, slug: &str, w: &Win, rule: &Rule, index_set: i64, mode: Option<&str>) -> Obj {
         let card = rule.spec();
@@ -195,7 +210,7 @@ impl Taker {
         if !assumed.is_empty() {
             return None;
         }
-        let expires = (if course { w.end() } else { w.start }).div_euclid(1000) - EXPIRY_BEFORE_S;
+        let expires = if course { expiry_for(w.end(), LIVE_STOP_MS, self.now()) } else { expiry_for(w.start, STOP_MS, self.now()) };
         let amounts = limit_amounts(true, to_wei(dec_f64(limit)), to_wei(dec_f64(take))).ok()?;
         let identity = format!(
             "rule-v1|{}|{}|{}|{}|{}|{count}",

@@ -117,6 +117,9 @@ class FakeApi:
             error, self.create_error = self.create_error, None
             raise error
         order = body["data"]["order"]
+        if self.clock is not None and int(order["expiration"]) * 1000 < self.clock.ms + 120_000:
+            # (as Predict answers an order signed to expire within two minutes of its arrival)
+            raise RemoteError("HTTP 400: expiry is too soon (minimum 2 minutes from now)")
         shares = int(order["takerAmount"])
         filled = 0 if self.stp_cancel else min(int(self.fill_on_create * 10 ** 18), shares)
         oid = f"id{len(self.created)}"

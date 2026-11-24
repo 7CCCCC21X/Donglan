@@ -4,7 +4,8 @@ One loop works out the rules' windows of the next day, finds each one's market a
 status and book before the start, buys what the rule allows, follows its orders to Predict's final word and settles each
 window on Predict's result. What is kept from huice as it was: the windows and the prices, the sizes and the caps, the order
 itself (a LIMIT at the rule's price, for all the window may still buy when enough is on offer; its rest withdrawn
-FILL_READ_MS after its answer; signed to expire EXPIRY_BEFORE_S before the start), the hash on disk before the request
+FILL_READ_MS after its answer; signed to expire EXPIRY_BEFORE_S before the start — in the last two minutes, when Predict
+would refuse that, two minutes past it: expiry_for), the hash on disk before the request
 leaves, an answer gone missing (or a 409) looked for by the hash and never sent again, the late fills, the fee taken in
 shares, the race's clock (Predict's stamps on the books), the per-second hours, the makers' moment, the wait for matching to
 open, the in-play rules.
@@ -72,8 +73,10 @@ COURSE_QUIET_MS = 12_000      # ...and around the beginning of a window's course
 RUSH_QUIET_MS = 3_000
 INDEX_FRESH_MS = 1_500        # an index older than this as it comes brings no look of its own
 STOP_MS = 15_000              # nothing placed this close to the start: the rule is about the window before it begins
-EXPIRY_BEFORE_S = 5           # an order's signed expiry: this long before the start, always
-SEND_MIN_LEFT_MS = 5_000      # ...and none is sent with less than this left to it
+EXPIRY_BEFORE_S = 5           # an order's signed expiry: this long before the start (in the last two minutes: expiry_for)
+PREDICT_EXPIRY_MIN_S = 120    # Predict takes no order signed to expire sooner than this after it arrives ("expiry is too soon")
+EXPIRY_SLACK_S = 10           # ...this much more for the clocks and the way there
+SEND_MIN_LEFT_MS = (PREDICT_EXPIRY_MIN_S + 2) * 1000  # none sent with less than this left to its expiry: Predict would refuse it
 FILL_READ_MS = 1_500          # an order is read this long after its answer; what has not filled then is withdrawn
 LATE_FILL_MS = 60_000         # an order off the book is final only by a read this long after it left
 REST_MIN_S = 0.1
@@ -271,6 +274,19 @@ def review_text(data: dict, days: int) -> str:
                          f"买{'涨' if r.get('side') == 'up' else '跌'} {fmt(r.get('shares') or 0)} 份 均价 {float(r.get('avg') or 0) * 100:.1f}¢ → {result}{pnl}")
     lines.append("其他天数：/review 7、/review all；图表和 CSV 在网页控制台")
     return "\n".join(lines)
+
+
+def expiry_for(line_ms: int, stop_ms: int, now_ms: int) -> int:
+    """An order's signed expiry (s) for a window's line — its start before it, its end in its course: EXPIRY_BEFORE_S before
+    the line; once that is too soon for Predict (under PREDICT_EXPIRY_MIN_S + EXPIRY_SLACK_S from now: the last two minutes),
+    late enough for the last order that may still go out (``stop_ms`` before the line) — one value for all of them, so an
+    order signed beforehand is still the one the look signs. It then outlasts the line; what does not fill at once is
+    withdrawn at the follow, FILL_READ_MS after the answer, as always."""
+    line = line_ms // 1000
+    early = line - EXPIRY_BEFORE_S
+    if early * 1000 - now_ms >= (PREDICT_EXPIRY_MIN_S + EXPIRY_SLACK_S) * 1000:
+        return early
+    return line - stop_ms // 1000 + PREDICT_EXPIRY_MIN_S + EXPIRY_SLACK_S
 
 
 class RuleTaker:
@@ -576,13 +592,13 @@ class RuleTaker:
         if order is None:
             return "订单记录不见了"
         now = self.now()
-        if int(order.get("expires") or 0) * 1000 - now < SEND_MIN_LEFT_MS:
-            return "距订单到期不足 5 秒（开场前 5 秒到期；盘中的单在这一场结束前 5 秒到期），不再发送"
         if order.get("live"):
             if now > int(rec.get("end_ms") or 0) - LIVE_STOP_MS:
                 return "离这一场结束不足 15 秒，盘中的单不再发送"
         elif now > int(rec.get("start_ms") or 0) - STOP_MS:
             return "离开场不足 15 秒，这张单不再发送（它在路上等了太久）"
+        if int(order.get("expires") or 0) * 1000 - now < SEND_MIN_LEFT_MS:
+            return "距订单签的到期时间不足 2 分钟（Predict 不收这样的单）：这张不发了，下一轮重新签"
         if why := self.block(float(order.get("shares") or 0) * float(order.get("limit") or 0), excluding=order):
             return why
         if order.get("live") and (rule := RULE_OF.get(rec.get("rule"))) is not None:
@@ -1557,7 +1573,7 @@ class RuleTaker:
         outcome, assumed = outcome_for_side(rule.side, info.outcomes)
         if outcome is None or assumed:
             return None
-        expires = (self.end_of(w) if course else w["start"]) // 1000 - EXPIRY_BEFORE_S
+        expires = expiry_for(self.end_of(w), LIVE_STOP_MS, self.now()) if course else expiry_for(w["start"], STOP_MS, self.now())
         amounts = limit_amounts(True, to_wei(limit), to_wei(take))
         count = len((rec or {}).get("orders") or []) if (rec or {}).get("mode") == "on" else 0
         identity = f"rule-v1|{self.config.chain_id}|{self.wallet.maker.lower()}|{info.market_id}|{outcome['token']}|{w['start']}|{count}"

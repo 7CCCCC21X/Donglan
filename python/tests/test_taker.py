@@ -386,6 +386,57 @@ class InPlayTest(unittest.TestCase):
             self.assertTrue(taker.record(SLUG, "on")["orders"][0]["live"])
         run(go())
 
+    def test_an_order_in_the_last_two_minutes_is_signed_to_expire_where_predict_takes_it(self) -> None:
+        from ruletaker.index import IndexFeed
+        line = START // 1000
+        self.assertEqual(T.expiry_for(START, T.STOP_MS, START - 3_600_000), line - T.EXPIRY_BEFORE_S)
+        self.assertEqual(T.expiry_for(START, T.STOP_MS, START - 136_000), line - T.EXPIRY_BEFORE_S)
+        for now in (START - 134_000, START - 60_000, START - T.STOP_MS):
+            # (one value for the whole stretch, two minutes and ten seconds clear of the last order that may go out)
+            self.assertEqual(T.expiry_for(START, T.STOP_MS, now), line + 115)
+            self.assertGreaterEqual(T.expiry_for(START, T.STOP_MS, now) * 1000 - now, 130_000)
+
+        async def before() -> None:
+            # an offer a minute before the start (as 11-24 18:15's, which Predict refused: "expiry is too soon"): bought — signed
+            # to expire past the start, where Predict takes it; the order signed beforehand is the one sent; what rests withdrawn
+            taker, api, _chain, stream, clock = make_taker(START - 60_000, RULE_FAST_HOURS="00:00-24:00")
+            await found(taker, api)
+            taker.pace(taker.now())
+            taker.presign(taker.now())
+            stream.take(MID, book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0)
+            self.assertEqual(len(api.created), 1, taker.track[SLUG]["word"])
+            self.assertEqual(int(api.created[0]["data"]["order"]["expiration"]), line + 115)
+            await asyncio.gather(*taker.sends)
+            order = taker.record(SLUG, "on")["orders"][0]
+            self.assertEqual((order["state"], order["expires"]), ("open", line + 115))
+            self.assertEqual(taker.presign_hits, 1)
+            clock.ms += T.FILL_READ_MS
+            await taker.follow()
+            clock.ms += 1_000
+            await taker.follow()
+            self.assertTrue(taker.record(SLUG, "on")["orders"][0].get("removed"))
+
+        async def course() -> None:
+            # the course's last two minutes alike: signed to expire past the end
+            taker, api, _chain, stream, clock = make_taker(START - 60_000, RULE_GOLD_SHUT_LIVE_CENTS="80")
+            taker.index = feed = IndexFeed(["XAUUSDT"])
+            feed.on_change = taker.on_index
+            await found(taker, api)
+            clock.ms = START + 14 * 60_000  # a minute before the end
+            taker.track[SLUG]["look_ms"] = 0
+            feed.candles[("XAUUSDT", START - 60_000)] = D("4000")
+            feed.push_index("XAUUSDT", D("4000.4"), clock.ms - 50, clock.ms)
+            stream.take(MID, book(asks=[("0.70", "100")]))
+            await asyncio.sleep(0)
+            self.assertEqual(len(api.created), 1, taker.track[SLUG]["word"])
+            self.assertEqual(int(api.created[0]["data"]["order"]["expiration"]), (START + 15 * 60_000) // 1000 + 115)
+            await asyncio.gather(*taker.sends)
+            self.assertEqual(taker.record(SLUG, "on")["orders"][0]["state"], "open")
+
+        run(before())
+        run(course())
+
     def test_first_minute_no_dearer_than_before(self) -> None:
         from ruletaker.index import IndexFeed
 

@@ -4,7 +4,8 @@
 //! status and book before the start, buys what the rule allows, follows its orders to Predict's final word and settles each
 //! window on Predict's result. What is kept from huice as it was: the windows and the prices, the sizes and the caps, the order
 //! itself (a LIMIT at the rule's price, for all the window may still buy when enough is on offer; its rest withdrawn
-//! FILL_READ_MS after its answer; signed to expire EXPIRY_BEFORE_S before the start), the hash on disk before the request
+//! FILL_READ_MS after its answer; signed to expire EXPIRY_BEFORE_S before the start — in the last two minutes, when Predict
+//! would refuse that, two minutes past it: expiry_for), the hash on disk before the request
 //! leaves, an answer gone missing (or a 409) looked for by the hash and never sent again, the late fills, the fee taken in
 //! shares, the race's clock, the per-second hours, the makers' moment, the wait for matching to open, the in-play rules.
 //!
@@ -65,7 +66,13 @@ pub const RACE_WAIT_S: f64 = 30.0; // the status text and the CSV wait out the r
 pub const INDEX_FRESH_MS: i64 = 1_500;
 pub const STOP_MS: i64 = 15_000;
 pub const EXPIRY_BEFORE_S: i64 = 5;
-pub const SEND_MIN_LEFT_MS: i64 = 5_000;
+/// Predict takes no order signed to expire sooner than this after it arrives ("expiry is too soon (minimum 2 minutes from
+/// now)"); EXPIRY_SLACK_S more for the clocks and the way there.
+pub const PREDICT_EXPIRY_MIN_S: i64 = 120;
+pub const EXPIRY_SLACK_S: i64 = 10;
+/// None is sent with less than this left to its signed expiry: Predict would refuse it (it waited on its way; the next look
+/// signs it afresh).
+pub const SEND_MIN_LEFT_MS: i64 = (PREDICT_EXPIRY_MIN_S + 2) * 1000;
 pub const FILL_READ_MS: i64 = 1_500;
 pub const LATE_FILL_MS: i64 = 60_000;
 pub const REST_MIN_S: f64 = 0.1;
@@ -757,15 +764,15 @@ impl Taker {
         let rec = self.record(slug, Some("on")).unwrap_or(&empty);
         let Some(order) = rec_orders(rec).find(|o| o.sv("hash") == digest) else { return "订单记录不见了".into() };
         let now = self.now();
-        if order.i("expires") * 1000 - now < SEND_MIN_LEFT_MS {
-            return "距订单到期不足 5 秒（开场前 5 秒到期；盘中的单在这一场结束前 5 秒到期），不再发送".into();
-        }
         if order.t("live") {
             if now > rec.i("end_ms") - LIVE_STOP_MS {
                 return "离这一场结束不足 15 秒，盘中的单不再发送".into();
             }
         } else if now > rec.i("start_ms") - STOP_MS {
             return "离开场不足 15 秒，这张单不再发送（它在路上等了太久）".into();
+        }
+        if order.i("expires") * 1000 - now < SEND_MIN_LEFT_MS {
+            return "距订单签的到期时间不足 2 分钟（Predict 不收这样的单）：这张不发了，下一轮重新签".into();
         }
         let why = self.block(order.f("shares") * order.f("limit"), Some(&digest));
         if !why.is_empty() {

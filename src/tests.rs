@@ -141,6 +141,13 @@ impl FakePredict {
                 return Err(error);
             }
             let order = &body["data"]["order"];
+            // (as Predict answers an order signed to expire within two minutes of its arrival)
+            let expiration: i64 = order["expiration"].as_str().unwrap_or("0").parse().unwrap_or(0);
+            if let Some(clock) = self.clock.borrow().as_ref() {
+                if expiration * 1000 < clock.get() + 120_000 {
+                    return Err(RemoteError::new("HTTP 400: expiry is too soon (minimum 2 minutes from now)"));
+                }
+            }
             let shares: u128 = order["takerAmount"].as_str().unwrap_or("0").parse().unwrap_or(0);
             let filled = ((self.fill_on_create.get() * 1e18) as u128).min(shares);
             let oid = format!("id{}", self.created.borrow().len());
@@ -1303,6 +1310,60 @@ fn course_buys_only_with_the_index_ahead() {
         let o = r.order(0);
         assert!(o.is_true("live"));
         assert!(o.t("index_wall"));
+    });
+}
+
+#[test]
+fn an_order_in_the_last_two_minutes_is_signed_to_expire_where_predict_takes_it() {
+    use crate::taker::look::expiry_for;
+    let s = start();
+    let line = s / 1000;
+    assert_eq!(expiry_for(s, taker::STOP_MS, s - 3_600_000), line - taker::EXPIRY_BEFORE_S);
+    assert_eq!(expiry_for(s, taker::STOP_MS, s - 136_000), line - taker::EXPIRY_BEFORE_S);
+    assert_eq!(expiry_for(s, taker::STOP_MS, s - 134_000), line + 115);
+    for now in [s - 134_000, s - 60_000, s - taker::STOP_MS] {
+        // (one value for the whole stretch, two minutes and ten seconds clear of the last order that may go out)
+        assert_eq!(expiry_for(s, taker::STOP_MS, now), line + 115);
+        assert!(expiry_for(s, taker::STOP_MS, now) * 1000 - now >= 130_000, "{now}");
+    }
+    run(async {
+        // an offer a minute before the start (as 11-24 18:15's, which Predict refused: "expiry is too soon"): bought — signed
+        // to expire past the start, where Predict takes it; the order signed beforehand is the one sent; what rests withdrawn
+        let r = rig(start() - 60_000, &[("RULE_FAST_HOURS", "00:00-24:00")]);
+        r.found().await;
+        {
+            let mut t = r.me.borrow_mut();
+            let now = t.now();
+            let _ = t.pace(now);
+            look::presign(&mut t, now);
+        }
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        assert_eq!(r.created().len(), 1, "{}", r.word());
+        assert_eq!(r.created()[0]["data"]["order"]["expiration"], (start() / 1000 + 115).to_string());
+        r.sends().await;
+        let o = r.order(0);
+        assert_eq!((o.state(), o.i("expires")), ("open", start() / 1000 + 115), "{o:?}");
+        assert_eq!(r.me.borrow().presign_hits, 1);
+        r.advance(taker::FILL_READ_MS);
+        orders::follow(&r.me).await;
+        r.advance(1_000);
+        orders::follow(&r.me).await;
+        assert!(r.order(0).t("removed"), "{:?}", r.order(0));
+    });
+    run(async {
+        // the course's last two minutes alike: signed to expire past the end
+        let (r, feed) = live_rig(start() - 60_000);
+        r.found().await;
+        r.clock.set(start() + 14 * 60_000); // a minute before the end
+        r.me.borrow().track.get(&slug_of(start())).unwrap().borrow_mut().look_ms = 0;
+        feed.candles.borrow_mut().insert(("XAUUSDT".into(), start() - 60_000), dec("4000"));
+        let now = r.clock.get();
+        feed.push_index("XAUUSDT", dec("4000.4"), now - 50, now);
+        r.push(MID, book(&[("0.70", "100")], &[]));
+        assert_eq!(r.created().len(), 1, "{}", r.word());
+        assert_eq!(r.created()[0]["data"]["order"]["expiration"], ((start() + 15 * 60_000) / 1000 + 115).to_string());
+        r.sends().await;
+        assert_eq!(r.order(0).state(), "open");
     });
 }
 
