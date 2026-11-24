@@ -287,10 +287,13 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
     ));
     say.line("（约 1 分钟，其间占这把 Key 每分钟额度的四分之一左右：别在抢单时段跑）");
     let pool = http::http();
+    // (this measurement's own requests: set against what Predict counts for the key's minute)
+    let sent = std::cell::Cell::new(0usize);
     let now = now_ms();
     let slug = format!("btc-updown-15m-{}", (now - now % 900_000) / 1000);
     let mut market_id = String::new();
     let began = mono();
+    sent.set(sent.get() + 1);
     match pool.request_json(&format!("{base}/categories/{slug}"), None, 10.0, &headers).await {
         Ok(answer) => {
             let first = (mono() - began) * 1000.0;
@@ -305,6 +308,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
     // (the next quarter hour's market too: twice the books to time)
     let next = format!("btc-updown-15m-{}", (now - now % 900_000) / 1000 + 900);
     let mut watched: Vec<String> = vec![market_id.clone()];
+    sent.set(sent.get() + 1);
     if let Ok(answer) = pool.request_json(&format!("{base}/categories/{next}"), None, 10.0, &headers).await {
         watched.extend(predict::predict_markets(&answer).first().map(|m| util::Py::s(m, "id")));
     }
@@ -313,6 +317,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
     let (mut reads, mut refused, mut why) = (vec![], vec![], String::new());
     for _ in 0..rounds {
         let began = mono();
+        sent.set(sent.get() + 1);
         match pool.request(&format!("{base}{path}"), None, 10.0, &headers).await {
             Ok(_) => reads.push((mono() - began) * 1000.0),
             Err(e) => {
@@ -354,6 +359,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
         let mut last = String::new();
         while !polled.is_empty() && !watched_out.get() {
             let asked = mono();
+            sent.set(sent.get() + 1);
             if let Ok(answer) = pool.request_json(&format!("{base}/markets/{polled}/orderbook"), None, 10.0, &headers).await {
                 let got = mono();
                 reads += 1;
@@ -533,6 +539,16 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
     } else {
         format!("接口限额（Predict 答复里写的）：{limits}——按它设 PREDICT_RATE_PER_MIN（留一成余量）")
     });
+    // (what Predict counted for the key's minute, against what this measurement sent: the rest is another program's)
+    if let Some((shared, line)) = taker::control::key_budget_line(&limits, sent.get()) {
+        say.line(line);
+        if shared {
+            say.line(
+                "→ 这把 Key 正被别的程序大量占用：先别跑 rt.sh latency 4000 / /speed 4000——会把这一分钟的额度顶破，\
+                 两边一起被限流（429）。先停掉那边对这把 Key 的使用，再量",
+            );
+        }
+    }
     say.line(
         "怎么看：抢单时卖单从出现到我们看到，就是“推送延迟”这一段（东京实测中位 66～85 ms）——比区域主要看它，越小越近。\
          盘中规则另看“币安指数推送延迟”：换区域时它也会变，两项一起比。\

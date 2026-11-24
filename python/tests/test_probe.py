@@ -16,7 +16,7 @@ from fakes import make_config
 
 # The stand-in book: the state Predict has now (its number, when it changed); the push of each state goes out 40 ms after it
 # changed, so a REST read in between shows it first.
-STATE = {"k": -1, "stamp": 0}
+STATE = {"k": -1, "stamp": 0, "hits": 0}
 
 
 def book(k: int, stamp: int) -> dict:
@@ -28,6 +28,7 @@ class _Api(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self) -> None:
+        STATE["hits"] += 1
         if "/categories/" in self.path:
             quarter = int(self.path.rsplit("-", 1)[1])
             mid = f"m{quarter % 1800 // 900}"  # (this quarter hour's market, and the next one's)
@@ -38,6 +39,8 @@ class _Api(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-RateLimit-Limit", "600")
+        # (the key's minute as Predict counts it: 500 of 600 gone — far more than the probe's own reads: another program's)
+        self.send_header("X-RateLimit-Remaining", "100")
         self.end_headers()
         self.wfile.write(body)
 
@@ -93,8 +96,9 @@ class ProbeTest(unittest.TestCase):
                 port, binance_port = server.sockets[0].getsockname()[1], binance.sockets[0].getsockname()[1]
                 config = make_config(RULE_TAKER="off", RULE_REGION="test", BINANCE_WS_URL=f"ws://127.0.0.1:{binance_port}",
                                      PREDICT_RATE_PER_MIN="6000")  # (REST read every 0.1 s)
-                return await latency(config, rounds=2, push_seconds=1.0,
+                return await latency(config, rounds=2, push_seconds=1.0, say=said.append,
                                      base=f"http://127.0.0.1:{api.server_address[1]}/v1", ws_url=f"ws://127.0.0.1:{port}")
+        said: list[str] = []
         found = asyncio.run(go())
         self.assertEqual(len(found["reads"]), 2)
         lags = found["lags"]
@@ -105,7 +109,11 @@ class ProbeTest(unittest.TestCase):
         self.assertTrue(found["rest_ahead"] and all(lead <= 60 for lead in found["rest_ahead"]), found)
         self.assertTrue(found["rest_ages"] and all(0 <= a < 200 for a in found["rest_ages"]), found)
         from ruletaker import http as nethttp
-        self.assertEqual(nethttp.HTTP_NET["127.0.0.1"]["limits"], "x-ratelimit-limit: 600")
+        self.assertEqual(nethttp.HTTP_NET["127.0.0.1"]["limits"], "x-ratelimit-limit: 600; x-ratelimit-remaining: 100")
+        # the key shared: said, with this measurement's own count, and the denser measurement held back
+        text, hits = "\n".join(said), STATE["hits"]
+        self.assertIn(f"用了 500 次（上限 600），我们这一分钟发了 {hits} 次：另外约 {500 - hits} 次是别的程序", text)  # (as the Rust version says it)
+        self.assertIn("先别跑 rt.sh latency 4000", text)
         self.assertEqual(echoed, [7, 7])
         self.assertGreaterEqual(len(found["index"]), 5, found["index"])  # (the index watched over the same seconds)
         self.assertTrue(all(0 <= lag < 200 for lag in found["index"]), found["index"])

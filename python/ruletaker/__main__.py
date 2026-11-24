@@ -199,10 +199,12 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     say(f"Predict 网络延迟探测（只读，不下单）｜区域 {zone or '未知'}｜版本 {VERSION}" + ("" if config.api_key else "｜没有设置 API Key：可能被拒绝"))
     say("（约 1 分钟，其间占这把 Key 每分钟额度的四分之一左右：别在抢单时段跑）")
     loop = asyncio.get_running_loop()
+    sent = [0]  # (this measurement's own requests: set against what Predict counts for the key's minute)
     now = int(time.time() * 1000)
     slug, market_id = f"btc-updown-15m-{(now - now % 900_000) // 1000}", ""
     try:
         began = time.perf_counter()
+        sent[0] += 1
         answer = await loop.run_in_executor(READ_POOL, http.request_json, f"{base}/categories/{slug}", None, 10, headers)
         found["first"] = (time.perf_counter() - began) * 1000
         markets = predict_markets(answer)
@@ -213,6 +215,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     watched = [market_id] if market_id else []
     try:  # (the next quarter hour's market too: twice the books to time)
         nxt = f"btc-updown-15m-{(now - now % 900_000) // 1000 + 900}"
+        sent[0] += 1
         more = predict_markets(await loop.run_in_executor(READ_POOL, http.request_json, f"{base}/categories/{nxt}", None, 10, headers))
         watched += [str(more[0]["id"])] if more and more[0].get("id") else []
     except Exception:
@@ -222,6 +225,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     refused: list[float] = []
     for _ in range(rounds):
         began = time.perf_counter()
+        sent[0] += 1
         try:
             await loop.run_in_executor(READ_POOL, http.request, base + path, None, 10, headers)
             found["reads"].append((time.perf_counter() - began) * 1000)
@@ -252,6 +256,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
         last = ""
         while polled and not watched_out.is_set():
             asked = time.perf_counter()
+            sent[0] += 1
             try:
                 answer = await loop.run_in_executor(READ_POOL, http.request_json, f"{base}/markets/{polled}/orderbook", None, 10, headers)
             except Exception:
@@ -355,6 +360,14 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     limits = (http.HTTP_NET.get(host) or {}).get("limits", "")
     say(f"接口限额（Predict 答复里写的）：{limits}——按它设 PREDICT_RATE_PER_MIN（留一成余量）" if limits else
           "接口限额：Predict 的答复里没有写，按 Predict 给这把 Key 的额度设 PREDICT_RATE_PER_MIN（留一成余量）")
+    # (what Predict counted for the key's minute, against what this measurement sent)
+    from .taker import key_budget_line
+    if budget := key_budget_line(limits, sent[0]):
+        shared, line = budget
+        say(line)
+        if shared:
+            say("→ 这把 Key 正被别的程序大量占用：先别跑 rt.sh latency 4000 / /speed 4000——会把这一分钟的额度顶破，"
+                "两边一起被限流（429）。先停掉那边对这把 Key 的使用，再量")
     say("怎么看：抢单时卖单从出现到我们看到，就是“推送延迟”这一段（东京实测中位 66～85 ms）——比区域主要看它，越小越近。"
           "盘中规则另看“币安指数推送延迟”：换区域时它也会变，两项一起比。"
           "“读盘口”代表不了下单：东京读一次约 12 ms，下单往返约 49 ms（下单在 Predict 那边走得更远）。下单往返只能用私钥量："

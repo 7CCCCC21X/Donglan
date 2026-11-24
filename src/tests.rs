@@ -2551,6 +2551,7 @@ fn the_console_refuses_on_the_head_and_takes_no_flood() {
 /// after it changed, so a REST read in between shows it first.
 static PROBE_STATE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 static PROBE_STAMP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static PROBE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn probe_book(k: i64, stamp: i64) -> Value {
     json!({"updateTimestampMs": stamp, "bids": [["0.40", "10"]], "asks": [[format!("0.{}", 50 + k.rem_euclid(40)), "5"]]})
@@ -2559,6 +2560,7 @@ fn probe_book(k: i64, stamp: i64) -> Value {
 /// The probe's stand-in API: a quarter hour's BTC market (and the next one's), and the book as it stands.
 fn probe_api(_method: &str, path: &str, _body: &[u8]) -> Vec<u8> {
     use std::sync::atomic::Ordering::SeqCst;
+    PROBE_HITS.fetch_add(1, SeqCst);
     let data = match path.rsplit_once("btc-updown-15m-") {
         Some((_, quarter)) => {
             let q: i64 = quarter.parse().unwrap_or(0);
@@ -2567,7 +2569,12 @@ fn probe_api(_method: &str, path: &str, _body: &[u8]) -> Vec<u8> {
         None => probe_book(PROBE_STATE.load(SeqCst), PROBE_STAMP.load(SeqCst)),
     };
     let body = json!({"success": true, "data": data}).to_string();
-    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-RateLimit-Limit: 600\r\n\r\n{body}", body.len()).into_bytes()
+    // (the key's minute as Predict counts it: 500 of 600 gone — far more than the probe's own reads: another program's)
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-RateLimit-Limit: 600\r\nX-RateLimit-Remaining: 100\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
 }
 
 #[test]
@@ -2656,7 +2663,12 @@ fn the_probe_times_each_pushed_change_and_answers_the_heartbeat() {
         assert!(!p.rest_ahead.is_empty(), "{p:?}");
         assert!(p.rest_ahead.iter().all(|l| *l <= 60.0), "{p:?}");
         assert!(!p.rest_ages.is_empty() && p.rest_ages.iter().all(|a| (0.0..200.0).contains(a)), "{p:?}");
-        assert_eq!(crate::http::http().net_of("127.0.0.1").limits, "x-ratelimit-limit: 600");
+        assert_eq!(crate::http::http().net_of("127.0.0.1").limits, "x-ratelimit-limit: 600; x-ratelimit-remaining: 100");
+        // the key shared: said, with this measurement's own count, and the denser measurement held back
+        let hits = PROBE_HITS.load(SeqCst);
+        let said = say.lines.borrow().join("\n");
+        assert!(said.contains(&format!("用了 500 次（上限 600），我们这一分钟发了 {hits} 次：另外约 {} 次是别的程序", 500 - hits)), "{said}");
+        assert!(said.contains("先别跑 rt.sh latency 4000"), "{said}");
     });
 }
 
