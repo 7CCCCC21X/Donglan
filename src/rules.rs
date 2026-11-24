@@ -468,6 +468,9 @@ fn opt_i(v: Option<i64>) -> Value {
     jopt_i(v)
 }
 
+/// An order sent on a book Predict stamped within this of the offer's first showing answered that showing.
+pub const FIRST_BOOK_MS: i64 = 1_000;
+
 /// The windows' races since ``since_ms``, the latest start first.
 pub fn races(recs: &Recs, mode: &str, since_ms: i64) -> Vec<Obj> {
     let mut rows: Vec<Obj> = vec![];
@@ -530,6 +533,8 @@ pub fn races(recs: &Recs, mode: &str, since_ms: i64) -> Vec<Obj> {
             x.insert("error".into(), json!(if never_placed(o.state()) { o.s("error") } else { String::new() }));
             let both = |a: &str, b: &str| o.t(a) && o.t(b);
             x.insert("after".into(), opt_i(if o.t("sent_wall") && shown != 0 { Some(o.i("sent_wall") - shown) } else { None }));
+            // (sent on a book from the offer's first showing: only such an order measures how quick we were)
+            x.insert("first".into(), json!(shown != 0 && (0..=FIRST_BOOK_MS).contains(&(o.i("book_ts") - shown))));
             x.insert(
                 "lag".into(),
                 opt_i(if both("book_ts", "seen_wall") { Some(o.i("seen_wall") - o.i("book_ts")) } else { None }),
@@ -583,6 +588,17 @@ pub fn races(recs: &Recs, mode: &str, since_ms: i64) -> Vec<Obj> {
 
 fn sec(ms: i64) -> String {
     format!("{:.2} 秒", ms as f64 / 1000.0)
+}
+
+/// A stretch of time in the unit that reads best: 秒, 分钟, 小时.
+pub fn ago(ms: i64) -> String {
+    if ms < 60_000 {
+        sec(ms)
+    } else if ms < 3_600_000 {
+        format!("{} 分钟", g(round_to(ms as f64 / 60_000.0, 1)))
+    } else {
+        format!("{} 小时", g(round_to(ms as f64 / 3_600_000.0, 1)))
+    }
 }
 
 /// Predict closed this order itself, short of its shares, and never withdrawn by us (an unfilled rest is withdrawn only at a
@@ -657,7 +673,11 @@ pub fn race_text(row: &Obj) -> String {
         let num = |k: &str| o.get(k).and_then(Value::as_i64);
         let mut parts: Vec<String> = vec![];
         if let Some(a) = num("after") {
-            parts.push(format!("出现后 {a} ms 发出"));
+            parts.push(if o.t("first") {
+                format!("出现后 {a} ms 发出")
+            } else {
+                format!("首次出现 {}后才发出（跟的是后来的盘口）", ago(a))
+            });
         }
         if let Some(l) = num("lag") {
             parts.push(format!("推送 {l} ms"));
@@ -729,7 +749,9 @@ pub fn race_summary(rows: &[Obj]) -> String {
     let mut ours: Vec<f64> = rows
         .iter()
         .flat_map(|r| r.arr("orders").iter().filter_map(Value::as_object))
-        .filter(|o| !o.is_false("fresh"))
+        // (only an order sent on a book from the offer's first showing is set against the fastest hand: one that went out on a
+        // later book — the offer back again, matching opened hours on — says nothing of how quick we were)
+        .filter(|o| o.t("first") && !o.is_false("fresh"))
         .filter_map(|o| o.get("after").and_then(Value::as_i64))
         .map(|a| a as f64)
         .collect();

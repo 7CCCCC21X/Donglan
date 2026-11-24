@@ -265,6 +265,9 @@ def watch_stats(recs: dict[str, dict], rule: str, mode: str, since_ms: int) -> d
             "won": len(won), "won_life": mid([max(0, stood(x)) for x in won])}
 
 
+FIRST_BOOK_MS = 1_000  # an order sent on a book Predict stamped within this of the offer's first showing answered that showing
+
+
 def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
     """The windows' races since ``since_ms``, the latest start first: when the offer showed (Predict's stamp, else the look's
     time) and how long before the start, the most on offer, how long until it was first taken from and until none was left,
@@ -298,6 +301,7 @@ def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
                         "seen": o.get("seen"), "fresh": o.get("fresh"), "state": o.get("state"),
                         "error": str(o.get("error") or "") if o.get("state") in NEVER_PLACED else "",
                         "after": int(o["sent_wall"]) - shown if o.get("sent_wall") and shown else None,
+                        "first": bool(shown) and 0 <= int(o.get("book_ts") or 0) - shown <= FIRST_BOOK_MS,
                         "lag": int(o["seen_wall"]) - int(o["book_ts"]) if o.get("book_ts") and o.get("seen_wall") else None,
                         "own": int(o["sent_wall"]) - int(o["seen_wall"]) if o.get("sent_wall") and o.get("seen_wall") else None,
                         "wake": int(o["look_wall"]) - int(o["seen_wall"]) if o.get("look_wall") and o.get("seen_wall") and int(o["look_wall"]) >= int(o["seen_wall"]) else None,
@@ -324,6 +328,15 @@ def closed_by_predict(o: dict) -> str | None:
     return str(o.get("closed_as") or "?")
 
 
+def ago(ms: int) -> str:
+    """A stretch of time in the unit that reads best: 秒, 分钟, 小时."""
+    if ms < 60_000:
+        return f"{ms / 1000:.2f} 秒"
+    if ms < 3_600_000:
+        return f"{round(ms / 60_000, 1):g} 分钟"
+    return f"{round(ms / 3_600_000, 1):g} 小时"
+
+
 def race_text(row: dict) -> str:
     sec = lambda ms: f"{ms / 1000:.2f} 秒"
     text = f"{bj(row['start_ms'])} {row['name']}："
@@ -346,7 +359,8 @@ def race_text(row: dict) -> str:
         if o.get("state") in NEVER_PLACED:
             text += f"｜第 {i} 张 要 {o['shares']:g}：没下成" + (f"（{o['error']}）" if o.get("error") else "")
             continue
-        parts = ([f"出现后 {o['after']} ms 发出"] if o["after"] is not None else []) + ([f"推送 {o['lag']} ms"] if o["lag"] is not None else [])
+        parts = [] if o["after"] is None else [f"出现后 {o['after']} ms 发出" if o.get("first") else f"首次出现 {ago(o['after'])}后才发出（跟的是后来的盘口）"]
+        parts += [f"推送 {o['lag']} ms"] if o["lag"] is not None else []
         if o["own"] is not None:
             split = [f"{name} {o[key]} ms" for name, key in (("到达→开始处理", "wake"), ("处理→签好", "prep"), ("签好→发出", "out")) if o.get(key) is not None]
             if o.get("presigned"):
@@ -373,7 +387,9 @@ def race_summary(rows: list[dict]) -> str:
     mid = statistics.median
     marks = [(r["offer_at"] % 900_000) / 1000 for r in rows if r.get("stamped")]
     cuts = [r["cut_ms"] / 1000 for r in rows if r.get("cut_ms") is not None and r.get("stamped")]
-    ours = [o["after"] for r in rows for o in r["orders"] if o.get("after") is not None and o.get("fresh") is not False]
+    # (only an order sent on a book from the offer's first showing is set against the fastest hand: one that went out on a
+    # later book — the offer back again, matching opened hours on — says nothing of how quick we were)
+    ours = [o["after"] for r in rows for o in r["orders"] if o.get("after") is not None and o.get("first") and o.get("fresh") is not False]
     parts = []
     if marks:
         parts.append(f"卖单出现在整刻钟后 中位 {mid(marks):.2f} 秒（{min(marks):.2f}～{max(marks):.2f}，{len(marks)} 场）")

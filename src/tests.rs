@@ -2134,6 +2134,62 @@ fn an_order_predict_cancelled_itself_is_said_so_one_we_withdrew_is_not() {
 }
 
 #[test]
+fn only_an_order_on_the_offer_s_first_showing_is_timed_against_the_fastest_hand() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        let v0 = crate::util::now_ms();
+        // the offer first shows on a book Predict stamped 5 s ago: the order goes out on that very book
+        let mut first = book(&[("0.55", "100")], &[]);
+        first["version"] = json!(v0);
+        first["updateTimestampMs"] = json!(v0 - 5_000);
+        r.push(MID, first);
+        r.sends().await;
+        r.advance(taker::FILL_READ_MS);
+        orders::follow(&r.me).await;
+        r.advance(1_000);
+        orders::follow(&r.me).await; // (it rested on the book: withdrawn)
+        assert!(r.order(0).t("removed"), "{:?}", r.order(0));
+        r.advance(taker::LATE_FILL_MS + 1_000);
+        orders::follow(&r.me).await; // (no late fill: its shares free again)
+        let mut gone = book(&[], &[]);
+        gone["version"] = json!(v0 + 1);
+        r.push(MID, gone);
+        let mut again = book(&[("0.55", "100")], &[]); // back on a later book (stamped now): a second order
+        again["version"] = json!(v0 + 2);
+        r.push(MID, again);
+        r.sends().await;
+        let t = r.me.borrow();
+        let rows = crate::rules::races(&t.recs, "on", 0);
+        let ords: Vec<&Obj> = rows[0].arr("orders").iter().filter_map(Value::as_object).collect();
+        assert_eq!(ords.len(), 2, "{}", r.word());
+        assert_eq!((ords[0].get("first"), ords[1].get("first")), (Some(&json!(true)), Some(&json!(false))));
+        let (a0, a1) = (ords[0].i("after"), ords[1].i("after"));
+        assert!(a0 >= 5_000 && a1 >= a0, "{a0} {a1}");
+        let text = crate::rules::race_text(&rows[0]);
+        assert!(text.contains(&format!("出现后 {a0} ms 发出")), "{text}");
+        assert!(text.contains(&format!("首次出现 {}后才发出（跟的是后来的盘口）", crate::rules::ago(a1))), "{text}");
+        let second = text.split("｜第 2 张").nth(1).unwrap_or_default();
+        assert!(!second.contains("出现后") && second.contains("首次出现"), "{text}");
+        // (the second order's hours-or-seconds wait kept out of the comparison: only the first is timed)
+        let summary = crate::rules::race_summary(&rows);
+        assert!(summary.contains(&format!("我们的单在出现后 中位 {a0} ms 发出（最快 {a0}）")), "{summary}");
+    });
+}
+
+#[test]
+fn a_stretch_of_time_reads_in_its_own_unit() {
+    use crate::rules::ago;
+    assert_eq!(ago(370), "0.37 秒");
+    assert_eq!(ago(59_994), "59.99 秒");
+    assert_eq!(ago(60_000), "1 分钟");
+    assert_eq!(ago(1_322_675), "22 分钟");
+    assert_eq!(ago(3_600_000), "1 小时");
+    assert_eq!(ago(26_236_610), "7.3 小时");
+    assert_eq!(ago(68_404_200), "19 小时");
+}
+
+#[test]
 fn a_record_from_before_the_status_was_kept_is_read_the_same_way() {
     let order = |extra: &[(&str, Value)]| -> Obj {
         let mut o: Obj = serde_json::from_value(json!({"state": "final", "id": "id1", "shares": 30.0, "filled": 0.0})).unwrap();

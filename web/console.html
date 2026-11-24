@@ -253,8 +253,9 @@ function renderReview(r){
         w.open_lead==null?"—":"中位 "+Math.round(w.open_lead)+" 秒",w.offer_lead==null?"—":"中位 "+Math.round(w.offer_lead)+" 分钟",
         w.lost?w.lost+" 场"+(w.life==null?"":"（存活中位 "+(w.life/1000).toFixed(1)+" 秒）"):"—",w.won?w.won+" 场"+(w.won_life==null?"":"（出现到被吃掉中位 "+(w.won_life/1000).toFixed(1)+" 秒）"):"—"]}),[2,3,4]));
   const sec=v=>v==null?"—":(v/1000).toFixed(2)+" 秒";
+  const ago=v=>v<60000?(v/1000).toFixed(2)+" 秒":v<3600000?+(v/60000).toFixed(1)+" 分钟":+(v/3600000).toFixed(1)+" 小时";
   const ord=o=>o.paper?"只记录 "+num(o.shares)+" 份":["rejected","not_sent","not_found"].includes(o.state)?"要 "+num(o.shares)+"：没下成"+(o.error?"（"+o.error+"）":""):
-    "要 "+num(o.shares)+" 成交 "+num(o.filled)+(o.after==null?"":"，出现后 "+o.after+" ms 发出")+(o.lag==null?"":"，推送 "+o.lag+" ms")+(o.own==null?"":"，到达→发出 "+o.own+" ms")+(o.presigned?"（预先签好）":"")+(o.trip==null?"":"，往返 "+o.trip+" ms")+(o.closed==null?"":"，Predict 当场就撤了这张单"+(o.closed==="?"?"":"（"+o.closed+"）")+"：不是我们撤的，多半是吃到了这个账户自己的挂单（自成交保护撤吃单方）");
+    "要 "+num(o.shares)+" 成交 "+num(o.filled)+(o.after==null?"":o.first?"，出现后 "+o.after+" ms 发出":"，首次出现 "+ago(o.after)+"后才发出（跟的是后来的盘口）")+(o.lag==null?"":"，推送 "+o.lag+" ms")+(o.own==null?"":"，到达→发出 "+o.own+" ms")+(o.presigned?"（预先签好）":"")+(o.trip==null?"":"，往返 "+o.trip+" ms")+(o.closed==null?"":"，Predict 当场就撤了这张单"+(o.closed==="?"?"":"（"+o.closed+"）")+"：不是我们撤的，多半是吃到了这个账户自己的挂单（自成交保护撤吃单方）");
   const rc=r.races||[];
   $("races").replaceChildren(big(rc,12,part=>table(["场次","规则","卖单出现","开场前","最多份数","开始被吃","被吃光","买到","我们的单"],
     part.map(x=>[bj(x.start_ms)+" "+(x.window||"").replace(/^\S+ 15分涨跌 /,""),x.name,x.offer_at?bjs(x.offer_at):"没记到",x.lead_min==null?"—":x.lead_min+" 分钟",x.offer_at?num(x.peak):"—",

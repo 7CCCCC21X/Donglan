@@ -53,6 +53,49 @@ class ClosedByPredictTest(unittest.TestCase):
             self.assertIsNone(rules.closed_by_predict(not_so), not_so)
 
 
+class FirstShowingTest(unittest.TestCase):
+    def test_only_an_order_on_the_offer_s_first_showing_is_timed_against_the_fastest_hand(self) -> None:
+        async def go() -> list[dict]:
+            taker, api, _chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            v0 = int(time.time() * 1000)
+            # the offer first shows on a book Predict stamped 5 s ago: the order goes out on that very book
+            stream.take(MID, {**book(asks=[("0.55", "100")]), "version": v0, "updateTimestampMs": v0 - 5_000})
+            await asyncio.sleep(0)
+            await asyncio.gather(*taker.sends)
+            clock.ms += T.FILL_READ_MS
+            await taker.follow()
+            clock.ms += 1_000
+            await taker.follow()  # (it rested on the book: withdrawn)
+            self.assertTrue(taker.record(SLUG, "on")["orders"][0].get("removed"))
+            clock.ms += T.LATE_FILL_MS + 1_000
+            await taker.follow()  # (no late fill: its shares free again)
+            stream.take(MID, {**book(), "version": v0 + 1})
+            stream.take(MID, {**book(asks=[("0.55", "100")]), "version": v0 + 2})  # back on a later book: a second order
+            await asyncio.sleep(0)
+            await asyncio.gather(*taker.sends)
+            return rules.races(taker.recs, "on", 0)
+
+        rows = run(go())
+        orders = rows[0]["orders"]
+        self.assertEqual(len(orders), 2)
+        self.assertEqual((orders[0]["first"], orders[1]["first"]), (True, False))
+        a0, a1 = orders[0]["after"], orders[1]["after"]
+        self.assertTrue(a0 >= 5_000 and a1 >= a0, (a0, a1))
+        text = rules.race_text(rows[0])
+        self.assertIn(f"出现后 {a0} ms 发出", text)
+        self.assertIn(f"首次出现 {rules.ago(a1)}后才发出（跟的是后来的盘口）", text)  # (word for word as the Rust version says it)
+        second = text.split("｜第 2 张")[1]
+        self.assertTrue("出现后" not in second and "首次出现" in second, text)
+        # (the second order's hours-or-seconds wait kept out of the comparison: only the first is timed)
+        self.assertIn(f"我们的单在出现后 中位 {a0} ms 发出（最快 {a0}）", rules.race_summary(rows))
+
+    def test_a_stretch_of_time_reads_in_its_own_unit(self) -> None:
+        for ms, said in ((370, "0.37 秒"), (59_994, "59.99 秒"), (60_000, "1 分钟"), (1_322_675, "22 分钟"), (3_600_000, "1 小时"),
+                         (26_236_610, "7.3 小时"), (68_404_200, "19 小时")):
+            self.assertEqual(rules.ago(ms), said)
+
+
 class KeyBudgetTest(unittest.TestCase):
     def test_another_program_on_the_same_key_is_seen_in_predict_s_figures(self) -> None:
         self.assertEqual(nethttp.budget_of(SHARED), (5000, 1236))
