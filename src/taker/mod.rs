@@ -186,6 +186,8 @@ pub struct Win {
     pub rushed: bool,
     pub rush_error: String,
     pub rush_task: Option<JoinHandle<()>>,
+    /// the look's status read of a market not yet open, beside it (flow::verify_status): one at a time
+    pub status_task: Option<JoinHandle<()>>,
     pub open_told: bool,
     pub held_back: i64,
     pub strike: Option<Decimal>,

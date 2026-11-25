@@ -526,9 +526,8 @@ pub async fn look(me: &Me, slug: &str, w: &W) -> Res<()> {
                 b = w.borrow_mut();
             }
             let every = if near || t.fast { FAST_S } else { OFFER_STATUS_S };
-            if (now - b.status_ms) as f64 >= every * 1000.0 {
+            if (now - b.status_ms) as f64 >= every * 1000.0 && !crate::sync::running(&b.status_task) {
                 b.status_ms = now;
-                t.reads += 1;
                 read = true;
             }
         }
@@ -536,21 +535,11 @@ pub async fn look(me: &Me, slug: &str, w: &W) -> Res<()> {
     };
     let (levels, limit, read) = pending_read;
     if read {
-        let market = api.market(&mid, false).await?;
-        let now = me.borrow().now();
-        let mut b = w.borrow_mut();
-        let open = market.s("tradingStatus").to_uppercase() == "OPEN";
-        let mut m = market;
-        m.insert("categorySlug".into(), json!(slug));
-        b.market = Some(m);
-        if open && b.open_ms == 0 {
-            b.open_ms = now;
-            b.open_wall = now_ms();
-            let seen = b.watch();
-            if seen.i("open_ms") == 0 {
-                seen.insert("open_ms".into(), json!(now));
-            }
-        }
+        // (beside the look, never waited on here: a push for this window while the read is out is looked at at once — not
+        // after it, however long Predict takes to answer (12 s at the most); the status OPEN nudges the window, and that look
+        // buys)
+        let task = spawn(super::flow::verify_status(me.clone(), slug.to_string(), w.clone()));
+        w.borrow_mut().status_task = Some(task);
     }
     // -- the take --
     let decided = {

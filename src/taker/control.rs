@@ -511,7 +511,7 @@ pub async fn self_check(me: &Me) -> String {
                     delays.into_iter().collect::<Vec<_>>().join("；")
                 ));
             }
-            if api.fresh() {
+            if api.usable() {
                 let body = Rc::new(br#"{"data":{}}"#.to_vec());
                 match api.authed("POST", "/orders", Some(body), crate::predict::API_TIMEOUT, true, None).await {
                     Ok(_) => r.warn("下单接口对空订单没有报错（意外），请用 /test 挂单测试确认"),
@@ -1326,7 +1326,7 @@ impl Taker {
                 "kind": self.wallet.as_ref().map(|w| w.kind()).unwrap_or(""), "maker": self.wallet.as_ref().map(|w| w.maker.clone()).unwrap_or_default(),
                 "usdt": self.usdt.map(|u| jf(from_wei(u))), "spendable": self.usd(None).map(jf),
                 "bnb": self.bnb.map(|b| jf(from_wei(b))), "balance_ms": self.balance_ms, "balance_error": self.balance_error,
-                "signed_in": self.api.fresh(),
+                "signed_in": self.api.usable(),
             },
             "stream": {"connected": self.stream.connected(), "alive": self.stream.alive(), "error": self.stream.error(),
                        "connects": self.stream.connects(), "lag_ms": mid(&mut stream_lags)},

@@ -676,7 +676,7 @@ async fn check(config: Config, probe_order: bool) -> i32 {
             Err(e) => println!("⚠️ 授权 {key} 没读到：{}", clean_error(&e)),
         }
     }
-    if probe_order && api.fresh() {
+    if probe_order && api.usable() {
         // an empty order: Predict refuses it as invalid (400) — unless this region may not trade at all (403). Never placed
         match api.authed("POST", "/orders", Some(Rc::new(br#"{"data":{}}"#.to_vec())), predict::API_TIMEOUT, true, None).await {
             Ok(_) => println!("⚠️ 下单接口对空订单没有报错（意外），请人工核对"),

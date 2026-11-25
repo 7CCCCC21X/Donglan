@@ -418,7 +418,7 @@ async def check(config: Config, probe_order: bool = True) -> int:
             print(f"授权 {key}：{'✅ 已授权' if allowance >= 10 ** 20 else '❌ 没有授权（在 Predict 网站用这个账户交易一次）'}")
         except Exception as error:
             print(f"⚠️ 授权 {key} 没读到：{clean_error(error)}")
-    if probe_order and api.fresh():
+    if probe_order and api.usable():
         # an empty order: Predict refuses it as invalid (400) — unless this region may not trade at all (403). Never placed
         try:
             await api.authed("POST", "/orders", {"data": {}}, priority=True)

@@ -64,6 +64,8 @@ pub struct FakePredict {
     /// the taker's clock, moved on by ``book_ms`` while a REST book read is out
     pub clock: RefCell<Option<Rc<Cell<i64>>>>,
     pub book_ms: Cell<i64>,
+    /// Predict this slow (s) to answer a market's details (its matching status)
+    pub market_delay: Cell<f64>,
     /// GET /orders/{hash}, one answer each in turn: "" as it stands, "empty" a 200 with no order in it, "timeout" lost
     pub order_reads: RefCell<std::collections::VecDeque<&'static str>>,
     /// a cancel answered without naming the ids ("silent": carried out all the same; "ignored": not carried out) or naming
@@ -279,6 +281,9 @@ impl Transport for FakePredict {
                         return Err(RemoteError::new("网络错误 (TimeoutError: timed out)"));
                     }
                 }
+            }
+            if method == "GET" && path.starts_with("/markets/") && !path.ends_with("/orderbook") && self.market_delay.get() > 0.0 {
+                crate::sync::sleep(self.market_delay.get()).await; // (answered as it stands once the wait is over)
             }
             self.answer(method, &path, req.payload.as_deref().map(Vec::as_slice))
         })
@@ -676,6 +681,66 @@ fn matching_not_open_waits_then_buys_the_moment_it_opens() {
         assert_eq!(r.created().len(), 1, "{}", r.word());
         assert!(r.order(0).has("open_wait"));
         r.sends().await;
+    });
+}
+
+#[test]
+fn a_slow_status_read_never_holds_up_the_window_s_next_push() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        {
+            let mut t = r.me.borrow_mut();
+            let now = t.now();
+            t.plan(now);
+            t.planned_ms = now;
+        }
+        r.api.list(MID, &slug_of(start()), "MATCHING_NOT_ENABLED");
+        flow::turn(&r.me).await;
+        r.api.market_delay.set(0.5); // (Predict slow to answer a market's status)
+        r.advance((taker::OFFER_STATUS_S * 1000.0) as i64 + 1_000); // (its status due to be read again)
+        let v0 = crate::util::now_ms();
+        let mut first = book(&[("0.55", "100")], &[]);
+        first["version"] = json!(v0);
+        r.push(MID, first);
+        assert!(r.word().contains("等撮合开启") && r.word().contains("100 份"), "{}", r.word());
+        // a second push while the status read is out: looked at at once, not after the read
+        let mut second = book(&[("0.55", "40")], &[]);
+        second["version"] = json!(v0 + 1);
+        r.push(MID, second);
+        assert!(r.word().contains("40 份"), "{}", r.word());
+        // open by the time Predict answers: the window nudged, the order out
+        r.api.markets.borrow_mut().get_mut(MID).unwrap().insert("tradingStatus".into(), json!("OPEN"));
+        crate::sync::sleep(0.8).await;
+        assert_eq!(r.created().len(), 1, "{}", r.word());
+        r.sends().await;
+    });
+}
+
+#[test]
+fn an_order_never_signs_in_on_its_way_while_the_token_is_good() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        let api = r.me.borrow().api.clone();
+        api.ensure_auth().await.unwrap();
+        let signins = || r.api.calls.borrow().iter().filter(|c| *c == "GET /auth/message").count();
+        let before = signins();
+        // the token with 200 s left: due for renewal (the readiness loop's), still good for an order
+        api.jwt_exp.set(crate::util::now_ms() / 1000 + 200);
+        assert!(!api.fresh() && api.usable());
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        assert_eq!(r.created().len(), 1, "{}", r.word());
+        assert_eq!(signins(), before, "signed in on the order's way");
+        // the readiness loop: renewed ahead, off the order's way
+        flow::prepare(&r.me).await;
+        assert_eq!(signins(), before + 1);
+        assert!(api.fresh());
+        // a token nearly out (20 s left): a request signs in first, as before
+        api.jwt_exp.set(crate::util::now_ms() / 1000 + 20);
+        assert!(!api.usable());
+        api.ensure_auth().await.unwrap();
+        assert_eq!(signins(), before + 2);
     });
 }
 

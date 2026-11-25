@@ -618,7 +618,7 @@ class RuleTaker:
         if self.wallet is None:
             return
         try:
-            await self.api.ensure_auth()
+            await self.api.renew_auth()
             self.ready_error, self.ready_ms = "", self.now()
         except asyncio.CancelledError:
             raise
@@ -1015,7 +1015,7 @@ class RuleTaker:
                     self.watch(w)["open_ms"] = self.watch(w)["open_ms"] or now
             if self.settings.mode != "on" or self.block(0.0):
                 return
-            await self.api.ensure_auth()
+            await self.api.renew_auth()  # (a busy stretch begun with a token good for all of it)
             exchanges = set()
             for w in list(self.track.values()):
                 if w["market"] is not None:
@@ -1428,13 +1428,13 @@ class RuleTaker:
             if not w.get("rushed"):
                 w["rushed"] = True
                 self.rush(slug, w)
-            if now - w["status_ms"] >= (FAST_S if near or self.fast else OFFER_STATUS_S) * 1000:
+            task = w.get("status_task")
+            if now - w["status_ms"] >= (FAST_S if near or self.fast else OFFER_STATUS_S) * 1000 and (task is None or task.done()):
                 w["status_ms"] = now
-                self.reads += 1
-                w["market"] = {**await self.api.market(mid), "categorySlug": slug}
-                if str(w["market"].get("tradingStatus") or "").upper() == "OPEN" and not w["open_ms"]:
-                    w["open_ms"], w["open_wall"] = now, int(time.time() * 1000)
-                    self.watch(w)["open_ms"] = self.watch(w)["open_ms"] or now
+                # (beside the look, never waited on here: a push for this window while the read is out is looked at at once —
+                # not after it, however long Predict takes to answer (12 s at the most); the status OPEN nudges the window, and
+                # that look buys)
+                w["status_task"] = asyncio.ensure_future(self.verify_status(slug, w))
             if not w["open_ms"]:
                 w["word"] = (f"盘口已有 ≤{int(limit * 100)}¢ 的{rule.word} {sum(q for _, q in levels):g} 份，等撮合开启就买"
                              f"（现在 {w['market'].get('tradingStatus') or '?'}" + (f"，每 {self.rush_pace():g} 秒读一次状态" if self.rushing(w) else "") + "）")
@@ -2267,7 +2267,7 @@ class RuleTaker:
                 warn("Predict 对这些市场的吃单有延迟设置（吃单的单要在 Predict 那边等这么久才撮合）：" + "；".join(delays))
             else:
                 ok("吃单延迟：跟踪的市场没有这类设置（speedBump / delay）")
-            if self.api.fresh() if hasattr(self.api, "fresh") else False:
+            if self.api.usable() if hasattr(self.api, "usable") else False:
                 try:
                     await self.api.authed("POST", "/orders", {"data": {}}, priority=True)
                     warn("下单接口对空订单没有报错（意外），请用 /test 挂单测试确认")
@@ -2683,7 +2683,7 @@ class RuleTaker:
                 "account": {"kind": self.wallet.kind if self.wallet else "", "maker": self.wallet.maker if self.wallet else "",
                             "usdt": from_wei(self.usdt) if self.usdt is not None else None, "spendable": self.usd(),
                             "bnb": from_wei(self.bnb) if self.bnb is not None else None, "balance_ms": self.balance_ms,
-                            "balance_error": self.balance_error, "signed_in": bool(self.api.fresh()) if hasattr(self.api, "fresh") else False},
+                            "balance_error": self.balance_error, "signed_in": bool(self.api.usable()) if hasattr(self.api, "usable") else False},
                 "stream": {"connected": self.stream.connected, "alive": self.stream.alive(), "error": self.stream.error,
                            "connects": self.stream.connects, "lag_ms": mid(list(self.stream.lags))},
                 "index": ({"connected": self.index.ws is not None, "error": self.index.error, "pushes": self.index.pushes}
@@ -2830,7 +2830,7 @@ class RuleTaker:
         bal = f"USDT {from_wei(self.usdt):,.2f}" if self.usdt is not None else f"USDT 未读到（{self.balance_error or '尚未读取'}）"
         bnb = f"｜BNB {from_wei(self.bnb):.4f}" if self.bnb is not None else ""
         return (f"账户：{self.wallet.kind} {self.wallet.maker[:6]}…{self.wallet.maker[-4:]}｜{bal}{bnb}"
-                + f"｜{'已登录' if self.api.fresh() else '未登录'}" + (f"｜未就绪：{self.not_ready_why}" if self.settings.mode == "on" and not self.ready else "")
+                + f"｜{'已登录' if self.api.usable() else '未登录'}" + (f"｜未就绪：{self.not_ready_why}" if self.settings.mode == "on" and not self.ready else "")
                 + (f"｜在途和未结算 ${open_cost(self.recs):,.2f}" if open_cost(self.recs) > 0 else ""))
 
     def calendar_note(self, now: int) -> str:

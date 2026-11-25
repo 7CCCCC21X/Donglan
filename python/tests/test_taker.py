@@ -7,6 +7,7 @@ import asyncio
 import datetime as dt
 import json
 import os
+import time
 import unittest
 from decimal import Decimal as D
 
@@ -263,6 +264,29 @@ class OrderTest(unittest.TestCase):
             self.assertEqual(len(api.created), 1)
             order = taker.record(SLUG, "on")["orders"][0]
             self.assertIn("open_wait", order)
+            await asyncio.gather(*taker.sends)
+        run(go())
+
+    def test_a_slow_status_read_never_holds_up_the_window_s_next_push(self) -> None:
+        async def go() -> None:
+            taker, api, _chain, stream, clock = make_taker(START - 3_600_000)
+            taker.plan(taker.now())
+            taker.planned_ms = taker.now()
+            listed(api, status="MATCHING_NOT_ENABLED")
+            await taker.turn()
+            api.market_delay = 0.5  # (Predict slow to answer a market's status)
+            clock.ms += int(T.OFFER_STATUS_S * 1000) + 1_000  # (its status due to be read again)
+            v0 = int(time.time() * 1000)
+            stream.take(MID, {**book(asks=[("0.55", "100")]), "version": v0})
+            await asyncio.sleep(0)
+            word = taker.track[SLUG]["word"]
+            self.assertTrue("等撮合开启" in word and "100 份" in word, word)
+            stream.take(MID, {**book(asks=[("0.55", "40")]), "version": v0 + 1})  # a second push while the read is out: at once
+            await asyncio.sleep(0)
+            self.assertIn("40 份", taker.track[SLUG]["word"])
+            api.markets[MID]["tradingStatus"] = "OPEN"  # open by the time Predict answers: the window nudged, the order out
+            await asyncio.sleep(0.8)
+            self.assertEqual(len(api.created), 1, taker.track[SLUG]["word"])
             await asyncio.gather(*taker.sends)
         run(go())
 

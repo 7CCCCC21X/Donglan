@@ -31,6 +31,8 @@ PREDICT_REST = "https://api.predict.fun/v1"
 API_BASES = {56: PREDICT_REST, 97: "https://api-testnet.predict.fun/v1"}  # the testnet API needs no API key
 RPC_URLS = {56: "https://bsc-dataseed.bnbchain.org/", 97: "https://bsc-testnet-dataseed.bnbchain.org/"}
 API_TIMEOUT = 12
+AUTH_RENEW_S = 300   # the sign-in renewed in the background this long before its token runs out...
+AUTH_USABLE_S = 30   # ...while a request (an order) still uses the token until this long before
 ORDER_TIMEOUT = 20
 RPC_TIMEOUT = 15
 PREDICT_DEPTH = 20  # levels kept a side
@@ -342,7 +344,12 @@ class PredictApi:
             return await self.call(method, path, payload, timeout, priority, check)
 
     def fresh(self) -> bool:
-        return bool(self.jwt) and (not self.jwt_exp or time.time() < self.jwt_exp - 300)
+        """Signed in, the token good for AUTH_RENEW_S more: when not, the readiness loop renews it in the background."""
+        return bool(self.jwt) and (not self.jwt_exp or time.time() < self.jwt_exp - AUTH_RENEW_S)
+
+    def usable(self) -> bool:
+        """Signed in, the token good for AUTH_USABLE_S more: a request (an order) uses it as it is."""
+        return bool(self.jwt) and (not self.jwt_exp or time.time() < self.jwt_exp - AUTH_USABLE_S)
 
     @property
     def auth_lock(self) -> asyncio.Lock:
@@ -352,6 +359,18 @@ class PredictApi:
         return self._auth_lock[1]
 
     async def ensure_auth(self) -> None:
+        """Signed in for a request now: a sign-in (two round trips) only when the token is out, or nearly — never on an order's
+        way while it is good (the readiness loop renews it ahead: renew_auth)."""
+        if self.usable():
+            return
+        async with self.auth_lock:
+            if self.usable():
+                return
+            await self._sign_in()
+
+    async def renew_auth(self) -> None:
+        """Signed in ahead: renewed once the token has less than AUTH_RENEW_S left (the readiness loop and the warm-up before a
+        busy stretch — off an order's way)."""
         if self.fresh():
             return
         async with self.auth_lock:

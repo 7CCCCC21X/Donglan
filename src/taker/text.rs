@@ -277,7 +277,7 @@ impl Taker {
             wallet.kind(),
             &maker[..6.min(maker.len())],
             &maker[maker.len().saturating_sub(4)..],
-            if self.api.fresh() { "已登录" } else { "未登录" },
+            if self.api.usable() { "已登录" } else { "未登录" },
             if self.settings.mode == "on" && !self.ready() {
                 format!("｜未就绪：{}", self.not_ready_why())
             } else {

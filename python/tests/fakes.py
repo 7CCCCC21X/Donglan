@@ -61,7 +61,13 @@ class FakeApi:
     def fresh(self) -> bool:
         return self.jwt_ok
 
+    def usable(self) -> bool:
+        return self.jwt_ok
+
     async def ensure_auth(self) -> None:
+        self.calls.append(("auth",))
+
+    async def renew_auth(self) -> None:
         self.calls.append(("auth",))
 
     async def authed(self, method: str, path: str, payload: Any = None, *args: Any, **kwargs: Any) -> Any:
@@ -82,6 +88,8 @@ class FakeApi:
 
     async def market(self, mid: str, priority: bool = False) -> dict:
         self.calls.append(("market", mid))
+        if getattr(self, "market_delay", 0):
+            await asyncio.sleep(self.market_delay)  # (Predict slow to answer: answered as it stands once the wait is over)
         return dict(self.markets[mid])
 
     async def orderbook(self, mid: str) -> tuple:

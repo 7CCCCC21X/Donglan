@@ -21,6 +21,10 @@ use tokio::sync::{Mutex, Semaphore};
 
 pub const PREDICT_REST: &str = "https://api.predict.fun/v1";
 pub const API_TIMEOUT: f64 = 12.0;
+/// The sign-in renewed in the background this long before its token runs out; a request still uses the token until
+/// AUTH_USABLE_S before (s).
+pub const AUTH_RENEW_S: i64 = 300;
+pub const AUTH_USABLE_S: i64 = 30;
 pub const ORDER_TIMEOUT: f64 = 20.0;
 pub const RPC_TIMEOUT: f64 = 15.0;
 pub const PREDICT_DEPTH: usize = 20;
@@ -576,12 +580,37 @@ impl PredictApi {
         }
     }
 
+    /// Signed in, the token good for AUTH_RENEW_S more: when not, the readiness loop renews it in the background (renew_auth).
     pub fn fresh(&self) -> bool {
-        let exp = self.jwt_exp.get();
-        !self.jwt.borrow().is_empty() && (exp == 0 || (crate::util::now_ms() / 1000) < exp - 300)
+        self.good_for(AUTH_RENEW_S)
     }
 
+    /// Signed in, the token good for AUTH_USABLE_S more: a request (an order) uses it as it is.
+    pub fn usable(&self) -> bool {
+        self.good_for(AUTH_USABLE_S)
+    }
+
+    fn good_for(&self, seconds: i64) -> bool {
+        let exp = self.jwt_exp.get();
+        !self.jwt.borrow().is_empty() && (exp == 0 || (crate::util::now_ms() / 1000) < exp - seconds)
+    }
+
+    /// Signed in for a request now: a sign-in (two round trips) only when the token is out, or nearly — never on an order's
+    /// way while it is good (the readiness loop renews it ahead: renew_auth).
     pub async fn ensure_auth(&self) -> Res<()> {
+        if self.usable() {
+            return Ok(());
+        }
+        let _held = self.auth_lock.lock().await;
+        if self.usable() {
+            return Ok(());
+        }
+        self.sign_in().await.map(|_| ())
+    }
+
+    /// Signed in ahead: renewed once the token has less than AUTH_RENEW_S left (the readiness loop and the warm-up before a
+    /// busy stretch — off an order's way).
+    pub async fn renew_auth(&self) -> Res<()> {
         if self.fresh() {
             return Ok(());
         }

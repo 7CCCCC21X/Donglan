@@ -96,6 +96,33 @@ class FirstShowingTest(unittest.TestCase):
             self.assertEqual(rules.ago(ms), said)
 
 
+class SignInTest(unittest.TestCase):
+    def test_an_order_never_signs_in_on_its_way_while_the_token_is_good(self) -> None:
+        from ruletaker.predict import PredictApi
+
+        async def go() -> list:
+            api = PredictApi("https://api.predict.fun/v1", "k", None, 0)
+            signed: list = []
+
+            async def sign_in() -> str:
+                signed.append(1)
+                api.jwt, api.jwt_exp = "t", int(time.time()) + 3600
+                return api.jwt
+            api._sign_in = sign_in
+            api.jwt, api.jwt_exp = "t", int(time.time()) + 200  # 200 s left: due for renewal, still good for an order
+            out = [api.fresh(), api.usable()]
+            await api.ensure_auth()  # an order's: no sign-in on its way
+            out.append(len(signed))
+            await api.renew_auth()  # the readiness loop's: renewed ahead, off the order's way
+            out += [len(signed), api.fresh()]
+            api.jwt_exp = int(time.time()) + 20  # a token nearly out: a request signs in first, as before
+            out.append(api.usable())
+            await api.ensure_auth()
+            out.append(len(signed))
+            return out
+        self.assertEqual(run(go()), [False, True, 0, 1, True, False, 2])
+
+
 class KeyBudgetTest(unittest.TestCase):
     def test_another_program_on_the_same_key_is_seen_in_predict_s_figures(self) -> None:
         self.assertEqual(nethttp.budget_of(SHARED), (5000, 1236))

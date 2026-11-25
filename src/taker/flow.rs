@@ -406,7 +406,7 @@ pub async fn prepare(me: &Me) {
         (t.api.clone(), t.wallet.clone(), t.chain.clone(), !t.config.api_key.is_empty())
     };
     let Some(wallet) = wallet else { return };
-    match api.ensure_auth().await {
+    match api.renew_auth().await {
         Ok(()) => {
             let mut t = me.borrow_mut();
             t.ready_error.clear();
@@ -948,7 +948,7 @@ async fn warm_inner(me: &Me) -> Res<()> {
         exchanges.dedup();
         (t.api.clone(), t.chain.clone(), exchanges)
     };
-    api.ensure_auth().await?;
+    api.renew_auth().await?; // (a busy stretch begun with a token good for all of it)
     if let Some(chain) = chain {
         for exchange in exchanges {
             let got = chain.allowance(&exchange).await?;
