@@ -24,6 +24,8 @@ pub const MAX_BODY: usize = 8_000_000;
 pub const KEEPALIVE_IDLE: f64 = 25.0;
 pub const KEEPALIVE_POST_IDLE: f64 = 3.0;
 pub const KEEPALIVE_PER_HOST: usize = 24;
+/// A parked connection's handshake given this long at the most (s).
+pub const PREWARM_TIMEOUT_S: f64 = 5.0;
 const SECRET_HEADERS: [&str; 4] = ["authorization", "x-api-key", "cookie", "proxy-authorization"];
 
 pub fn user_agent() -> String {
@@ -532,6 +534,27 @@ impl Http {
         rows.push((conn, mono()));
     }
 
+    /// A connection to ``base``'s host opened now and parked in the pool unused, when none there was used (or opened) within
+    /// ``within`` seconds: an order — whose POST takes only a connection that fresh (KEEPALIVE_POST_IDLE) — then waits for no
+    /// TCP + TLS handshake of its own. No request goes over it: nothing of the key's budget is spent. The pooled ones past
+    /// KEEPALIVE_POST_IDLE are let go (the fresh one serves the reads as well). Ok(false): one that fresh was there already.
+    pub async fn prewarm(&self, base: &str, within: f64) -> Res<bool> {
+        let url = Url::parse(base)?;
+        if self.pool_fresh(&url.host, url.port).is_some_and(|f| f < within) {
+            return Ok(false);
+        }
+        let conn = self.open(&url, Duration::from_secs_f64(PREWARM_TIMEOUT_S)).await.map_err(|e| net_error(&e))?;
+        let key = (url.host.clone(), url.port, url.https);
+        {
+            let now = mono();
+            if let Some(rows) = self.pool.borrow_mut().get_mut(&key) {
+                rows.retain(|(_, last)| now - *last <= KEEPALIVE_POST_IDLE);
+            }
+        }
+        self.put(key, conn);
+        Ok(true)
+    }
+
     /// Seconds since the most recently used pooled connection to host:port was last used; None when there is none.
     pub fn pool_fresh(&self, host: &str, port: u16) -> Option<f64> {
         let pool = self.pool.borrow();
@@ -1022,6 +1045,22 @@ kH4quf9Jdu9x9uX2RLFwvDZb+aYhwhTYdaU3pUXXQzcms0rqJfVKpo5S\
             assert_eq!(h.request_json(&format!("{base}/json"), None, 5.0, &[]).await.unwrap()["ok"], true);
             assert_eq!(*log.borrow(), vec![format!("1 POST /predict"), format!("1 GET /json")]); // one connection
             assert_eq!(h.stats.borrow().new, 1);
+        });
+    }
+
+    #[test]
+    fn an_order_goes_out_on_a_connection_kept_ready_with_no_handshake_of_its_own() {
+        run(async {
+            let (port, log) = serve(answers, 0).await;
+            let h = Http::new();
+            let base = format!("http://127.0.0.1:{port}");
+            assert!(h.prewarm(&base, 2.0).await.unwrap()); // opened and parked: no request over it
+            assert!(!h.prewarm(&base, 2.0).await.unwrap()); // one that fresh there already
+            assert!(log.borrow().is_empty());
+            assert_eq!(h.request(&format!("{base}/echo"), Some(b"{\"x\":1}"), 5.0, &[]).await.unwrap(), b"POST{\"x\":1}");
+            let stats = h.stats.borrow();
+            assert_eq!((stats.new, stats.reused), (1, 1), "{stats:?}"); // the POST took the parked one
+            assert_eq!(*log.borrow(), vec!["1 POST /echo".to_string()]);
         });
     }
 

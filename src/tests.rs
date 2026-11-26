@@ -66,6 +66,8 @@ pub struct FakePredict {
     pub book_ms: Cell<i64>,
     /// Predict this slow (s) to answer a market's details (its matching status)
     pub market_delay: Cell<f64>,
+    /// connections asked to be kept ready (PredictApi::prewarm)
+    pub prewarms: Cell<usize>,
     /// GET /orders/{hash}, one answer each in turn: "" as it stands, "empty" a 200 with no order in it, "timeout" lost
     pub order_reads: RefCell<std::collections::VecDeque<&'static str>>,
     /// a cancel answered without naming the ids ("silent": carried out all the same; "ignored": not carried out) or naming
@@ -233,6 +235,11 @@ impl FakePredict {
 }
 
 impl Transport for FakePredict {
+    fn prewarm<'a>(&'a self, _base: &'a str, _within: f64) -> LocalBoxFuture<'a, Res<bool>> {
+        self.prewarms.set(self.prewarms.get() + 1);
+        Box::pin(async { Ok(true) })
+    }
+
     fn request(&self, req: Req) -> LocalBoxFuture<'_, Res<Vec<u8>>> {
         Box::pin(async move {
             if req.url.contains("bsc") || req.url.contains("rpc") {
@@ -741,6 +748,57 @@ fn an_order_never_signs_in_on_its_way_while_the_token_is_good() {
         assert!(!api.usable());
         api.ensure_auth().await.unwrap();
         assert_eq!(signins(), before + 2);
+    });
+}
+
+#[test]
+fn out_of_the_busy_stretches_a_connection_is_kept_ready_while_a_window_may_buy() {
+    run(async {
+        // an hour before the start (no per-second hours, no makers' moment): matching open, the rule's price set — a window
+        // that may buy at any moment: a just-opened connection parked, no request over it
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        let now = r.me.borrow().now();
+        assert_eq!(r.me.borrow().busy_in(now).map(|ms| ms > 0), Some(true), "not a busy stretch");
+        let reads = r.api.calls.borrow().len();
+        flow::keep_warm(&r.me, now);
+        settle_tasks().await;
+        assert_eq!(r.api.prewarms.get(), 1);
+        assert_eq!(r.api.calls.borrow().len(), reads, "no request for it: nothing of the key's budget");
+        // paused: no order may go out, no connection kept for one
+        r.me.borrow_mut().paused = "测试暂停".into();
+        assert!(!r.me.borrow().block(0.0, None).is_empty());
+        flow::keep_warm(&r.me, now);
+        settle_tasks().await;
+        assert_eq!(r.api.prewarms.get(), 1);
+    });
+    run(async {
+        // matching not open yet: no order can go out — no connection kept for one
+        let r = rig(start() - 3_600_000, &[]);
+        {
+            let mut t = r.me.borrow_mut();
+            let now = t.now();
+            t.plan(now);
+            t.planned_ms = now;
+        }
+        r.api.list(MID, &slug_of(start()), "MATCHING_NOT_ENABLED");
+        flow::turn(&r.me).await;
+        r.api.prewarms.set(0);
+        let now = r.me.borrow().now();
+        flow::keep_warm(&r.me, now);
+        settle_tasks().await;
+        assert_eq!(r.api.prewarms.get(), 0);
+    });
+    run(async {
+        // in a busy stretch (ten minutes before the start): the book read keeps the connection used, as before
+        let r = rig(start() - 600_000, &[]);
+        r.found().await;
+        r.api.prewarms.set(0);
+        let now = r.me.borrow().now();
+        assert_eq!(r.me.borrow().busy_in(now), Some(0));
+        flow::keep_warm(&r.me, now);
+        settle_tasks().await;
+        assert_eq!(r.api.prewarms.get(), 0);
     });
 }
 

@@ -254,6 +254,8 @@ pub struct Taker {
     pub warmed: bool,
     pub warming: Option<JoinHandle<()>>,
     pub verifying: Option<JoinHandle<()>>,
+    /// a connection being opened to be kept ready (flow::keep_warm, out of the busy stretches)
+    pub prewarming: Option<JoinHandle<()>>,
     pub verify_at: f64,
     pub verifies: u64,
     pub verify_diffs: u64,
@@ -431,6 +433,7 @@ impl Taker {
             warmed: false,
             warming: None,
             verifying: None,
+            prewarming: None,
             verify_at: 0.0,
             verifies: 0,
             verify_diffs: 0,

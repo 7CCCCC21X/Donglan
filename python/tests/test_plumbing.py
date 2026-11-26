@@ -169,6 +169,14 @@ class HttpTest(unittest.TestCase):
             nethttp.request("https://api.predict.fun/v1/orders", b"{}")
         self.assertEqual(sum(1 for c in FakeConn.made for r in c.requests if r[0] == "POST"), 1)
 
+    def test_an_order_goes_out_on_a_connection_kept_ready_with_no_handshake_of_its_own(self) -> None:
+        self.assertTrue(nethttp.prewarm("api.predict.fun", 443, 2.0))  # opened and parked: no request over it
+        self.assertFalse(nethttp.prewarm("api.predict.fun", 443, 2.0))  # one that fresh there already
+        self.assertEqual((len(FakeConn.made), FakeConn.made[0].requests), (1, []))
+        self.assertEqual(nethttp.request("https://api.predict.fun/v1/orders", b"{}"), b'{"ok": 1}')
+        self.assertEqual(len(FakeConn.made), 1)  # the POST took the parked one
+        self.assertEqual([r[0] for r in FakeConn.made[0].requests], ["POST"])
+
     def test_get_retried_on_a_closed_connection(self) -> None:
         nethttp.request("https://api.predict.fun/v1/x")
         FakeConn.made[0].mode = "answer-fail"

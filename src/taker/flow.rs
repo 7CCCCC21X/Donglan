@@ -546,7 +546,7 @@ pub async fn run(me: Me) {
     }
     let mut held = me.borrow_mut();
     let t = &mut *held;
-    for task in side.into_iter().chain(t.side_tasks.drain(..)).chain(t.warming.take()).chain(t.verifying.take()) {
+    for task in side.into_iter().chain(t.side_tasks.drain(..)).chain(t.warming.take()).chain(t.verifying.take()).chain(t.prewarming.take()) {
         task.abort();
     }
 }
@@ -1032,7 +1032,10 @@ pub fn verify_tick(me: &Me) {
 }
 
 /// Through every busy stretch a pooled connection to Predict is kept used within WARM_CONN_S (an order reuses only a connection
-/// that fresh; on a cold one it waits for a TCP + TLS handshake): a book of the soonest window read and merged.
+/// that fresh; on a cold one it waits for a TCP + TLS handshake): a book of the soonest window read and merged. Out of them,
+/// while a window may still buy at any moment (its market open for matching, before its start or in its course, its price
+/// set): a just-opened connection kept parked instead — no request, so nothing of the key's budget (11-25 17:22, 53 minutes
+/// before a start, an offer's order waited 21 ms for a handshake).
 pub fn keep_warm(me: &Me, now: i64) {
     let mid = {
         let t = me.borrow();
@@ -1043,7 +1046,12 @@ pub fn keep_warm(me: &Me, now: i64) {
         if fresh.is_some_and(|f| f < WARM_CONN_S) {
             return;
         }
-        if t.busy_in(now) != Some(0) || !t.block(0.0, None).is_empty() {
+        if !t.block(0.0, None).is_empty() {
+            return;
+        }
+        if t.busy_in(now) != Some(0) {
+            drop(t);
+            prewarm(me, now);
             return;
         }
         let soon = t
@@ -1064,6 +1072,34 @@ pub fn keep_warm(me: &Me, now: i64) {
     };
     let task = spawn(verify(me.clone(), mid));
     me.borrow_mut().verifying = Some(task);
+}
+
+/// A just-opened connection to Predict parked for an order (PredictApi::prewarm), while a window may buy at any moment.
+fn prewarm(me: &Me, now: i64) {
+    let api = {
+        let t = me.borrow();
+        if running(&t.prewarming) {
+            return;
+        }
+        let buyable = t.track.iter().any(|(slug, w)| {
+            let b = w.borrow();
+            let phase = t.phase(&b, now);
+            let rule = b.rule();
+            b.market.is_some()
+                && b.open_ms != 0
+                && !phase.is_empty()
+                && (phase == "live" || t.settings.price(rule.key) > 0)
+                && t.finished(slug, rule, phase == "live").is_empty()
+        });
+        if !buyable {
+            return;
+        }
+        t.api.clone()
+    };
+    let task = spawn(async move {
+        let _ = api.prewarm(WARM_CONN_S).await; // (no connection to be had now: the order makes its own, as before)
+    });
+    me.borrow_mut().prewarming = Some(task);
 }
 
 pub async fn verify_status(me: Me, slug: String, w: W) {

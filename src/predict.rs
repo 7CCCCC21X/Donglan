@@ -61,6 +61,10 @@ pub struct Req {
 
 pub trait Transport {
     fn request(&self, req: Req) -> LocalBoxFuture<'_, Res<Vec<u8>>>;
+    /// A fresh connection to ``base`` kept ready (http::prewarm): Ok(true) when one was opened now. The stand-ins keep none.
+    fn prewarm<'a>(&'a self, _base: &'a str, _within: f64) -> LocalBoxFuture<'a, Res<bool>> {
+        Box::pin(async { Ok(false) })
+    }
 }
 
 pub struct Live;
@@ -80,6 +84,10 @@ impl Transport for Live {
                 )
                 .await
         })
+    }
+
+    fn prewarm<'a>(&'a self, base: &'a str, within: f64) -> LocalBoxFuture<'a, Res<bool>> {
+        Box::pin(async move { crate::http::http().prewarm(base, within).await })
     }
 }
 
@@ -606,6 +614,12 @@ impl PredictApi {
             return Ok(());
         }
         self.sign_in().await.map(|_| ())
+    }
+
+    /// A just-opened connection to Predict parked for the next order, when none was used within ``within`` seconds (no request
+    /// over it: nothing of the key's budget).
+    pub async fn prewarm(&self, within: f64) -> Res<bool> {
+        self.transport.prewarm(&self.base, within).await
     }
 
     /// Signed in ahead: renewed once the token has less than AUTH_RENEW_S left (the readiness loop and the warm-up before a

@@ -343,6 +343,7 @@ class RuleTaker:
         self.warmed = False
         self.warming: asyncio.Task | None = None
         self.verifying: asyncio.Task | None = None
+        self.prewarming: asyncio.Task | None = None  # a connection being opened to be kept ready (keep_warm)
         self.verify_at = 0.0
         self.verifies = self.verify_diffs = self.fast_looks = self.status_reads = 0
         self.first_ticks = self.index_looks = self.index_late = 0
@@ -713,7 +714,7 @@ class RuleTaker:
             self.stream.stop()
             if self.index is not None:
                 self.index.stop()
-            extra = [t for t in (self.warming, self.verifying) if t is not None]
+            extra = [t for t in (self.warming, self.verifying, self.prewarming) if t is not None]
             for task in [*side, *self.side_tasks, *extra]:
                 task.cancel()
             await asyncio.gather(*side, *self.side_tasks, *extra, return_exceptions=True)
@@ -1087,7 +1088,10 @@ class RuleTaker:
         fresh = nethttp.pool_fresh(host) if host else 0.0
         if fresh is not None and fresh < WARM_CONN_S:
             return
-        if self.busy_in(now) != 0 or self.block(0.0):
+        if self.block(0.0):
+            return
+        if self.busy_in(now) != 0:
+            self.prewarm(now)
             return
         soon = sorted((w["start"], slug) for slug, w in self.track.items() if w["market"] is not None and self.phase(w, now))
         if not soon:
@@ -1095,6 +1099,25 @@ class RuleTaker:
         w = self.track[soon[0][1]]
         w["rest_at"] = self.verify_at = time.monotonic()
         self.verifying = asyncio.create_task(self.verify(str(w["market"]["id"])), name="rules-keep-warm")
+
+    def prewarm(self, now: int) -> None:
+        """Out of the busy stretches, while a window may still buy at any moment (its market open for matching, before its
+        start or in its course, its price set): a just-opened connection kept parked (PredictApi.prewarm) — no request, so
+        nothing of the key's budget (11-25 17:22, 53 minutes before a start, an offer's order waited 21 ms for a handshake)."""
+        if (self.prewarming is not None and not self.prewarming.done()) or not hasattr(self.api, "prewarm"):
+            return
+        for slug, w in self.track.items():
+            phase = self.phase(w, now) if w["market"] is not None and w["open_ms"] else ""
+            rule = RULE_OF.get(w["rule"]) if phase else None
+            if rule is not None and (phase == "live" or self.settings.price(rule.key) > 0) and not self.finished(slug, rule, phase == "live"):
+                break
+        else:
+            return
+
+        async def warm() -> None:
+            with contextlib.suppress(Exception):  # (no connection to be had now: the order makes its own, as before)
+                await self.api.prewarm(WARM_CONN_S)
+        self.prewarming = asyncio.ensure_future(warm())
 
     async def verify_status(self, slug: str, w: dict) -> None:
         try:

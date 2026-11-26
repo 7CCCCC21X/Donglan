@@ -70,6 +70,10 @@ class FakeApi:
     async def renew_auth(self) -> None:
         self.calls.append(("auth",))
 
+    async def prewarm(self, within: float) -> bool:
+        self.prewarms = getattr(self, "prewarms", 0) + 1  # (a connection asked to be kept ready: no request)
+        return True
+
     async def authed(self, method: str, path: str, payload: Any = None, *args: Any, **kwargs: Any) -> Any:
         self.calls.append(("authed", method, path))
         if method == "POST" and path == "/orders":  # the self-check's empty order: refused as invalid (or the region's 403)

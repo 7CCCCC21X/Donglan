@@ -30,6 +30,7 @@ SSL_CONTEXT = ssl.create_default_context()
 KEEPALIVE_IDLE_SECONDS = 25.0       # a pooled connection unused this long is dropped
 KEEPALIVE_POST_IDLE_SECONDS = 3.0   # a request with a body reuses only a connection used this recently (a stale one could swallow it)
 KEEPALIVE_PER_HOST = 24
+PREWARM_TIMEOUT_S = 5.0             # a parked connection's handshake given this long at the most
 HTTPS_CONNECTION = http.client.HTTPSConnection  # (the tests put a fake here)
 SECRET_HEADERS = frozenset({"authorization", "x-api-key", "cookie", "proxy-authorization"})
 HTTP_HINTS = {451: "部署所在地或接口访问受限；请核对官方地区规则", 403: "访问被拒绝；请核对权限与服务地区",
@@ -162,6 +163,35 @@ def _pool_put(host: str, port: int, conn: Any) -> None:
             conn.close()
             return
         rows.append((conn, time.monotonic()))
+
+
+def prewarm(host: str, port: int = 443, within: float = 2.0) -> bool:
+    """A connection to host:port opened now and parked in the pool unused, when none there was used (or opened) within
+    ``within`` seconds: an order — whose POST takes only a connection that fresh (KEEPALIVE_POST_IDLE_SECONDS) — then waits
+    for no TCP + TLS handshake of its own. No request goes over it: nothing of the key's budget is spent. The pooled ones past
+    KEEPALIVE_POST_IDLE_SECONDS are let go (the fresh one serves the reads as well). False: one that fresh was there already,
+    or the requests go by a proxy (its own connections)."""
+    fresh = pool_fresh(host, port)
+    if (fresh is not None and fresh < within) or _proxied(host):
+        return False
+    _count("new")
+    conn = HTTPS_CONNECTION(host, port, timeout=PREWARM_TIMEOUT_S, context=SSL_CONTEXT)
+    began = time.perf_counter()
+    try:
+        conn.connect()
+    except (OSError, http.client.HTTPException) as error:
+        conn.close()
+        raise _net_error(error) from None
+    http_net(host)["connect"].append((time.perf_counter() - began) * 1000)
+    with _POOL_LOCK:
+        rows = _POOL.setdefault((host, port), [])
+        now = time.monotonic()
+        for old, last in rows:
+            if now - last > KEEPALIVE_POST_IDLE_SECONDS:
+                old.close()
+        rows[:] = [(old, last) for old, last in rows if now - last <= KEEPALIVE_POST_IDLE_SECONDS]
+    _pool_put(host, port, conn)
+    return True
 
 
 def pool_fresh(host: str, port: int = 443) -> float | None:

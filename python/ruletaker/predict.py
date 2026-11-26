@@ -368,6 +368,13 @@ class PredictApi:
                 return
             await self._sign_in()
 
+    async def prewarm(self, within: float) -> bool:
+        """A just-opened connection to Predict parked for the next order, when none was used within ``within`` seconds (no
+        request over it: nothing of the key's budget)."""
+        split = urllib.parse.urlsplit(self.base)
+        return await asyncio.get_running_loop().run_in_executor(
+            READ_POOL, functools.partial(http.prewarm, split.hostname or "", split.port or 443, within))
+
     async def renew_auth(self) -> None:
         """Signed in ahead: renewed once the token has less than AUTH_RENEW_S left (the readiness loop and the warm-up before a
         busy stretch — off an order's way)."""

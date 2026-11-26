@@ -290,6 +290,29 @@ class OrderTest(unittest.TestCase):
             await asyncio.gather(*taker.sends)
         run(go())
 
+    def test_out_of_the_busy_stretches_a_connection_is_kept_ready_while_a_window_may_buy(self) -> None:
+        async def kept(at: int, status: str = "OPEN", paused: bool = False) -> tuple[int, int]:
+            taker, api, _chain, _stream, _clock = make_taker(at)
+            taker.plan(taker.now())
+            taker.planned_ms = taker.now()
+            listed(api, status=status)
+            await taker.turn()
+            await asyncio.sleep(0)  # (the turn's own keep-warm done with)
+            api.prewarms = 0
+            if paused:
+                taker.paused = "测试暂停"
+            calls = len(api.calls)
+            taker.keep_warm(taker.now())
+            await asyncio.sleep(0)
+            await asyncio.gather(*[t for t in (taker.verifying,) if t is not None], return_exceptions=True)
+            return api.prewarms, len(api.calls) - calls
+        # an hour before the start (no per-second hours, no makers' moment), matching open, the price set: kept ready — no
+        # request for it, nothing of the key's budget
+        self.assertEqual(run(kept(START - 3_600_000)), (1, 0))
+        self.assertEqual(run(kept(START - 3_600_000, paused=True)), (0, 0))  # paused: no order may go out
+        self.assertEqual(run(kept(START - 3_600_000, status="MATCHING_NOT_ENABLED")), (0, 0))  # not open: no order can go out
+        self.assertEqual(run(kept(START - 600_000)), (0, 1))  # a busy stretch: the book read keeps it used, as before
+
     def test_presigned_order_is_the_one_sent(self) -> None:
         async def go() -> None:
             taker, api, chain, stream, clock = make_taker(START - 3_600_000, RULE_FAST_HOURS="00:00-24:00")
