@@ -245,10 +245,12 @@ WATCH = {"best": None, "offer_max": 0.0, "offer_ms": 0, "listed_ms": 0, "open_ms
          "cut_ms": 0, "cut_ts": 0}
 
 
-def watch_stats(recs: dict[str, dict], rule: str, mode: str, since_ms: int) -> dict:
-    """What the watches of a rule's windows saw since ``since_ms``: the windows watched, those that offered the rule's side at its
-    price, the shares offered at once on average there, the median lowest offer, the median lead of matching's opening over the
-    start (seconds), the makers' lead, and the life of the offers lost and won."""
+def watch_stats(recs: dict[str, dict], rule: str, mode: str, since_ms: int, cents_now: int = 0) -> dict:
+    """What the watches of a rule's windows saw since ``since_ms``: the windows watched, those that offered the rule's side at the
+    price in force when each was watched (its range: cents_lo … cents_hi), the shares offered at once on average there, the
+    median lowest offer, the median lead of matching's opening over the start (seconds), the makers' lead, the life of the offers
+    lost and won, and ``best_in``: the windows whose lowest offer seen was at or under ``cents_now`` — the price set now (0: not
+    counted) — so a price changed since is judged on what was there."""
     seen = [r["seen"] for r in recs.values() if r.get("rule") == rule and r.get("mode") == mode and isinstance(r.get("seen"), dict)
             and int(r["seen"].get("start_ms") or 0) >= since_ms and not r["seen"].get("open")]
     offers = [x for x in seen if float(x.get("offer_max") or 0) > 0]
@@ -256,13 +258,16 @@ def watch_stats(recs: dict[str, dict], rule: str, mode: str, since_ms: int) -> d
     lost = [x for x in offers if x.get("gone_ms") and float(x.get("bought") or 0) <= DUST]
     won = [x for x in offers if x.get("gone_ts") and x.get("offer_ts") and float(x.get("bought") or 0) > DUST]
     stood = lambda x: (int(x["gone_ts"]) - int(x["offer_ts"])) if x.get("gone_ts") and x.get("offer_ts") else int(x["gone_ms"]) - int(x["offer_ms"])
+    prices = [int(x.get("cents") or 0) for x in seen if int(x.get("cents") or 0) > 0]
     return {"watched": len(seen), "offered": len(offers),
             "offer_avg": round(sum(float(x["offer_max"]) for x in offers) / len(offers), 2) if offers else None,
             "best_mid": mid([float(x["best"]) for x in seen if x.get("best") is not None]),
             "open_lead": mid([(int(x["start_ms"]) - int(x["open_ms"])) / 1000 for x in seen if x.get("open_ms")]),
             "offer_lead": mid([(int(x["start_ms"]) - int(x["offer_ms"])) / 60_000 for x in offers if x.get("offer_ms")]),
             "lost": len(lost), "life": mid([max(0, stood(x)) for x in lost]),
-            "won": len(won), "won_life": mid([max(0, stood(x)) for x in won])}
+            "won": len(won), "won_life": mid([max(0, stood(x)) for x in won]),
+            "cents_lo": min(prices) if prices else None, "cents_hi": max(prices) if prices else None,
+            "best_in": sum(1 for x in seen if x.get("best") is not None and float(x["best"]) <= cents_now / 100 + 1e-9) if cents_now > 0 else None}
 
 
 FIRST_BOOK_MS = 1_000  # an order sent on a book Predict stamped within this of the offer's first showing answered that showing

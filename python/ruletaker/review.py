@@ -27,7 +27,7 @@ def review(recs: dict[str, dict], settings: Any, now_ms: int, days: int = 30) ->
     for rule in RULES:
         for mode in ("on", "paper"):
             bought = [r for r in mine.values() if r.get("rule") == rule.key and r.get("mode") == mode and filled(r) > DUST]
-            stats = watch_stats(mine, rule.key, mode, since)
+            stats = watch_stats(mine, rule.key, mode, since, settings.price(rule.key))
             if not bought and not stats["watched"] and (mode == "paper" or not (live_rule(settings, rule) or live_price_of(settings, rule))):
                 continue
             done = [r for r in bought if r.get("pnl") is not None]

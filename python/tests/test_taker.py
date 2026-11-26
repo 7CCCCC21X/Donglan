@@ -313,6 +313,22 @@ class OrderTest(unittest.TestCase):
         self.assertEqual(run(kept(START - 3_600_000, status="MATCHING_NOT_ENABLED")), (0, 0))  # not open: no order can go out
         self.assertEqual(run(kept(START - 600_000)), (0, 1))  # a busy stretch: the book read keeps it used, as before
 
+    def test_a_price_changed_since_is_judged_on_what_was_there(self) -> None:
+        # three past windows watched at 60¢; the price is 73¢ now: the offers counted at 60¢ said to be at 60¢, and how many the
+        # lowest offer seen would have done at 73¢
+        from ruletaker.config import RuleSettings
+        taker, *_ = make_taker(START - 3_600_000, RULE_GOLD_SHUT_CENTS="73")
+        now = taker.now()
+        for i, (best, offer) in enumerate(((0.58, 30.0), (0.70, 0.0), (0.76, 0.0))):
+            at = now - (i + 1) * 86_400_000
+            key = f"xau-updown-15m-{at // 1000}"
+            taker.recs[key] = {"slug": key, "rule": "gold_shut", "mode": "on", "start_ms": at, "end_ms": at + 900_000, "orders": [],
+                               "seen": {"start_ms": at, "cents": 60, "best": best, "offer_max": offer, "offer_ms": at - 60_000 if offer else 0}}
+        text = taker.status()
+        self.assertIn("近 30 天看了 3 场，1 场有 ≤60¢（当时的规则价）的卖单（平均 30 份），按现在的 ≤73¢ 算有 2 场，最低卖价中位 70¢", text)
+        taker.settings = RuleSettings.parse({"RULE_TAKER": "on", "RULE_GOLD_SHUT_CENTS": "60"})  # (unchanged: said as before)
+        self.assertIn("近 30 天看了 3 场，1 场有 ≤60¢ 的卖单（平均 30 份），最低卖价中位 70¢", taker.status())
+
     def test_presigned_order_is_the_one_sent(self) -> None:
         async def go() -> None:
             taker, api, chain, stream, clock = make_taker(START - 3_600_000, RULE_FAST_HOURS="00:00-24:00")

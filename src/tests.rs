@@ -803,6 +803,31 @@ fn out_of_the_busy_stretches_a_connection_is_kept_ready_while_a_window_may_buy()
 }
 
 #[test]
+fn a_price_changed_since_is_judged_on_what_was_there() {
+    // three past windows watched at 60¢; the price is 73¢ now: the offers counted at 60¢ said to be at 60¢, and how many the
+    // lowest offer seen would have done at 73¢
+    let r = rig(start() - 3_600_000, &[("RULE_GOLD_SHUT_CENTS", "73")]);
+    let mut t = r.me.borrow_mut();
+    let now = t.now();
+    for (i, (best, offer)) in [(0.58, 30.0), (0.70, 0.0), (0.76, 0.0)].iter().enumerate() {
+        let at = now - (i as i64 + 1) * crate::util::DAY_MS;
+        let key = format!("xau-updown-15m-{}", at / 1000);
+        let rec = json!({"slug": key, "rule": "gold_shut", "mode": "on", "start_ms": at, "end_ms": at + 900_000, "orders": [],
+            "seen": {"start_ms": at, "cents": 60, "best": best, "offer_max": offer, "offer_ms": if *offer > 0.0 { at - 60_000 } else { 0 }}});
+        t.recs.insert(key, rec.as_object().cloned().unwrap());
+    }
+    let text = t.status();
+    assert!(
+        text.contains("近 30 天看了 3 场，1 场有 ≤60¢（当时的规则价）的卖单（平均 30 份），按现在的 ≤73¢ 算有 2 场，最低卖价中位 70¢"),
+        "{text}"
+    );
+    // the price unchanged: said as before
+    t.settings = crate::config::RuleSettings::parse(&env_of(&[("RULE_GOLD_SHUT_CENTS", "60")]), None).unwrap();
+    let text = t.status();
+    assert!(text.contains("近 30 天看了 3 场，1 场有 ≤60¢ 的卖单（平均 30 份），最低卖价中位 70¢"), "{text}");
+}
+
+#[test]
 fn presigned_order_is_the_one_sent() {
     run(async {
         let r = rig(start() - 3_600_000, &[("RULE_FAST_HOURS", "00:00-24:00")]);

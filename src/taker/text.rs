@@ -396,7 +396,7 @@ impl Taker {
                 }
                 let nxt = self.track.values().filter(|w| w.borrow().rule == rule.key).min_by_key(|w| w.borrow().start);
                 let st = if s.mode != "off" && cents > 0 {
-                    Some(watch_stats(recs, rule.key, &s.mode, now - 30 * DAY_MS))
+                    Some(watch_stats(recs, rule.key, &s.mode, now - 30 * DAY_MS, cents))
                 } else {
                     None
                 };
@@ -421,9 +421,27 @@ impl Taker {
                     );
                 }
                 if let Some(st) = st.filter(|st| st.i("watched") != 0) {
-                    line += &format!("｜近 30 天看了 {} 场，{} 场有 ≤{cents}¢ 的卖单", st.i("watched"), st.i("offered"));
+                    // (the windows offered at the price in force when each was watched: said so when that is not today's)
+                    let (lo, hi) = (st.get("cents_lo").and_then(Value::as_i64), st.get("cents_hi").and_then(Value::as_i64));
+                    let then = match (lo, hi) {
+                        (Some(l), Some(h)) if l == h && l == cents => None,
+                        (Some(l), Some(h)) if l == h => Some(format!("≤{l}¢（当时的规则价）")),
+                        (Some(l), Some(h)) => Some(format!("≤{l}～{h}¢（当时的规则价）")),
+                        _ => None,
+                    };
+                    line += &format!(
+                        "｜近 30 天看了 {} 场，{} 场有 {}的卖单",
+                        st.i("watched"),
+                        st.i("offered"),
+                        then.clone().unwrap_or_else(|| format!("≤{cents}¢ "))
+                    );
                     if let Some(avg) = st.get("offer_avg").and_then(Value::as_f64).filter(|a| *a != 0.0) {
                         line += &format!("（平均 {} 份）", g(avg));
+                    }
+                    if then.is_some() {
+                        if let Some(n) = st.get("best_in").and_then(Value::as_i64) {
+                            line += &format!("，按现在的 ≤{cents}¢ 算有 {n} 场");
+                        }
                     }
                     if let Some(best) = st.get("best_mid").and_then(Value::as_f64) {
                         line += &format!("，最低卖价中位 {:.0}¢", best * 100.0);

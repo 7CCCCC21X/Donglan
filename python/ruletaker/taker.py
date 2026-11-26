@@ -2900,13 +2900,17 @@ class RuleTaker:
                     lines.append(f"· {rule.name}：不做（价格设为 0）")
                     continue
                 nxt = min((w for w in self.track.values() if w["rule"] == rule.key), key=lambda w: w["start"], default=None)
-                st = watch_stats(recs, rule.key, s.mode, now - 30 * DAY_MS) if s.mode != "off" and cents > 0 else {"watched": 0}
+                st = watch_stats(recs, rule.key, s.mode, now - 30 * DAY_MS, cents) if s.mode != "off" and cents > 0 else {"watched": 0}
+                # (the windows offered at the price in force when each was watched: said so when that is not today's)
+                lo, hi = st.get("cents_lo"), st.get("cents_hi")
+                then = None if lo is None or (lo == hi == cents) else f"≤{lo}¢（当时的规则价）" if lo == hi else f"≤{lo}～{hi}¢（当时的规则价）"
                 cs = course_stats(recs, rule.key, s.mode, now - 30 * DAY_MS) if s.mode != "off" else {"windows": 0}
                 lines.append(f"· {rule.name} 买{rule.word} " + (f"≤{cents}¢" if cents > 0 else "盘前不买")
                              + (f"｜盘中 ≤{during}¢（{lead_note(rule)}）" if during > 0 else "") + f"：{rule.when}"
                              + (f"｜{'这一场' if nxt['start'] <= now else '下一场'} {bj(nxt['start'])}{('：' + nxt['word']) if nxt['word'] else ''}" if nxt else "")
-                             + (f"｜近 30 天看了 {st['watched']} 场，{st['offered']} 场有 ≤{cents}¢ 的卖单"
+                             + (f"｜近 30 天看了 {st['watched']} 场，{st['offered']} 场有 {then or f'≤{cents}¢ '}的卖单"
                                 + (f"（平均 {st['offer_avg']:g} 份）" if st["offer_avg"] else "")
+                                + (f"，按现在的 ≤{cents}¢ 算有 {st['best_in']} 场" if then and st.get("best_in") is not None else "")
                                 + (f"，最低卖价中位 {st['best_mid'] * 100:.0f}¢" if st["best_mid"] is not None else "")
                                 + (f"，撮合开启在开场前中位 {st['open_lead']:.0f} 秒" if st["open_lead"] is not None else "")
                                 + (f"，卖单首次出现在开场前中位 {st['offer_lead']:.0f} 分钟" if st.get("offer_lead") is not None else "")

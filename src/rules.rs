@@ -426,7 +426,10 @@ fn mid(xs: Vec<f64>) -> Value {
 }
 
 /// What the watches of a rule's windows saw since ``since_ms``.
-pub fn watch_stats(recs: &Recs, rule: &str, mode: &str, since_ms: i64) -> Obj {
+/// What the watches of a rule's windows saw since ``since_ms``. "offered" counts the windows that had an offer at the price in
+/// force when each was watched (its range: "cents_lo" … "cents_hi"); "best_in", those whose lowest offer seen was at or under
+/// ``cents_now`` — the price set now (0: not counted) — so a price changed since is judged on what was there.
+pub fn watch_stats(recs: &Recs, rule: &str, mode: &str, since_ms: i64, cents_now: i64) -> Obj {
     let seen: Vec<&Obj> = recs
         .values()
         .filter(|r| r.s("rule") == rule && r.s("mode") == mode)
@@ -461,6 +464,17 @@ pub fn watch_stats(recs: &Recs, rule: &str, mode: &str, since_ms: i64) -> Obj {
     out.insert("life".into(), mid_i(lost.iter().map(|x| stood(x).max(0)).collect()));
     out.insert("won".into(), json!(won.len()));
     out.insert("won_life".into(), mid_i(won.iter().map(|x| stood(x).max(0)).collect()));
+    let prices: Vec<i64> = seen.iter().map(|x| x.i("cents")).filter(|c| *c > 0).collect();
+    out.insert("cents_lo".into(), opt_i(prices.iter().copied().min()));
+    out.insert("cents_hi".into(), opt_i(prices.iter().copied().max()));
+    out.insert(
+        "best_in".into(),
+        if cents_now > 0 {
+            json!(seen.iter().filter(|x| !x.none("best") && x.f("best") <= cents_now as f64 / 100.0 + 1e-9).count())
+        } else {
+            Value::Null
+        },
+    );
     out
 }
 

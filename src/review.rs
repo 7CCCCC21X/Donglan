@@ -24,7 +24,7 @@ pub fn review(recs: &Recs, settings: &RuleSettings, now_ms: i64, days: i64) -> V
         for mode in ["on", "paper"] {
             let bought: Vec<&Obj> =
                 mine.values().filter(|r| r.s("rule") == rule.key && r.s("mode") == mode && filled(r) > DUST).collect();
-            let stats = watch_stats(&mine, rule.key, mode, since);
+            let stats = watch_stats(&mine, rule.key, mode, since, settings.price(rule.key));
             if bought.is_empty()
                 && stats.i("watched") == 0
                 && (mode == "paper" || !(live_rule(settings, rule) || live_price_of(settings, rule) != 0))
