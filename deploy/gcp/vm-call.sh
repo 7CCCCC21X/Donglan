@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs ON the VM as root (rt.sh pipes it in): one call on the service's own pages (127.0.0.1), with STATUS_KEY and STATUS_PORT
 # read from the settings file the way the service reads it — the first line of a name wins; "export ", quotes around the value
-# and a " #" comment after it taken off — and the key handed to curl through a pipe, never on a command line (ps shows those).
+# and a " #" comment after it taken off — or, for a secret the file no longer holds, from the encrypted store beside it
+# (vm-key.sh), as the service gets it; and the key handed to curl through a pipe, never on a command line (ps shows those).
 #
 #   bash -s -- port                          the console's port
 #   bash -s -- get /status | /status.json
@@ -10,9 +11,11 @@
 #   bash -s -- probe-keys                    what a probe machine needs (the API key, the chain) — never the private key
 #
 # Nothing here reads its own stdin (the script itself comes that way). For a test elsewhere: RT_ENV stands in for the VM's
-# settings file, RT_RUN for the command line of the version in use.
+# settings file, RT_SSTORE for its encrypted secrets, RT_CREDS for systemd-creds, RT_RUN for the command line of the version in use.
 set -uo pipefail
 F="${RT_ENV:-/etc/ruletaker/ruletaker.env}"
+SSTORE="${RT_SSTORE:-/etc/credstore.encrypted/ruletaker_secrets}"
+CREDS="${RT_CREDS:-systemd-creds}"
 
 setting() {  # setting NAME: its value as the service reads it ("" when not set)
   [ -r "$F" ] || return 0
@@ -41,6 +44,15 @@ setting() {  # setting NAME: its value as the service reads it ("" when not set)
     }' "$F"
 }
 
+secret() {  # secret NAME: the settings file's value, else the one kept encrypted (vm-key.sh) — opened here (root), never shown
+  local v
+  v="$(setting "$1")"
+  if [ -z "$v" ] && [ -s "$SSTORE" ]; then
+    v="$("$CREDS" decrypt --name=ruletaker_secrets "$SSTORE" - 2>/dev/null | sed -n "s/^$1=//p" | head -1)"
+  fi
+  printf '%s\n' "$v"
+}
+
 port="$(setting STATUS_PORT)"
 case "$port" in ''|*[!0-9]*) port=8080 ;; esac
 
@@ -56,7 +68,7 @@ BODY=""
 CODE=""
 call() {  # call METHOD PATH [JSON] [SECONDS]: the answer in BODY, the HTTP status in CODE ("000": no connection)
   local key out
-  key="$(setting STATUS_KEY)"
+  key="$(secret STATUS_KEY)"
   key="${key//\\/\\\\}"
   key="${key//\"/\\\"}"
   out="$(mktemp)"
@@ -72,7 +84,7 @@ said() {  # what went wrong, in words (never silent)
     000|"")
       # (243: systemd could not open the key kept encrypted — the service never got as far as starting)
       if [ "$(systemctl show -p ExecMainStatus --value ruletaker 2>/dev/null)" = 243 ]; then
-        echo "❌ 服务起不来：systemd 解不开加密保存的私钥（换了虚拟机、或这台机器的虚拟 TPM 重置过）。重新设定私钥：bash deploy/gcp/rt.sh key"
+        echo "❌ 服务起不来：systemd 解不开加密保存的私钥或 Key、令牌（换了虚拟机、或这台机器的虚拟 TPM 重置过）。重新设定：私钥 bash deploy/gcp/rt.sh key，Key、令牌 bash deploy/gcp/rt.sh set 名字"
       else
         echo "❌ 连不上服务的控制台（127.0.0.1:${port}）：服务没在运行，或 STATUS_PORT 设成了 0。看原因：sudo systemctl status ruletaker"
       fi
@@ -100,7 +112,7 @@ case "${1:-}" in
     ;;
   probe-keys)
     for name in RULE_API_KEY PREDICT_API_KEY PREDICT_CHAIN_ID PREDICT_RATE_PER_MIN; do
-      value="$(setting "$name")"
+      value="$(secret "$name")"
       [ -z "$value" ] || printf '%s=%s\n' "$name" "$value"
     done
     ;;

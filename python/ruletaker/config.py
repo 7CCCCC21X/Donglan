@@ -47,14 +47,34 @@ def load_env_file(path: str | os.PathLike, into: dict | None = None) -> dict:
 # systemd decrypts it for the service alone (LoadCredentialEncrypted= in deploy/gcp/ruletaker.service) into a directory of the
 # service's own in memory — $CREDENTIALS_DIRECTORY, read by its user only, gone when it stops.
 KEY_CREDENTIAL = "predict_private_key"
+# The name the other secrets are kept under, encrypted on the VM beside the private key (deploy/gcp/vm-key.sh): NAME=VALUE lines
+# of SECRET_SETTINGS, opened by systemd for the service the same way. The settings file there then holds none of them.
+SECRETS_CREDENTIAL = "ruletaker_secrets"
+# The settings that are secrets, beside PREDICT_PRIVATE_KEY: on the VM kept encrypted (SECRETS_CREDENTIAL), never in the settings
+# file. A value in the settings file still wins over the kept one (the next rt.sh edit / set / update keeps it instead).
+SECRET_SETTINGS = ("PREDICT_API_KEY", "RULE_API_KEY", *(f"RULE_API_KEY_{n}" for n in range(2, 10)), "TELEGRAM_BOT_TOKEN",
+                   "TELEGRAM_COMMAND_TOKEN", "STATUS_KEY", "BSC_RPC_URL")
+
+
+def secrets_of(text: str) -> tuple[tuple[str, str], ...]:
+    """The kept secrets' text (SECRETS_CREDENTIAL): NAME=VALUE lines, SECRET_SETTINGS' names alone (anything else left out),
+    empty values left out."""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        name, sep, value = line.partition("=")
+        name, value = name.strip(), value.strip()
+        if sep and name in SECRET_SETTINGS and value and name not in out:
+            out[name] = value
+    return tuple(out.items())
 
 
 @dataclasses.dataclass(frozen=True)
 class Stored:
-    """What systemd handed the service: whether it runs with a credentials directory at all (the VM's unit gives it one), and
-    the private key kept there ("" none). The key never in a repr."""
+    """What systemd handed the service: whether it runs with a credentials directory at all (the VM's unit gives it one), the
+    private key kept there ("" none), and the other secrets kept there (SECRET_SETTINGS' names). Never in a repr."""
     store: bool = False
     key: str = dataclasses.field(default="", repr=False)
+    secrets: tuple = dataclasses.field(default=(), repr=False)
 
     @classmethod
     def from_systemd(cls) -> "Stored":
@@ -70,11 +90,20 @@ class Stored:
         path = os.path.join(folder, KEY_CREDENTIAL)
         try:
             with open(path, encoding="utf-8") as f:
-                return cls(True, f.read().strip())
+                key = f.read().strip()
         except FileNotFoundError:
-            return cls(True, "")
+            key = ""
         except (OSError, UnicodeDecodeError) as error:
             raise ValueError(f"读不到加密保存的私钥（{path}：{error}）") from None
+        path = os.path.join(folder, SECRETS_CREDENTIAL)
+        try:
+            with open(path, encoding="utf-8") as f:
+                secrets = secrets_of(f.read())
+        except FileNotFoundError:
+            secrets = ()
+        except (OSError, UnicodeDecodeError) as error:
+            raise ValueError(f"读不到加密保存的设置（{path}：{error}）") from None
+        return cls(True, key, secrets)
 
 
 def key_of(raw: str) -> str | None:
@@ -185,6 +214,7 @@ class Config:
     key_kept: str = ""                # where the key came from: "stored" (kept encrypted on this machine), "settings" (the
                                       # settings file: plain text), "both" (the same key in both: the plain copy is to go), "" (none)
     key_store: bool = False           # run with systemd's credentials directory (the VM's unit): the key could be kept encrypted here
+    secrets_kept: int = 0             # how many of the secrets (SECRET_SETTINGS) came from the encrypted store, not the settings file
     account: str = ""
     chain_id: int = 56
     rpc_url: str = ""
@@ -223,6 +253,11 @@ class Config:
         PREDICT_PRIVATE_KEY is used only when none is kept; the same key in both is that key (its plain copy reported, to go);
         two different keys are refused — never one of them picked behind the user's back."""
         e = dict(os.environ if e is None else e)
+        secrets_kept = 0
+        for name, value in stored.secrets:  # (the kept secrets fill in what the settings file does not set: a value there still wins)
+            if not str(e.get(name, "")).strip():
+                e[name] = value
+                secrets_kept += 1
         rules = RuleSettings.parse(e)
         CALENDAR.configure(parse_dates(e.get("CME_EARLY_DAYS", DEFAULT_CME_EARLY), "CME_EARLY_DAYS"),
                            parse_dates(e.get("CME_CLOSED_DAYS", DEFAULT_CME_CLOSED), "CME_CLOSED_DAYS"))
@@ -268,7 +303,7 @@ class Config:
             trading_allowed=allowed(e.get("LIVE_TRADING_ALLOWED")),
             api_key=key, own_key=bool(own) and own != shared,
             api_spares=tuple(dict.fromkeys(k for k in (str(e.get(f"RULE_API_KEY_{n}", "")).strip() for n in range(2, 10)) if k and k != key)),
-            private_key=private_key, key_kept=key_kept, key_store=stored.store, account=account,
+            private_key=private_key, key_kept=key_kept, key_store=stored.store, secrets_kept=secrets_kept, account=account,
             chain_id=int(bounded(e, "PREDICT_CHAIN_ID", 56, 1, 10 ** 9)),
             rpc_url=str(e.get("BSC_RPC_URL", "")).strip().rstrip("/"),
             fee_bps=int(bounded(e, "PREDICT_FEE_BPS", 200, 0, 1000)),
@@ -296,4 +331,4 @@ class Config:
                 f"spare_api_keys={len(self.api_spares)} predict_private_key={bool(self.private_key)} predict_account={bool(self.account)} "
                 f"telegram_token={bool(self.telegram_token)} telegram_command_token={bool(self.telegram_command_token)} "
                 f"telegram_commands={self.telegram_commands} status_key={bool(self.status_key)} mode={self.rules.mode} "
-                f"trading_allowed={self.trading_allowed} private_key_kept={self.key_kept or 'none'}")
+                f"trading_allowed={self.trading_allowed} secrets_kept={self.secrets_kept} private_key_kept={self.key_kept or 'none'}")

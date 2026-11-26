@@ -17,6 +17,9 @@ ExecStart=/opt/ruletaker/bin/ruletaker run --env /etc/ruletaker/ruletaker.env
 # own in memory ($CREDENTIALS_DIRECTORY: read by its user only, gone when it stops). None kept: nothing is loaded, and the
 # settings file's PREDICT_PRIVATE_KEY is used as before.
 LoadCredentialEncrypted=predict_private_key
+# The other secrets the same way (the API keys, the Telegram tokens, STATUS_KEY, BSC_RPC_URL — vm-key.sh's SECRETS), kept
+# together in /etc/credstore.encrypted/ruletaker_secrets: the settings file holds none of them. None kept: nothing loaded.
+LoadCredentialEncrypted=ruletaker_secrets
 Restart=always
 RestartSec=3
 # On a stop: the orders on their way get their answers (25 s at the most) and the resting rest is withdrawn, the records are

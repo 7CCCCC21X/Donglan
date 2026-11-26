@@ -104,7 +104,7 @@ fi
 install -m 644 "$APP/deploy/gcp/ruletaker.service" /etc/systemd/system/ruletaker.service
 systemctl daemon-reload
 systemctl enable ruletaker >/dev/null 2>&1
-bash "$APP/deploy/gcp/vm-key.sh" move || echo "（私钥照旧在设置文件里，服务照常运行；原因见上面）"
+bash "$APP/deploy/gcp/vm-key.sh" move || echo "（没收走的照旧在设置文件里，服务照常运行；原因见上面）"
 bash "$APP/deploy/gcp/vm-key.sh" status
 echo "== 设置自检 =="
 bash "$APP/deploy/gcp/vm-key.sh" run plan --env /etc/ruletaker/ruletaker.env   # (a setting that does not parse stops here)

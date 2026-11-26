@@ -789,7 +789,15 @@ async fn key_command(env: Env, from_stdin: bool) -> i32 {
             return 2;
         }
     };
-    let setting = |name: &str| env.get(name).map(|v| v.trim().to_string()).unwrap_or_default();
+    // (BSC_RPC_URL may be kept encrypted with the other secrets: filled in from there when the settings file has none)
+    let kept = config::Stored::from_systemd().map(|s| s.secrets).unwrap_or_default();
+    let setting = |name: &str| {
+        let v = env.get(name).map(|v| v.trim().to_string()).unwrap_or_default();
+        if !v.is_empty() {
+            return v;
+        }
+        kept.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()).unwrap_or_default()
+    };
     let chain_id: i64 = setting("PREDICT_CHAIN_ID").parse().unwrap_or(56);
     let wallet = match wallet::Wallet::new(&key, chain_id, &setting("PREDICT_ACCOUNT")) {
         Ok(w) => Rc::new(w),

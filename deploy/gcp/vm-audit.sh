@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Runs ON the VM as root (rt.sh audit pipes it in): where the private key is, who can read it, what can reach the machine.
-# Read-only, and the key itself is never shown: it is looked for as a pattern kept in a root-only file, deleted on exit,
-# and only whether (and in which files) it is found is printed.
+# Runs ON the VM as root (rt.sh audit pipes it in): where the private key and the other secrets (the API keys, the Telegram
+# tokens, STATUS_KEY, BSC_RPC_URL) are, who can read them, what can reach the machine. Read-only, and no secret is ever shown:
+# each is looked for as a pattern kept in a root-only file, deleted on exit, and only whether (and in which files) it is found
+# is printed.
 #
-# For a test elsewhere: RT_ENV (the settings file), RT_STORE (the key kept encrypted), RT_CREDS (systemd-creds), RT_SEARCH (the
-# folders searched) stand in for the VM's own, and RT_NO names tools to take as missing (systemctl, journalctl, …).
+# For a test elsewhere: RT_ENV (the settings file), RT_STORE (the key kept encrypted), RT_SSTORE (the secrets kept encrypted),
+# RT_CREDS (systemd-creds), RT_SEARCH (the folders searched) stand in for the VM's own, and RT_NO names tools to take as missing
+# (systemctl, journalctl, …).
 set -uo pipefail
 F="${RT_ENV:-/etc/ruletaker/ruletaker.env}"
 STORE="${RT_STORE:-/etc/credstore.encrypted/predict_private_key}"
+SSTORE="${RT_SSTORE:-/etc/credstore.encrypted/ruletaker_secrets}"
+SECRETS_RE='PREDICT_API_KEY|RULE_API_KEY(_[2-9])?|TELEGRAM_BOT_TOKEN|TELEGRAM_COMMAND_TOKEN|STATUS_KEY|BSC_RPC_URL'
 CREDS="${RT_CREDS:-systemd-creds}"
 SEARCH="${RT_SEARCH:-/etc /var/lib/ruletaker /opt/ruletaker /home /root /tmp /var/tmp /var/log}"
 ok() { echo "✅ $*"; }
@@ -60,8 +64,9 @@ fi
 # The key as a fixed-string pattern (its 64 hex digits, with or without 0x), in a file only root reads, gone on exit: every
 # PREDICT_PRIVATE_KEY line's (should there be more than one, commented out or not) and the one kept encrypted, each looked for.
 P="$(mktemp -p /dev/shm 2>/dev/null || mktemp)"   # (in memory where there is a /dev/shm)
-chmod 600 "$P"
-trap 'shred -u "$P" 2>/dev/null || rm -f "$P"' EXIT
+Q="$(mktemp -p /dev/shm 2>/dev/null || mktemp)"   # (the other secrets' values, the same way)
+chmod 600 "$P" "$Q"
+trap 'shred -u "$P" "$Q" 2>/dev/null || rm -f "$P" "$Q"' EXIT
 grep -E '^[[:space:]]*#*[[:space:]]*(export[[:space:]]+)?PREDICT_PRIVATE_KEY[[:space:]]*=' "$F" | grep -oiE '[0-9a-f]{64}' > "$P"
 kept=""
 if [ -e "$STORE" ]; then
@@ -119,6 +124,57 @@ else
       else
         warn "服务没拿到加密保存的私钥（它的 systemd 配置是旧的？）：bash deploy/gcp/rt.sh update"
       fi
+    fi
+  fi
+fi
+
+# The other secrets: kept encrypted beside the key (vm-key.sh), none in the settings file in plain text; their values (8
+# characters or more: a value that short would turn up anywhere) looked for the way the key is, letter case kept
+plain="$(grep -E "^[[:space:]]*(export[[:space:]]+)?($SECRETS_RE)[[:space:]]*=[[:space:]]*[^[:space:]#]" "$F" \
+  | sed -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Z0-9_]+).*/\2/' | sort -u | paste -sd ' ' -)"
+grep -E "^[[:space:]]*#*[[:space:]]*(export[[:space:]]+)?($SECRETS_RE)[[:space:]]*=" "$F" \
+  | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]+#.*$//; s/^["'"'"']//; s/["'"'"']$//' | awk 'length >= 8' >> "$Q"
+skept=""
+if [ -e "$SSTORE" ]; then
+  if have "$CREDS" && text="$("$CREDS" decrypt --name=ruletaker_secrets "$SSTORE" - 2>/dev/null)"; then
+    skept="$(printf '%s\n' "$text" | cut -d= -f1 | paste -sd ' ' -)"
+    printf '%s\n' "$text" | cut -d= -f2- | awk 'length >= 8' >> "$Q"
+    text=""
+    smode="$(stat -c '%a %U:%G' "$SSTORE")"
+    if [ "$smode" = "600 root:root" ]; then
+      ok "Key、令牌加密保存在 $SSTORE（$(kind_of "$SSTORE")；权限 $smode）：$skept"
+    else
+      warn "加密保存的 Key、令牌 $SSTORE 权限是 $smode（应为 600 root:root）"
+    fi
+  else
+    warn "加密保存的 Key、令牌 $SSTORE 在，但这台机器解不开它：重新设定 bash deploy/gcp/rt.sh set 名字"
+  fi
+fi
+sort -u -o "$Q" "$Q"
+if [ -n "$plain" ]; then
+  warn "设置文件里还有明文的 Key、令牌：$plain——运行 bash deploy/gcp/rt.sh update 改成加密保存（只有这台机器能解开）"
+elif [ -n "$skept" ]; then
+  ok "设置文件里没有明文的 Key、令牌"
+fi
+if [ -s "$Q" ]; then
+  # shellcheck disable=SC2086
+  others="$(grep -rlF -f "$Q" $SEARCH --exclude-dir=target --exclude-dir=.cargo --exclude-dir=venv --exclude-dir=journal 2>/dev/null \
+    | grep -vxF "$Q" | grep -vxF "$P" | grep -vxF "$F" || true)"
+  if [ -n "$others" ]; then
+    warn "Key、令牌的明文还出现在这些文件里（看完删掉：sudo shred -u 文件名）："
+    printf '     %s\n' $others
+  elif [ -n "$skept" ]; then
+    ok "除了加密保存的那份，哪个文件里都没有 Key、令牌的明文（搜过：$SEARCH）"
+  fi
+  if have journalctl; then
+    n="$(journalctl --no-pager -q 2>/dev/null | grep -cF -f "$Q" || true)"
+    if [ "${n:-0}" = "0" ]; then ok "系统日志里没有 Key、令牌"; else warn "系统日志里有 ${n} 行带着 Key、令牌"; fi
+  fi
+  if [ -n "$pid" ]; then
+    if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qF -f "$Q" || tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF -f "$Q"; then
+      warn "Key、令牌在服务进程的环境变量或命令行里"
+    else
+      ok "Key、令牌不在服务进程的环境变量和命令行里"
     fi
   fi
 fi

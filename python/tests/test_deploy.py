@@ -13,7 +13,7 @@ import tempfile
 import threading
 import unittest
 
-from ruletaker.config import Config, Stored, load_env_file
+from ruletaker.config import Config, Stored, load_env_file, secrets_of
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CALL = os.path.join(ROOT, "deploy", "gcp", "vm-call.sh")
@@ -87,6 +87,26 @@ class VmCallTest(unittest.TestCase):
         got, _ = self.call("STATUS_KEY=x", "port")
         self.assertEqual(got, "8080")
 
+    def test_a_secret_the_file_no_longer_holds_is_read_from_the_encrypted_store(self) -> None:
+        creds = os.path.join(self.dir, "systemd-creds")
+        with open(creds, "w") as f:
+            f.write(FAKE_CREDS.replace("PYTHON", sys.executable))
+        os.chmod(creds, 0o755)
+        kept = os.path.join(self.dir, "ruletaker_secrets")
+        subprocess.run([creds, "encrypt", "--name=ruletaker_secrets", "--with-key=host", "--tpm2-pcrs=", "-", kept],
+                       input=b"PREDICT_API_KEY=api-kept-1\nSTATUS_KEY=kept-status-key-1\n", check=True)
+        path = os.path.join(self.dir, "ruletaker.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"STATUS_PORT={self.port}\nPREDICT_CHAIN_ID=56\n")
+        env = dict(os.environ, RT_ENV=path, RT_SSTORE=kept, RT_CREDS=creds)
+        run = lambda *words: subprocess.run(["bash", CALL, *words], capture_output=True, text=True, env=env,
+                                            stdin=subprocess.DEVNULL, timeout=30, check=False).stdout
+        self.assertEqual(run("get", "/status").strip(), "kept-status-key-1")  # (what the console was sent)
+        self.assertEqual(run("probe-keys"), "PREDICT_API_KEY=api-kept-1\nPREDICT_CHAIN_ID=56\n")
+        with open(path, "a", encoding="utf-8") as f:  # (a value in the file still wins, as with the service)
+            f.write("STATUS_KEY=from-the-file\n")
+        self.assertEqual(run("get", "/status").strip(), "from-the-file")
+
     def test_only_its_own_words(self) -> None:
         got, _ = self.call(f"STATUS_PORT={self.port}", "post", "/mode?to=on;id")
         self.assertIn("不认识的调用", got)
@@ -145,7 +165,7 @@ while i < len(args) and args[i].startswith("-"):
             env[k] = v
     else:
         i += 1
-code = subprocess.run(args[i:], env=env, stdin=subprocess.DEVNULL).returncode
+code = subprocess.run(args[i:], env=env).returncode  # (--pipe: its standard input passed on)
 for f in os.listdir(creds):
     os.remove(os.path.join(creds, f))
 os.rmdir(creds)
@@ -161,6 +181,8 @@ A_SIGNER = "0x511387682044334a3e855679c186455753356BF5"  # (tests/vectors/wallet
 B = "4c" * 32
 OLD = "9d" * 32
 MARK = "# PREDICT_PRIVATE_KEY：已加密保存"
+SMARK = "# 下面这些设置已加密保存在这台机器上"
+SECRET_VALUES = ("api-key-0123456789", "spare-key-123", "123456:telegram-token-abc", "status-key-abcdef", "rpc-secret-token-9")
 try:
     import eth_account  # noqa: F401
     ETH = True
@@ -184,9 +206,10 @@ class VmKeyTest(unittest.TestCase):
         os.mkdir(os.path.join(self.dir, "etc"))
         self.env_file = os.path.join(self.dir, "etc", "ruletaker.env")
         self.store = os.path.join(self.dir, "credstore.encrypted", "predict_private_key")
+        self.sstore = os.path.join(self.dir, "credstore.encrypted", "ruletaker_secrets")
         self.unit = os.path.join(self.dir, "ruletaker.service")
         with open(self.unit, "w") as f:
-            f.write("[Service]\nLoadCredentialEncrypted=predict_private_key\n")
+            f.write("[Service]\nLoadCredentialEncrypted=predict_private_key\nLoadCredentialEncrypted=ruletaker_secrets\n")
         self.log = os.path.join(self.dir, "log")
         open(self.log, "w").close()
 
@@ -215,17 +238,24 @@ class VmKeyTest(unittest.TestCase):
         return subprocess.run([self.creds, "decrypt", "--name=predict_private_key", self.store, "-"], capture_output=True,
                               text=True, check=True).stdout
 
+    def secrets(self) -> str:
+        """The kept secrets, opened as the service's would be ("" none kept)."""
+        if not os.path.exists(self.sstore):
+            return ""
+        return subprocess.run([self.creds, "decrypt", "--name=ruletaker_secrets", self.sstore, "-"], capture_output=True,
+                              text=True, check=True).stdout
+
     def key_sh(self, *words: str, stdin: str = "", **extra: str) -> tuple[int, str]:
         python = os.path.join(ROOT, "python")
-        env = dict(os.environ, RT_ENV=self.env_file, RT_STORE=self.store, RT_UNIT=self.unit, RT_CREDS=self.creds,
+        env = dict(os.environ, RT_ENV=self.env_file, RT_STORE=self.store, RT_SSTORE=self.sstore, RT_UNIT=self.unit, RT_CREDS=self.creds,
                    RT_SYSTEMD_RUN=self.sdrun, RT_SYSTEMCTL=self.systemctl, RT_AS="", RT_WAIT="0",
                    RT_RUN=f"env PYTHONPATH={python} {sys.executable} -m ruletaker", FAKE_LOG=self.log, FAKE_CREDS=self.creds)
         env.update(extra)
         env.pop("CREDENTIALS_DIRECTORY", None)
         out = subprocess.run(["bash", KEYSH, *words], capture_output=True, text=True, env=env, input=stdin, timeout=120)
         text = out.stdout + out.stderr
-        for secret in (A, B, OLD):  # never printed, whatever happened
-            self.assertNotIn(secret, text.lower())
+        for secret in (A, B, OLD, *SECRET_VALUES):  # never printed, whatever happened
+            self.assertNotIn(secret.lower(), text.lower())
         return out.returncode, text
 
     def test_move_takes_every_copy_out_and_keeps_the_key_encrypted(self) -> None:
@@ -245,9 +275,14 @@ class VmKeyTest(unittest.TestCase):
         for secret in (A, B, OLD):
             self.assertNotIn(secret, after.lower())
         self.assertEqual(after.count(MARK), 1)
-        self.assertEqual([line for line in after.split("\n") if not line.startswith(MARK)],
-                         ["RULE_TAKER=on", "PREDICT_API_KEY=k", "TELEGRAM_CHAT_ID=1\r", "STATUS_KEY=x # 控制台", ""])
+        self.assertEqual([line for line in after.split("\n") if not line.startswith((MARK, SMARK))],
+                         ["RULE_TAKER=on", "TELEGRAM_CHAT_ID=1\r", ""])
         self.assertTrue(after.split("\n")[1].startswith(MARK), "the note where the key was")
+        # the secrets went the same way: kept encrypted, a note naming them where the first one was
+        self.assertTrue(after.split("\n")[2].startswith(SMARK) and after.split("\n")[2].endswith("PREDICT_API_KEY STATUS_KEY"),
+                        after)
+        self.assertEqual(self.secrets(), "PREDICT_API_KEY=k\nSTATUS_KEY=x\n")
+        self.assertEqual(stat.S_IMODE(os.stat(self.sstore).st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(os.stat(self.env_file).st_mode), 0o640)
         self.assertEqual(sorted(os.listdir(os.path.dirname(self.env_file))), ["ruletaker.env"])  # (no copy, no leftover)
         # the key the service read (its first line's), kept; the service reads no plain key any more
@@ -255,8 +290,8 @@ class VmKeyTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(self.store).st_mode), 0o600)
         settings = load_env_file(self.env_file)
         self.assertNotIn("PREDICT_PRIVATE_KEY", settings)
-        config = Config.load({**settings, "PREDICT_API_KEY": "k"}, Stored(True, self.kept()))
-        self.assertEqual((config.private_key, config.key_kept), ("0x" + A, "stored"))
+        config = Config.load(settings, Stored(True, self.kept(), secrets_of(self.secrets())))
+        self.assertEqual((config.private_key, config.key_kept, config.api_key, config.secrets_kept), ("0x" + A, "stored", "k", 2))
         # proved by systemd opening it for the service's user, with the service's devices
         with open(self.log) as f:
             proof = f.read()
@@ -264,15 +299,100 @@ class VmKeyTest(unittest.TestCase):
         self.assertIn("-p PrivateDevices=yes", proof)
         self.assertIn(f"签名地址 {A_SIGNER}", out)
         # once more: nothing to do, nothing touched
-        stamp = os.stat(self.env_file).st_ino, os.stat(self.store).st_mtime_ns
+        stamp = os.stat(self.env_file).st_ino, os.stat(self.store).st_mtime_ns, os.stat(self.sstore).st_mtime_ns
         code, out = self.key_sh("move")
         self.assertEqual((code, out), (0, ""))
-        self.assertEqual((os.stat(self.env_file).st_ino, os.stat(self.store).st_mtime_ns), stamp)
+        self.assertEqual((os.stat(self.env_file).st_ino, os.stat(self.store).st_mtime_ns, os.stat(self.sstore).st_mtime_ns), stamp)
         # the commands the service's way: its kept key handed over
         code, out = self.key_sh("run", "key")
         self.assertEqual((code, out.strip()), (0, A_SIGNER))
         code, out = self.key_sh("status")
         self.assertIn("私钥：加密保存在", out)
+        self.assertIn("：PREDICT_API_KEY STATUS_KEY", out)
+        self.assertNotIn("还有明文", out)
+
+    def test_every_secret_is_kept_encrypted_and_the_settings_file_holds_none(self) -> None:
+        before = ("RULE_TAKER=paper\n"
+                  "PREDICT_API_KEY=api-key-0123456789\n"
+                  "RULE_GOLD_SHARES=300\n"
+                  'RULE_API_KEY_2="spare-key-123"\n'
+                  "export TELEGRAM_BOT_TOKEN=123456:telegram-token-abc  # 通知\n"
+                  "#TELEGRAM_COMMAND_TOKEN=an-old-command-token\n"
+                  "# 旧的 api-key-0123456789 记一下\n"
+                  "STATUS_KEY=status-key-abcdef\n"
+                  "BSC_RPC_URL=https://rpc.example/rpc-secret-token-9\n"
+                  "TELEGRAM_CHAT_ID=1\n")
+        self.settings(before)
+        code, out = self.key_sh("move")
+        self.assertEqual(code, 0, out)
+        self.assertIn("已从设置文件收走，加密保存在这台机器上", out)
+        after = self.read()
+        for secret in (*SECRET_VALUES, "an-old-command-token"):
+            self.assertNotIn(secret, after)
+        lines = after.split("\n")
+        self.assertEqual(lines[0], "RULE_TAKER=paper")
+        self.assertTrue(lines[1].startswith(SMARK), "the note where the first one was")
+        self.assertTrue(lines[1].endswith("PREDICT_API_KEY RULE_API_KEY_2 TELEGRAM_BOT_TOKEN STATUS_KEY BSC_RPC_URL"), lines[1])
+        self.assertEqual(lines[2:], ["RULE_GOLD_SHARES=300", "TELEGRAM_CHAT_ID=1", ""])
+        # kept as the service reads them (quotes and the comment taken off), in a fixed order
+        self.assertEqual(self.secrets(), "PREDICT_API_KEY=api-key-0123456789\nRULE_API_KEY_2=spare-key-123\n"
+                                         "TELEGRAM_BOT_TOKEN=123456:telegram-token-abc\nSTATUS_KEY=status-key-abcdef\n"
+                                         "BSC_RPC_URL=https://rpc.example/rpc-secret-token-9\n")
+        # proved by systemd opening them for the service's user, before the file was touched
+        with open(self.log) as f:
+            self.assertIn("LoadCredentialEncrypted=ruletaker_secrets:", f.read())
+        # the service's way: they are handed over, and the settings check passes on them
+        code, out = self.key_sh("run", "plan", "--env", self.env_file)
+        self.assertEqual(code, 0, out)
+        code, out = self.key_sh("status")
+        self.assertIn("Key、令牌：加密保存在", out)
+        self.assertNotIn("还有明文", out)
+        # a new private key, checked on chain the way the service would: the kept secrets (BSC_RPC_URL) opened for it
+        open(self.log, "w").close()
+        code, out = self.key_sh("set", stdin=A + "\n")
+        self.assertEqual(code, 0, out)
+        with open(self.log) as f:
+            self.assertIn("LoadCredentialEncrypted=ruletaker_secrets:", f.read().split("key --stdin")[0])
+
+    def test_put_an_empty_secret_takes_it_out_and_a_value_refused_puts_everything_back(self) -> None:
+        self.settings("RULE_TAKER=paper\nPREDICT_API_KEY=api-key-0123456789\nSTATUS_KEY=status-key-abcdef\n")
+        self.assertEqual(self.key_sh("move")[0], 0)
+        code, out = self.key_sh("put", "STATUS_KEY", stdin="\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("✅ STATUS_KEY 已删掉", out)
+        self.assertEqual(self.secrets(), "PREDICT_API_KEY=api-key-0123456789\n")
+        # a value the service refuses (a console open beyond this machine needs a STATUS_KEY of 12 or more): all put back
+        self.settings(self.read() + "STATUS_HOST=0.0.0.0\n")
+        before, kept = self.read(), self.secrets()
+        open(self.log, "w").close()
+        code, out = self.key_sh("put", "STATUS_KEY", stdin="short\n")
+        self.assertNotEqual(code, 0)
+        self.assertIn("都已恢复原样", out)
+        self.assertEqual((self.read(), self.secrets()), (before, kept))
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.sstore))), ["ruletaker_secrets"])
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.env_file))), ["ruletaker.env"])
+        with open(self.log) as f:
+            self.assertNotIn("restart", f.read())
+
+    def test_an_old_unit_or_a_failed_proof_leaves_the_secrets_where_they_are(self) -> None:
+        before = "RULE_TAKER=paper\nPREDICT_API_KEY=api-key-0123456789\n"
+        self.settings(before)
+        code, out = self.key_sh("move", FAKE_OTHER="1")  # (systemd opens something else: the proof fails)
+        self.assertNotEqual(code, 0)
+        self.assertIn("什么都没改", out)
+        self.assertEqual(self.read(), before)
+        self.assertFalse(os.path.exists(self.sstore) or os.path.exists(self.sstore + ".new"))
+        with open(self.unit, "w") as f:  # (a unit from before: it would not open kept secrets)
+            f.write("[Service]\nLoadCredentialEncrypted=predict_private_key\n")
+        code, out = self.key_sh("move")
+        self.assertNotEqual(code, 0)
+        self.assertIn("rt.sh update", out)
+        self.assertEqual(self.read(), before)
+        self.assertFalse(os.path.exists(self.sstore))
+        code, out = self.key_sh("put", "RULE_API_KEY_2", stdin="spare-key-123\n")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.read(), before)
+        self.assertFalse(os.path.exists(self.sstore))
 
     def test_a_failed_proof_changes_nothing(self) -> None:
         before = f"RULE_TAKER=on\nPREDICT_PRIVATE_KEY=0x{A}\n"
@@ -376,12 +496,17 @@ exec env PYTHONPATH={python} {sys.executable} -m ruletaker "$@"
         self.assertEqual(stat.S_IMODE(os.stat(self.env_file).st_mode), 0o640)
         with open(self.log) as f:
             self.assertIn("systemctl restart ruletaker", f.read())
-        # a setting not there yet: added at the end — a key's value never printed
+        # a secret: kept encrypted, never in the file — the plain ones still there taken in with it (none lost)
         code, out = self.key_sh("put", "RULE_API_KEY_2", stdin="spare-key-123\n")
         self.assertEqual(code, 0, out)
-        self.assertTrue(self.read().endswith("PREDICT_RATE_PER_MIN=220\nRULE_API_KEY_2=spare-key-123\n"), self.read())
-        self.assertNotIn("spare-key-123", out)
+        self.assertIn("✅ RULE_API_KEY_2 已加密保存在这台机器上", out)
+        self.assertEqual(self.secrets(), "PREDICT_API_KEY=k\nRULE_API_KEY_2=spare-key-123\n")
+        after = self.read()
+        self.assertNotIn("spare-key-123", after)
+        self.assertNotIn("PREDICT_API_KEY=k", after)
+        self.assertTrue(after.startswith("RULE_TAKER=paper\n" + SMARK) and "PREDICT_RATE_PER_MIN=220\n" in after, after)
         self.assertEqual(sorted(os.listdir(os.path.dirname(self.env_file))), ["ruletaker.env"])  # (no copy left behind)
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.sstore))), ["ruletaker_secrets"])
 
     def test_put_refuses_what_the_service_would_not_take_and_leaves_the_file(self) -> None:
         before = "RULE_TAKER=paper\nPREDICT_API_KEY=k\n"
@@ -429,9 +554,16 @@ class VmAuditTest(unittest.TestCase):
         os.mkdir(os.path.join(self.dir, "etc"))
         self.env_file = os.path.join(self.dir, "etc", "ruletaker.env")
         self.store = os.path.join(self.dir, "credstore.encrypted", "predict_private_key")
+        self.sstore = os.path.join(self.dir, "credstore.encrypted", "ruletaker_secrets")
 
     def tearDown(self) -> None:
         shutil.rmtree(self.dir, ignore_errors=True)
+
+    def keep_secrets(self, text: str) -> None:
+        os.makedirs(os.path.dirname(self.sstore), exist_ok=True)
+        subprocess.run([self.creds, "encrypt", "--name=ruletaker_secrets", "--with-key=host", "-", self.sstore],
+                       input=text.encode(), check=True)
+        os.chmod(self.sstore, 0o600)
 
     def keep(self, key: str) -> None:
         os.makedirs(os.path.dirname(self.store), exist_ok=True)
@@ -442,13 +574,38 @@ class VmAuditTest(unittest.TestCase):
     def audit(self, settings: str) -> str:
         with open(self.env_file, "w") as f:
             f.write(settings)
-        env = dict(os.environ, RT_ENV=self.env_file, RT_STORE=self.store, RT_CREDS=self.creds, RT_SEARCH=self.dir,
-                   RT_NO="systemctl journalctl sshd swapon ss")
+        env = dict(os.environ, RT_ENV=self.env_file, RT_STORE=self.store, RT_SSTORE=self.sstore, RT_CREDS=self.creds,
+                   RT_SEARCH=self.dir, RT_NO="systemctl journalctl sshd swapon ss")
         out = subprocess.run(["bash", AUDIT], capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL, timeout=60)
         text = out.stdout + out.stderr
-        for secret in (A, B):
-            self.assertNotIn(secret, text.lower())
+        for secret in (A, B, *SECRET_VALUES):
+            self.assertNotIn(secret.lower(), text.lower())
         return text
+
+    def test_the_other_secrets_kept_encrypted_and_nowhere_in_plain_text(self) -> None:
+        self.keep("0x" + A)
+        self.keep_secrets("PREDICT_API_KEY=api-key-0123456789\nSTATUS_KEY=status-key-abcdef\n")
+        out = self.audit(f"RULE_TAKER=on\n{SMARK}（…）：PREDICT_API_KEY STATUS_KEY\n")
+        self.assertIn("✅ Key、令牌加密保存在", out)
+        self.assertIn("：PREDICT_API_KEY STATUS_KEY", out)
+        self.assertIn("✅ 设置文件里没有明文的 Key、令牌", out)
+        self.assertIn("✅ 除了加密保存的那份，哪个文件里都没有 Key、令牌的明文", out)
+        # a plain copy somewhere: found and named
+        with open(os.path.join(self.dir, "notes.txt"), "w") as f:
+            f.write("备忘 api-key-0123456789\n")
+        out = self.audit("RULE_TAKER=on\n")
+        self.assertIn("⚠️ Key、令牌的明文还出现在这些文件里", out)
+        self.assertIn("notes.txt", out)
+        os.remove(os.path.join(self.dir, "notes.txt"))
+        # one left in the settings file in plain text: named (never its value)
+        out = self.audit("RULE_TAKER=on\nTELEGRAM_BOT_TOKEN=123456:telegram-token-abc\nSTATUS_KEY= \n")
+        self.assertIn("⚠️ 设置文件里还有明文的 Key、令牌：TELEGRAM_BOT_TOKEN——", out)
+        # kept ones this machine cannot open: said
+        with open(self.sstore, "w") as f:
+            f.write("bm90IGEga2V5")
+        out = self.audit("RULE_TAKER=on\n")
+        self.assertIn("加密保存的 Key、令牌", out)
+        self.assertIn("这台机器解不开它", out)
 
     def test_kept_encrypted_and_nowhere_in_plain_text(self) -> None:
         self.keep("0x" + A)

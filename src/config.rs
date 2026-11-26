@@ -66,12 +66,51 @@ pub fn load_env_file(path: &str, into: &mut Env) {
 /// the service's own in memory — $CREDENTIALS_DIRECTORY, read by its user only, gone when it stops.
 pub const KEY_CREDENTIAL: &str = "predict_private_key";
 
-/// What systemd handed the service: whether it runs with a credentials directory at all (the VM's unit gives it one), and the
-/// private key kept there ("" none). No Debug: never printed.
+/// The name the other secrets are kept under, encrypted on the VM beside the private key (deploy/gcp/vm-key.sh): KEY=VALUE lines
+/// of SECRET_SETTINGS, opened by systemd for the service the same way (LoadCredentialEncrypted=). The settings file there then
+/// holds none of them.
+pub const SECRETS_CREDENTIAL: &str = "ruletaker_secrets";
+
+/// The settings that are secrets, beside PREDICT_PRIVATE_KEY: on the VM kept encrypted (SECRETS_CREDENTIAL), never in the
+/// settings file. A value in the settings file still wins over the kept one (the next rt.sh edit / set / update keeps it instead).
+pub const SECRET_SETTINGS: [&str; 14] = [
+    "PREDICT_API_KEY",
+    "RULE_API_KEY",
+    "RULE_API_KEY_2",
+    "RULE_API_KEY_3",
+    "RULE_API_KEY_4",
+    "RULE_API_KEY_5",
+    "RULE_API_KEY_6",
+    "RULE_API_KEY_7",
+    "RULE_API_KEY_8",
+    "RULE_API_KEY_9",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_COMMAND_TOKEN",
+    "STATUS_KEY",
+    "BSC_RPC_URL",
+];
+
+/// The kept secrets' text (SECRETS_CREDENTIAL): NAME=VALUE lines, SECRET_SETTINGS' names alone (anything else left out), empty
+/// values left out.
+pub fn secrets_of(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = vec![];
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once('=') else { continue };
+        let (name, value) = (name.trim(), value.trim());
+        if SECRET_SETTINGS.contains(&name) && !value.is_empty() && !out.iter().any(|(n, _)| n == name) {
+            out.push((name.to_string(), value.to_string()));
+        }
+    }
+    out
+}
+
+/// What systemd handed the service: whether it runs with a credentials directory at all (the VM's unit gives it one), the
+/// private key kept there ("" none), and the other secrets kept there (SECRET_SETTINGS' names). No Debug: never printed.
 #[derive(Clone, Default)]
 pub struct Stored {
     pub store: bool,
     pub key: String,
+    pub secrets: Vec<(String, String)>,
 }
 
 impl Stored {
@@ -87,11 +126,18 @@ impl Stored {
             return Ok(Stored::default());
         };
         let path = std::path::Path::new(&dir).join(KEY_CREDENTIAL);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(Stored { store: true, key: text.trim().to_string() }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Stored { store: true, key: String::new() }),
-            Err(e) => Err(format!("读不到加密保存的私钥（{}：{e}）", path.display())),
-        }
+        let key = match std::fs::read_to_string(&path) {
+            Ok(text) => text.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("读不到加密保存的私钥（{}：{e}）", path.display())),
+        };
+        let path = std::path::Path::new(&dir).join(SECRETS_CREDENTIAL);
+        let secrets = match std::fs::read_to_string(&path) {
+            Ok(text) => secrets_of(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(e) => return Err(format!("读不到加密保存的设置（{}：{e}）", path.display())),
+        };
+        Ok(Stored { store: true, key, secrets })
     }
 }
 
@@ -277,6 +323,8 @@ pub struct Config {
     pub key_kept: &'static str,
     /// run with systemd's credentials directory (the VM's unit): the key could be kept encrypted here
     pub key_store: bool,
+    /// how many of the secrets (SECRET_SETTINGS) came from the encrypted store, not the settings file
+    pub secrets_kept: usize,
     pub account: String,
     pub chain_id: i64,
     pub rpc_url: String,
@@ -314,6 +362,7 @@ impl Default for Config {
             private_key: String::new(),
             key_kept: "",
             key_store: false,
+            secrets_kept: 0,
             account: String::new(),
             chain_id: 56,
             rpc_url: String::new(),
@@ -362,6 +411,22 @@ impl Config {
     /// PREDICT_PRIVATE_KEY is used only when none is kept; the same key in both is that key (its plain copy reported, to go);
     /// two different keys are refused — never one of them picked behind the user's back.
     pub fn load(e: &Env, stored: &Stored) -> Result<Config, String> {
+        // (the kept secrets fill in what the settings file does not set: a value there still wins)
+        let merged;
+        let mut secrets_kept = 0;
+        let e = if stored.secrets.is_empty() {
+            e
+        } else {
+            let mut m = e.clone();
+            for (name, value) in &stored.secrets {
+                if m.get(name).is_none_or(|v| v.trim().is_empty()) {
+                    m.insert(name.clone(), value.clone());
+                    secrets_kept += 1;
+                }
+            }
+            merged = m;
+            &merged
+        };
         let rules = RuleSettings::parse(e, None)?;
         clock::configure(
             Some(parse_dates(get(e, "CME_EARLY_DAYS", DEFAULT_CME_EARLY), "CME_EARLY_DAYS")?),
@@ -443,6 +508,7 @@ impl Config {
             private_key,
             key_kept,
             key_store: stored.store,
+            secrets_kept,
             account,
             chain_id: bounded(e, "PREDICT_CHAIN_ID", 56.0, 1.0, 1e9, true)? as i64,
             rpc_url: get(e, "BSC_RPC_URL", "").trim().trim_end_matches('/').to_string(),
@@ -480,7 +546,7 @@ impl Config {
         format!(
             "secrets configured: predict_api_key={} own_rule_key={} spare_api_keys={} predict_private_key={} predict_account={} \
              telegram_token={} telegram_command_token={} telegram_commands={} status_key={} mode={} trading_allowed={} \
-             private_key_kept={}",
+             secrets_kept={} private_key_kept={}",
             py_bool(!self.api_key.is_empty()),
             py_bool(self.own_key),
             self.api_spares.len(),
@@ -492,6 +558,7 @@ impl Config {
             py_bool(!self.status_key.is_empty()),
             self.rules.mode,
             py_bool(self.trading_allowed),
+            self.secrets_kept,
             if self.key_kept.is_empty() { "none" } else { self.key_kept }
         )
     }
@@ -574,7 +641,33 @@ mod key_tests {
 
     fn load(pairs: &[(&str, &str)], store: bool, key: &str) -> Result<Config, String> {
         let e: Env = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        Config::load(&e, &Stored { store, key: key.to_string() })
+        Config::load(&e, &Stored { store, key: key.to_string(), secrets: vec![] })
+    }
+
+    #[test]
+    fn the_secrets_kept_encrypted_fill_in_what_the_settings_file_does_not_set() {
+        let kept = "PREDICT_API_KEY=kept-api-key\nTELEGRAM_BOT_TOKEN=123:kept-token\nRULE_TAKER=on\nSTATUS_KEY=\nRULE_API_KEY_2=spare-two\n";
+        let stored = Stored { store: true, key: String::new(), secrets: secrets_of(kept) };
+        // (RULE_TAKER is no secret: never taken from what is kept; an empty value neither)
+        assert_eq!(stored.secrets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["PREDICT_API_KEY", "TELEGRAM_BOT_TOKEN", "RULE_API_KEY_2"]);
+        let e: Env = [("RULE_TAKER", "paper")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let c = Config::load(&e, &stored).unwrap();
+        assert_eq!(
+            (c.api_key.as_str(), c.telegram_token.as_str(), c.api_spares.clone(), c.secrets_kept, c.rules.mode.as_str()),
+            ("kept-api-key", "123:kept-token", vec!["spare-two".to_string()], 3, "paper")
+        );
+        assert!(c.secrets_line().contains("secrets_kept=3"), "{}", c.secrets_line());
+        // a value in the settings file wins (the next rt.sh edit / set / update keeps it instead); an empty one does not
+        let e: Env = [("RULE_TAKER", "paper"), ("PREDICT_API_KEY", "file-api-key"), ("TELEGRAM_BOT_TOKEN", " ")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let c = Config::load(&e, &stored).unwrap();
+        assert_eq!((c.api_key.as_str(), c.telegram_token.as_str(), c.secrets_kept), ("file-api-key", "123:kept-token", 2));
+        let shown = format!("{c:?} {c:#?}");
+        for secret in ["kept-api-key", "kept-token", "spare-two", "file-api-key"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
     }
 
     #[test]
@@ -620,10 +713,18 @@ mod key_tests {
         std::fs::write(dir.join(KEY_CREDENTIAL), format!("0x{A}\n")).unwrap();
         let s = Stored::from_dir(Some(dir.clone().into_os_string())).unwrap();
         assert_eq!(s.key, format!("0x{A}"));
+        std::fs::write(dir.join(SECRETS_CREDENTIAL), "STATUS_KEY=kept-status-key-1\n").unwrap();
+        let s = Stored::from_dir(Some(dir.clone().into_os_string())).unwrap();
+        assert_eq!(s.secrets, vec![("STATUS_KEY".to_string(), "kept-status-key-1".to_string())]);
         std::fs::remove_file(dir.join(KEY_CREDENTIAL)).unwrap();
         std::fs::create_dir(dir.join(KEY_CREDENTIAL)).unwrap();
         let e = Stored::from_dir(Some(dir.clone().into_os_string())).err().expect("an unreadable key is an error");
         assert!(e.contains("读不到加密保存的私钥"), "{e}");
+        std::fs::remove_dir(dir.join(KEY_CREDENTIAL)).unwrap();
+        std::fs::remove_file(dir.join(SECRETS_CREDENTIAL)).unwrap();
+        std::fs::create_dir(dir.join(SECRETS_CREDENTIAL)).unwrap();
+        let e = Stored::from_dir(Some(dir.clone().into_os_string())).err().expect("unreadable secrets are an error");
+        assert!(e.contains("读不到加密保存的设置"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

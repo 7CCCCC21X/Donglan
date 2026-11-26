@@ -471,8 +471,13 @@ async def key_command(env: dict, from_stdin: bool) -> int:
               "❌ 没有私钥" + ("（标准输入是空的）" if from_stdin else "（这台机器上没有加密保存的私钥）"), file=sys.stderr)
         return 2
 
+    try:  # (BSC_RPC_URL may be kept encrypted with the other secrets: filled in from there when the settings file has none)
+        kept = dict(Stored.from_systemd().secrets)
+    except ValueError:
+        kept = {}
+
     def setting(name: str) -> str:
-        return str(env.get(name, "")).strip()
+        return str(env.get(name, "")).strip() or kept.get(name, "")
     try:
         chain_id = int(setting("PREDICT_CHAIN_ID") or 56)
     except ValueError:

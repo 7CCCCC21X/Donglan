@@ -153,7 +153,7 @@ bash deploy/gcp/rt.sh status    # 状态，就是 huice 的 /rules
 bash deploy/gcp/rt.sh env
 ```
 
-4. 部署完把 Cloud Shell 里的 `ruletaker.env` 删掉（里面有私钥，脚本也会提醒）：`shred -u ruletaker.env`。虚拟机上，私钥已经自动从设置文件收走、加密保存（见“[私钥加密保存](#私钥加密保存)”）。以后改设置用 `bash deploy/gcp/rt.sh edit`，换私钥用 `bash deploy/gcp/rt.sh key`；规则价格、份数这些直接在网页控制台里改更方便。
+4. 部署完把 Cloud Shell 里的 `ruletaker.env` 删掉（里面有私钥、API Key 和令牌，脚本也会提醒）：`shred -u ruletaker.env`。虚拟机上，私钥、API Key、Telegram 令牌、控制台密码已经自动从设置文件收走、加密保存（见“[私钥加密保存](#私钥加密保存)”）。以后改设置用 `bash deploy/gcp/rt.sh edit`，换私钥用 `bash deploy/gcp/rt.sh key`；规则价格、份数这些直接在网页控制台里改更方便。
 5. 运行一次安全加固：`bash deploy/gcp/rt.sh lockdown`（见“[安全](#安全)”）。
 
 ### 费用
@@ -180,7 +180,7 @@ bash deploy/gcp/rt.sh env
 | `bash deploy/gcp/rt.sh update` | 代码更新后：`git pull` 再运行它，重新上传、跑测试、重启（设置不动） |
 | `bash deploy/gcp/rt.sh env` | 上传改好的 `ruletaker.env` 并重启 |
 | `bash deploy/gcp/rt.sh edit` | 直接在虚拟机上改设置文件（nano，`Ctrl+O` 回车保存、`Ctrl+X` 退出），检查无误才重启——私钥不用留在 Cloud Shell。设置文件里**看不到私钥**（加密保存着）；照老习惯贴进去一行 `PREDICT_PRIVATE_KEY=…`，保存后也会被收进加密保存、从文件里删掉 |
-| `bash deploy/gcp/rt.sh set 设置名 值` | **改一项设置，不用编辑器**（手机上也能用）：例 `rt.sh set RULE_WS_CONNECTIONS 3`。同名的行全部换掉（服务只认第一行），没有就加在最后；检查无误才重启，服务不认的值把设置文件恢复原样、照旧运行。不写值就隐藏输入，填 Key 用：`rt.sh set RULE_API_KEY_2`。值里不能有空格、引号、`#`；私钥不行（用 `rt.sh key`） |
+| `bash deploy/gcp/rt.sh set 设置名 值` | **改一项设置，不用编辑器**（手机上也能用）：例 `rt.sh set RULE_WS_CONNECTIONS 3`。同名的行全部换掉（服务只认第一行），没有就加在最后；检查无误才重启，服务不认的值把设置文件恢复原样、照旧运行。不写值就隐藏输入，填 Key 用：`rt.sh set RULE_API_KEY_2`——API Key、Telegram 令牌、`STATUS_KEY`、`BSC_RPC_URL` 直接加密保存，不进设置文件，值留空就删掉。值里不能有空格、引号、`#`；私钥不行（用 `rt.sh key`） |
 | `bash deploy/gcp/rt.sh key` | **换私钥**：在 Cloud Shell 里粘贴（屏幕不显示、不进命令历史），先在链上核对它是不是 `PREDICT_ACCOUNT` 的控制钥匙，对了才在虚拟机上加密保存、重启服务；不对什么都不改 |
 | `bash deploy/gcp/rt.sh audit` | 私钥安全体检（只读）：私钥是不是加密保存、明文还在不在任何文件里、权限、日志、加固、谁能登录（私钥本身不会显示） |
 | `bash deploy/gcp/rt.sh restart` / `stop` / `start` | 重启 / 停止 / 启动服务 |
@@ -463,9 +463,16 @@ shred -u ruletaker.env
 3. 设置文件里所有写着私钥的行（包括注释掉的旧行）删掉，换成一句说明；文件原来的内容被覆盖，不是只改个名字。
 4. 服务启动时，systemd 替它解开，放进只属于这个服务的内存目录；程序从那里读，不经过设置文件、环境变量和命令行。
 
+**API Key、Telegram 令牌、控制台密码也一样加密**：`PREDICT_API_KEY`、`RULE_API_KEY`、`RULE_API_KEY_2`～`_9`、`TELEGRAM_BOT_TOKEN`、`TELEGRAM_COMMAND_TOKEN`、`STATUS_KEY`、`BSC_RPC_URL`（地址里常带着节点服务的 Key）同样被收走，一起封进 `/etc/credstore.encrypted/ruletaker_secrets`（同样的本机密钥 + 虚拟 TPM，同样先让 systemd 按服务的方式解开、逐字节对上了才动设置文件），设置文件里只剩一句说明，写着哪些名字加密保存了。服务启动时 systemd 一并解开交给它；设置文件里写了同名的值时，设置文件的优先（下次 `rt.sh edit` / `set` / `update` 就把它收进去）。
+
+- 改其中一项：`bash deploy/gcp/rt.sh set RULE_API_KEY_2`（隐藏输入），直接改加密保存里的那一份，不进设置文件；值留空回车就是删掉。服务不认这个值（比如 `STATUS_HOST` 不是本机时 `STATUS_KEY` 不到 12 位）就把加密保存和设置文件都恢复原样、不重启。
+- `rt.sh edit` 打开的设置文件里看不到这些值；照老习惯贴进去也行，保存后一样被收走。
+- `rt.sh audit` 列出哪些加密保存了、设置文件里还有没有明文、别的文件和系统日志里有没有它们的明文副本、服务进程的环境变量里有没有（只说有没有、在哪，从不显示值）。
+- `rt.sh status` / `pause` 这些命令要用的 `STATUS_KEY`，`rt.sh probe` 要用的 API Key，都在虚拟机上由 root 当场解开用，不落盘、不进命令行。
+
 **换私钥**：`bash deploy/gcp/rt.sh key`，在 Cloud Shell 里粘贴（不显示、不进命令历史、不写进任何文件），经 SSH 通道传过去；先在链上核对它是不是 `PREDICT_ACCOUNT` 的控制钥匙，对了才加密保存、删掉设置文件里的旧私钥、重启服务。照老习惯用 `rt.sh edit` 把私钥贴进设置文件也行，保存后一样会被收进加密保存。Telegram `/check`、`rt.sh check` 会写“私钥：加密保存在这台机器上”；还在设置文件里是明文的话写 ⚠️ 并告诉你怎么改。
 
-**它防住的**：截图、录屏、旁人看到屏幕（`rt.sh edit` 打开的文件里没有私钥）；设置文件被复制、备份、误发出去；磁盘快照或磁盘被拷到别的机器上（用上了 TPM 时，没有这台机器的 TPM 解不开；用的是哪种，`rt.sh update` 和 `rt.sh audit` 都会写）。
+**它防住的**：截图、录屏、旁人看到屏幕（`rt.sh edit` 打开的文件里没有私钥，也没有 API Key、令牌）；设置文件被复制、备份、误发出去；磁盘快照或磁盘被拷到别的机器上（用上了 TPM 时，没有这台机器的 TPM 解不开；用的是哪种，`rt.sh update` 和 `rt.sh audit` 都会写）。
 
 **它防不住的**（实话）：已经拿到这台机器 root 的人。服务要自己下单，就得在运行时用到私钥，root 能做服务能做的一切。所以真正的锁仍然是你的 Google 账号（见下面“需要你自己做的”），以及钱包里只放够用的钱。
 

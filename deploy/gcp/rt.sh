@@ -10,10 +10,11 @@
 #   bash deploy/gcp/rt.sh env [文件]      上传新的设置文件（默认 ./ruletaker.env）并重启
 #   bash deploy/gcp/rt.sh edit            直接在虚拟机上改设置文件（nano），检查无误才重启——私钥不用再留在 Cloud Shell
 #   bash deploy/gcp/rt.sh set 名 [值]     改一项设置，不用编辑器（手机上也能用）：例 rt.sh set RULE_WS_CONNECTIONS 3；不写值就
-#                                         隐藏输入（填 Key 用）。检查无误才重启，不认的值把设置文件恢复原样
+#                                         隐藏输入（填 Key 用）。检查无误才重启，不认的值把设置恢复原样。Key、令牌（API Key、
+#                                         Telegram 令牌、STATUS_KEY、BSC_RPC_URL）直接加密保存，不进设置文件；值留空就删掉
 #   bash deploy/gcp/rt.sh key             换私钥：在这里粘贴（不显示），先核对它是不是 PREDICT_ACCOUNT 的控制钥匙，对了才在虚拟机上
 #                                         加密保存、重启服务（私钥不在设置文件里：update / env / edit 会把设置文件里的明文自动收走）
-#   bash deploy/gcp/rt.sh audit           私钥安全体检（只读）：私钥只在该在的地方、权限、加固、谁能登录
+#   bash deploy/gcp/rt.sh audit           安全体检（只读）：私钥、Key、令牌只在该在的地方（加密保存）、权限、加固、谁能登录
 #   bash deploy/gcp/rt.sh console         打开网页控制台和复盘页（通过 Cloud Shell 的“网页预览”，不开公网端口）
 #   bash deploy/gcp/rt.sh status          看状态（就是 huice 的 /rules）
 #   bash deploy/gcp/rt.sh logs            看实时日志（Ctrl+C 退出）
@@ -143,10 +144,18 @@ setup() {
 RUN_ON_VM='if [ "$(cat /opt/ruletaker/IMPL 2>/dev/null || echo rust)" = python ]; then echo "env PYTHONPATH=/opt/ruletaker/python /opt/ruletaker/python/venv/bin/python -m ruletaker"; else echo /opt/ruletaker/bin/ruletaker; fi'
 
 
-remind_env() {  # the settings file left in this shell holds the private key: said once it is on the VM
-  if [ -n "${ENV_UPLOADED:-}" ] && [ -f "$ENV_UPLOADED" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?PREDICT_PRIVATE_KEY[[:space:]]*=[[:space:]]*["'"'"']?(0x)?[0-9a-fA-F]{64}' "$ENV_UPLOADED"; then
-    echo "提醒：$ENV_UPLOADED 还留在这里（里面有私钥）。虚拟机上已经加密保存了一份，删掉这里的：shred -u \"$ENV_UPLOADED\""
-    echo "      以后改设置直接在虚拟机上改：bash deploy/gcp/rt.sh edit；换私钥：bash deploy/gcp/rt.sh key（都不用在这里放私钥）"
+remind_env() {  # the settings file left in this shell holds the private key or another secret: said once it is on the VM
+  [ -n "${ENV_UPLOADED:-}" ] && [ -f "$ENV_UPLOADED" ] || return 0
+  local what=""
+  if grep -qE '^[[:space:]]*(export[[:space:]]+)?PREDICT_PRIVATE_KEY[[:space:]]*=[[:space:]]*["'"'"']?(0x)?[0-9a-fA-F]{64}' "$ENV_UPLOADED"; then
+    what="私钥"
+  fi
+  if grep -qE '^[[:space:]]*(export[[:space:]]+)?(PREDICT_API_KEY|RULE_API_KEY(_[2-9])?|TELEGRAM_BOT_TOKEN|TELEGRAM_COMMAND_TOKEN|STATUS_KEY|BSC_RPC_URL)[[:space:]]*=[[:space:]]*[^[:space:]#]' "$ENV_UPLOADED"; then
+    what="${what:+$what、}API Key / 令牌"
+  fi
+  if [ -n "$what" ]; then
+    echo "提醒：$ENV_UPLOADED 还留在这里（里面有${what}）。虚拟机上已经加密保存了一份，删掉这里的：shred -u \"$ENV_UPLOADED\""
+    echo "      以后改设置直接在虚拟机上改：bash deploy/gcp/rt.sh edit 或 rt.sh set 名字；换私钥：bash deploy/gcp/rt.sh key（都不用在这里放）"
   fi
 }
 
@@ -267,8 +276,9 @@ case "$cmd" in
     ;;
   edit)
     # The settings file edited where it lives (root's, on the VM): the key need not be kept in Cloud Shell to change a setting.
-    # Afterwards (vm-key.sh apply): a key pasted into it kept encrypted and taken out again, the settings checked the way the
-    # service reads them, and only then the restart — a setting that does not parse leaves the running service as it is.
+    # Afterwards (vm-key.sh apply): a key — or an API key, a token — pasted into it kept encrypted and taken out again, the
+    # settings checked the way the service reads them, and only then the restart — a setting that does not parse leaves the
+    # running service as it is.
     # (A VM still on the version before: checked and restarted as before.)
     ssh_to "$VM" "$ZONE" --command "sudo nano /etc/ruletaker/ruletaker.env; \
       if [ -f /opt/ruletaker/deploy/gcp/vm-key.sh ]; then sudo bash /opt/ruletaker/deploy/gcp/vm-key.sh apply; \
@@ -287,6 +297,11 @@ case "$cmd" in
     [ "$name" != PREDICT_PRIVATE_KEY ] || die "私钥用 bash deploy/gcp/rt.sh key 换（会加密保存，不放进设置文件）"
     vm_has "grep -q '^  put)' /opt/ruletaker/deploy/gcp/vm-key.sh" \
       || die "虚拟机上的版本还没有这个命令：先运行 bash deploy/gcp/rt.sh update"
+    if [[ "$name" =~ ^(PREDICT_API_KEY|RULE_API_KEY(_[2-9])?|TELEGRAM_BOT_TOKEN|TELEGRAM_COMMAND_TOKEN|STATUS_KEY|BSC_RPC_URL)$ ]]; then
+      # (a secret: kept encrypted on the VM — never written into the settings file there by an older version)
+      vm_has "grep -q ruletaker_secrets /opt/ruletaker/deploy/gcp/vm-key.sh" \
+        || die "虚拟机上的版本还不会加密保存 $name：先运行 bash deploy/gcp/rt.sh update，再设它（什么都没改）"
+    fi
     if [ $# -ge 2 ]; then
       value="$2"
     else
