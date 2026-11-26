@@ -1,0 +1,15 @@
+[Unit]
+Description=Rule taker: this machine's own firewall, beside Google Cloud's (rt.sh lockdown; deploy/gcp/vm-firewall.sh)
+Documentation=file:///opt/ruletaker/deploy/gcp/ruletaker-firewall.nft
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/ruletaker/firewall.nft
+ExecStop=-/usr/sbin/nft delete table inet ruletaker_guard
+
+[Install]
+WantedBy=multi-user.target

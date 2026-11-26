@@ -1,0 +1,20 @@
+#!/usr/sbin/nft -f
+# 规则吃单这台机器自己的防火墙（rt.sh lockdown 装上，rt.sh unlock 拿掉；deploy/gcp/vm-firewall.sh 管它）：Google Cloud 防火墙
+# 之外的第二道——就算项目的防火墙规则被删了、改了，进来的连接也只放行 Google IAP 通道来的 SSH。这台机器自己连出去的
+# （Predict、币安、Telegram、链上节点、Google 的元数据服务器）的回包照常进来；出去的连接不管。
+#
+# (The first two lines make the file safe to load again: the table made if missing, emptied, then made afresh.)
+table inet ruletaker_guard
+delete table inet ruletaker_guard
+table inet ruletaker_guard {
+  chain input {
+    type filter hook input priority filter; policy drop;
+    iif "lo" accept comment "the machine itself (the console on 127.0.0.1)"
+    ct state established,related accept comment "answers to what this machine asked for"
+    ct state invalid drop
+    ip saddr 35.235.240.0/20 tcp dport 22 accept comment "SSH through Google's IAP tunnel (a Google login checked first)"
+    udp sport 67 udp dport 68 accept comment "DHCP: the address lease from Google's metadata server"
+    icmp type { destination-unreachable, time-exceeded, parameter-problem } accept comment "path MTU and errors"
+    meta l4proto ipv6-icmp accept comment "IPv6 neighbour discovery and path MTU"
+  }
+}

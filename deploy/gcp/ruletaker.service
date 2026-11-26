@@ -44,6 +44,25 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 ReadWritePaths=/var/lib/ruletaker
+# No privilege of any kind (it runs as its own user and needs none; Nice= above is set by systemd before it starts), none to be
+# had; nothing of the kernel's it may touch — its logs, its clock, the host name, other users' processes (/proc shows its own
+# alone); no namespaces, realtime scheduling, SysV IPC, foreign system-call ABIs; no memory both written and run (no code
+# made at run time: the Rust binary has none — the Python version's drop-in allows it, for its libraries' callbacks); the
+# network families it uses alone. All of it checked offline by systemd-analyze security, and on the VM by the service
+# starting under it (vm-setup.sh puts the unit before back should it not).
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

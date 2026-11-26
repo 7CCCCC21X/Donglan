@@ -2,7 +2,8 @@
 # 规则吃单 · Google Cloud 部署和日常操作（在 Google Cloud Shell 里、仓库根目录下运行）
 #
 #   bash deploy/gcp/rt.sh deploy          第一次：在东京建一台虚拟机（asia-northeast1），装好、启动
-#   bash deploy/gcp/rt.sh lockdown        安全加固：封掉这台机器所有对外的入站连接，SSH 只能走 Google 的 IAP 通道（要 Google 登录）
+#   bash deploy/gcp/rt.sh lockdown        安全加固：封掉这台机器所有对外的入站连接，SSH 只能走 Google 的 IAP 通道（要 Google 登录）；
+#                                         Google Cloud 防火墙之外再加一道机器自己的防火墙（先验证能登录才保留，否则 3 分钟自动撤销）
 #   bash deploy/gcp/rt.sh unlock          解除上面的加固
 #   bash deploy/gcp/rt.sh nosa            去掉虚拟机的服务账号（早期部署的机器带着项目默认的；要停机约 1 分钟，会先问）
 #   bash deploy/gcp/rt.sh update          代码更新后：重新上传代码、编译、跑测试、重启（设置不动）
@@ -214,13 +215,13 @@ case "$cmd" in
     gcloud compute instances describe "$VM" "${G[@]}" "${Z[@]}" >/dev/null 2>&1 || die "还没有虚拟机 $VM：先 bash deploy/gcp/rt.sh deploy"
     net="$(gcloud compute instances describe "$VM" "${G[@]}" "${Z[@]}" --format='value(networkInterfaces[0].network.basename())' 2>/dev/null || true)"
     net="${net:-default}"
-    echo "1/4 允许 Google 的 IAP 通道连这台机器的 SSH（网络 $net）…"
+    echo "1/5 允许 Google 的 IAP 通道连这台机器的 SSH（网络 $net）…"
     gcloud services enable iap.googleapis.com "${G[@]}" >/dev/null 2>&1 || true
     gcloud compute firewall-rules describe "$RULE_IAP" "${G[@]}" >/dev/null 2>&1 || \
       gcloud compute firewall-rules create "$RULE_IAP" "${G[@]}" --network "$net" --direction INGRESS --action ALLOW --rules tcp:22 \
         --source-ranges "$IAP_RANGE" --target-tags "$TAG" --priority 900 --description "ruletaker: SSH through the IAP tunnel only" >/dev/null
     gcloud compute instances add-tags "$VM" "${G[@]}" "${Z[@]}" --tags "$TAG" >/dev/null
-    echo "2/4 试一下通过 IAP 通道能不能登录（还没封任何东西）…"
+    echo "2/5 试一下通过 IAP 通道能不能登录（还没封任何东西）…"
     tunnel_ok() {
       for _ in 1 2 3 4 5 6 7 8; do
         if gcloud compute ssh "$VM" "${G[@]}" "${Z[@]}" --quiet --tunnel-through-iap --command true >/dev/null 2>&1; then
@@ -231,14 +232,31 @@ case "$cmd" in
       return 1
     }
     tunnel_ok || die "通过 IAP 通道登录不了，所以什么都没有封（现在和加固前一样）。常见原因：账号不是项目所有者（要有 IAP-secured Tunnel User 角色），或 IAP API 没启用。手动试：gcloud compute ssh $VM --zone $ZONE --tunnel-through-iap"
-    echo "3/4 封掉其他所有入站连接…"
+    echo "3/5 封掉其他所有入站连接…"
     gcloud compute firewall-rules describe "$RULE_DENY" "${G[@]}" >/dev/null 2>&1 || \
       gcloud compute firewall-rules create "$RULE_DENY" "${G[@]}" --network "$net" --direction INGRESS --action DENY --rules all \
         --source-ranges 0.0.0.0/0 --target-tags "$TAG" --priority 1000 --description "ruletaker: nothing else gets in from outside" >/dev/null
-    echo "4/4 封好之后再登录一次确认…"
+    echo "4/5 封好之后再登录一次确认…"
     if ! tunnel_ok; then
       gcloud compute firewall-rules delete "$RULE_DENY" "${G[@]}" --quiet >/dev/null 2>&1 || true
       die "封好之后通过 IAP 登录不了，已经把刚才那条封锁规则撤掉（现在和加固前一样）"
+    fi
+    # The second layer: this machine's own firewall (vm-firewall.sh), the same door — so a firewall rule of the project's
+    # deleted or changed later leaves the machine as shut. Put on with its own undo already set (3 minutes), kept only once a
+    # fresh login through the tunnel proves it opens: nobody is locked out, whatever goes wrong.
+    echo "5/5 机器自己的防火墙（第二道：就算项目的防火墙规则被删了，机器也只放行 IAP 通道的 SSH）…"
+    if vm_has "test -f /opt/ruletaker/deploy/gcp/vm-firewall.sh"; then
+      if remote "sudo bash /opt/ruletaker/deploy/gcp/vm-firewall.sh arm"; then
+        if tunnel_ok; then
+          remote "sudo bash /opt/ruletaker/deploy/gcp/vm-firewall.sh confirm" || echo "（机器防火墙没确认上：3 分钟内自动撤销，Google Cloud 那层照旧）"
+        else
+          echo "⚠️ 加上机器防火墙后通过 IAP 登录不了：它 3 分钟内会自动撤销（什么都不用做），Google Cloud 那层照旧"
+        fi
+      else
+        echo "（机器防火墙没加，原因见上；Google Cloud 那层照旧）"
+      fi
+    else
+      echo "（虚拟机上的版本还没有机器防火墙：先 bash deploy/gcp/rt.sh update，再运行一次 bash deploy/gcp/rt.sh lockdown）"
     fi
     echo "✅ 加固完成：这台机器不再接受任何来自公网的连接；rt.sh 的所有命令从现在起自动走 IAP 通道（会慢一两秒）。"
     echo "   解除：bash deploy/gcp/rt.sh unlock"
@@ -267,6 +285,10 @@ case "$cmd" in
     if [ "$changed" = 1 ]; then echo "✅ 服务账号已去掉：进了这台机器也拿不到操作项目的令牌"; else die "服务账号没去掉（上面有 gcloud 的报错），机器已重新启动"; fi
     ;;
   unlock)
+    # the machine's own firewall first, while the tunnel still opens (afterwards SSH comes from anywhere, which it would refuse)
+    if [ ${#IAP[@]} -gt 0 ] && vm_has "test -f /opt/ruletaker/deploy/gcp/vm-firewall.sh"; then
+      remote "sudo bash /opt/ruletaker/deploy/gcp/vm-firewall.sh remove" || die "机器自己的防火墙没拿掉（原因见上），所以什么都没解除"
+    fi
     gcloud compute firewall-rules delete "$RULE_DENY" "${G[@]}" --quiet 2>/dev/null || echo "（本来就没有封锁规则）"
     echo "已解除加固：SSH 端口恢复成 Google Cloud 默认的对外可连（仍然只认密钥、不认密码）。再加固：bash deploy/gcp/rt.sh lockdown"
     ;;

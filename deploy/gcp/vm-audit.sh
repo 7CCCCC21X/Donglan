@@ -202,6 +202,37 @@ fi
 if have systemctl; then
   if systemctl is-enabled unattended-upgrades >/dev/null 2>&1; then ok "自动安装安全更新：开着"; else warn "自动安全更新没开"; fi
 fi
+# The machine's own hardening (vm-harden.sh, vm-firewall.sh): what is in force
+if [ -f "${RT_SYSCTL_CONF:-/etc/sysctl.d/90-ruletaker.conf}" ]; then
+  ok "内核加固在（别的用户看不到内核地址和日志、进程间不能互相读内存、不接受 ICMP 重定向）"
+else
+  warn "没有内核加固：bash deploy/gcp/rt.sh update 会装上"
+fi
+if [ -f "${RT_SSHD_CONF:-/etc/ssh/sshd_config.d/01-ruletaker.conf}" ]; then
+  ok "SSH 加固在（只认密钥、root 不能登录、只留本地端口转发）"
+else
+  warn "没有 SSH 加固：bash deploy/gcp/rt.sh update 会装上"
+fi
+if have nft && nft list table inet ruletaker_guard >/dev/null 2>&1; then
+  if have systemctl && systemctl is-enabled ruletaker-firewall.service >/dev/null 2>&1; then
+    ok "机器防火墙（第二道）在：进来的连接只放行 Google IAP 通道的 SSH，重启后照样有效"
+  else
+    warn "机器防火墙加上了还没确认（3 分钟内会自动撤销）：再运行一次 bash deploy/gcp/rt.sh lockdown"
+  fi
+elif have nft; then
+  warn "没有机器防火墙（只有 Google Cloud 那一道）：bash deploy/gcp/rt.sh lockdown 会加上"
+fi
+if have systemd-analyze; then
+  score="$(systemd-analyze security --no-pager ruletaker.service 2>/dev/null | tail -1 | sed -E 's/.*: //')"
+  [ -z "$score" ] || echo "服务的沙箱评分（systemd-analyze security，越低越好，10 最差）：$score"
+fi
+if [ -f /etc/systemd/system/ruletaker.service.d/relaxed.conf ]; then
+  warn "服务在完整沙箱下起不来，现在少了几项限制在跑（relaxed.conf）：把 sudo journalctl -u ruletaker -n 30 发给开发者"
+fi
+if have ss; then
+  outside="$(ss -Hltnu 2>/dev/null | awk '{print $5}' | grep -vE '^(127\.[0-9.]+|\[::1\]|localhost|\[::ffff:127\.[0-9.]+\]|0\.0\.0\.0%lo|::1):' | sort -u | paste -sd ' ' -)"
+  echo "这台机器对外监听的端口：${outside:-没有}（应该只有 SSH 的 22）"
+fi
 admins="$(getent group google-sudoers 2>/dev/null | cut -d: -f4)"
 [ -n "$admins" ] || admins="$(getent group sudo 2>/dev/null | cut -d: -f4)"
 echo "能用 sudo 的账号（它们都读得到私钥，应该只有你自己）：${admins:-（没有）}"

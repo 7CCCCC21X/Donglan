@@ -575,7 +575,8 @@ class VmAuditTest(unittest.TestCase):
         with open(self.env_file, "w") as f:
             f.write(settings)
         env = dict(os.environ, RT_ENV=self.env_file, RT_STORE=self.store, RT_SSTORE=self.sstore, RT_CREDS=self.creds,
-                   RT_SEARCH=self.dir, RT_NO="systemctl journalctl sshd swapon ss")
+                   RT_SEARCH=self.dir, RT_NO="systemctl journalctl sshd swapon ss nft systemd-analyze",
+                   RT_SYSCTL_CONF=os.path.join(self.dir, "no-sysctl"), RT_SSHD_CONF=os.path.join(self.dir, "no-sshd"))
         out = subprocess.run(["bash", AUDIT], capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL, timeout=60)
         text = out.stdout + out.stderr
         for secret in (A, B, *SECRET_VALUES):
@@ -637,6 +638,176 @@ class VmAuditTest(unittest.TestCase):
         out = self.audit("RULE_TAKER=on\n")
         self.assertIn("这台机器解不开它", out)
         self.assertIn("rt.sh key", out)
+
+
+HARDEN = os.path.join(ROOT, "deploy", "gcp", "vm-harden.sh")
+FIREWALL = os.path.join(ROOT, "deploy", "gcp", "vm-firewall.sh")
+FAKE_TOOL = """#!/usr/bin/env bash
+echo "$(basename "$0") $*" >> "$FAKE_LOG"
+case "$(basename "$0") $1" in
+  "sshd -t") [ -n "${FAKE_SSHD_BAD:-}" ] && [ -f "$FAKE_DIR/sshd/01-ruletaker.conf" ] && { echo "Bad configuration option: X"; exit 1; } ;;
+  "systemctl is-enabled") [ -f "$FAKE_DIR/enabled" ] || exit 1 ;;
+  "systemctl enable") touch "$FAKE_DIR/enabled" ;;
+  "systemctl disable") rm -f "$FAKE_DIR/enabled" ;;
+  "systemd-run "*) [ -z "${FAKE_RUN_BAD:-}" ] || exit 1 ;;
+  "nft -c") [ -z "${FAKE_NFT_BAD:-}" ] || { echo "Error: syntax error"; exit 1; } ;;
+  "nft -f") touch "$FAKE_DIR/loaded" ;;
+  "nft list") [ -f "$FAKE_DIR/loaded" ] || exit 1 ;;
+  "nft delete") rm -f "$FAKE_DIR/loaded" ;;
+esac
+exit 0
+"""
+
+
+@unittest.skipUnless(TOOLS and os.path.isfile(HARDEN), "no bash, or no deploy folder")
+class VmHardenTest(unittest.TestCase):
+    """deploy/gcp/vm-harden.sh: its own kernel and SSH files, each checked before it is used; an SSH file sshd will not take
+    is taken out again (nobody locked out); a second run changes nothing."""
+
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.log = os.path.join(self.dir, "log")
+        open(self.log, "w").close()
+        self.bin = os.path.join(self.dir, "bin")
+        os.mkdir(self.bin)
+        for tool in ("sysctl", "sshd", "systemctl"):
+            VmKeyTest.tool(self.bin, tool, FAKE_TOOL)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def harden(self, *words: str, **extra: str) -> tuple[int, str]:
+        env = dict(os.environ, RT_SYSCTL_D=os.path.join(self.dir, "sysctl"), RT_SSHD_D=os.path.join(self.dir, "sshd"),
+                   RT_SYSCTL=os.path.join(self.bin, "sysctl"), RT_SSHD=os.path.join(self.bin, "sshd"),
+                   RT_SYSTEMCTL=os.path.join(self.bin, "systemctl"), FAKE_LOG=self.log, FAKE_DIR=self.dir, **extra)
+        out = subprocess.run(["bash", HARDEN, *words], capture_output=True, text=True, env=env, timeout=60, check=False)
+        return out.returncode, out.stdout + out.stderr
+
+    def logged(self) -> str:
+        with open(self.log) as f:
+            return f.read()
+
+    def test_kernel_and_ssh_hardened_each_checked_and_a_second_run_changes_nothing(self) -> None:
+        code, out = self.harden()
+        self.assertEqual(code, 0, out)
+        self.assertIn("✅ 内核加固", out)
+        self.assertIn("✅ SSH 加固", out)
+        with open(os.path.join(self.dir, "sysctl", "90-ruletaker.conf")) as f:
+            kernel = f.read()
+        for line in ("kernel.kptr_restrict = 2", "kernel.yama.ptrace_scope = 2", "net.ipv4.conf.all.accept_redirects = 0"):
+            self.assertIn(line, kernel)
+        with open(os.path.join(self.dir, "sshd", "01-ruletaker.conf")) as f:
+            ssh = f.read()
+        for line in ("PasswordAuthentication no", "PermitRootLogin no", "AllowTcpForwarding local", "X11Forwarding no"):
+            self.assertIn(line, ssh)
+        log = self.logged()
+        self.assertIn("sysctl -q -e -p", log)
+        self.assertLess(log.index("sshd -t"), log.index("systemctl reload ssh"))  # (checked before sshd takes it)
+        open(self.log, "w").close()
+        code, out = self.harden()
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("reload", self.logged())  # (the same files: sshd not asked to read them again)
+
+    def test_an_ssh_file_sshd_will_not_take_is_taken_out(self) -> None:
+        code, out = self.harden(FAKE_SSHD_BAD="1")
+        self.assertEqual(code, 0, out)
+        self.assertIn("这台机器的 sshd 不认它", out)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "sshd", "01-ruletaker.conf")))
+        self.assertNotIn("reload", self.logged())
+        self.assertIn("✅ 内核加固", out)  # (the rest done all the same)
+
+
+@unittest.skipUnless(TOOLS and os.path.isfile(FIREWALL), "no bash, or no deploy folder")
+class VmFirewallTest(unittest.TestCase):
+    """deploy/gcp/vm-firewall.sh: the ruleset checked, its undo set before it is loaded (nobody locked out), kept across reboots
+    only once confirmed, taken off whole."""
+
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.log = os.path.join(self.dir, "log")
+        open(self.log, "w").close()
+        for tool in ("nft", "systemctl", "systemd-run"):
+            VmKeyTest.tool(self.dir, tool, FAKE_TOOL)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def fw(self, *words: str, **extra: str) -> tuple[int, str]:
+        env = dict(os.environ, RT_NFT=os.path.join(self.dir, "nft"), RT_SYSTEMCTL=os.path.join(self.dir, "systemctl"),
+                   RT_SYSTEMD_RUN=os.path.join(self.dir, "systemd-run"), RT_FW_DIR=os.path.join(self.dir, "etc"),
+                   RT_UNIT_DIR=os.path.join(self.dir, "units"), RT_SRC=os.path.join(ROOT, "deploy", "gcp"), FAKE_LOG=self.log,
+                   FAKE_DIR=self.dir, **extra)
+        os.makedirs(os.path.join(self.dir, "units"), exist_ok=True)
+        out = subprocess.run(["bash", FIREWALL, *words], capture_output=True, text=True, env=env, timeout=60, check=False)
+        return out.returncode, out.stdout + out.stderr
+
+    def logged(self) -> str:
+        with open(self.log) as f:
+            return f.read()
+
+    def test_armed_with_its_undo_first_then_confirmed_then_removed(self) -> None:
+        self.assertEqual(self.fw("status")[1].strip(), "off")
+        code, out = self.fw("arm")
+        self.assertEqual(code, 0, out)
+        log = self.logged()
+        check, undo, load = log.index("nft -c -f"), log.index("--on-active=180"), log.index("nft -f")
+        self.assertLess(check, undo)
+        self.assertLess(undo, load)  # (the undo set before the door is shut)
+        self.assertIn("delete table inet ruletaker_guard", log[undo:].splitlines()[0])
+        self.assertEqual(self.fw("status")[1].strip(), "pending")
+        code, out = self.fw("confirm")
+        self.assertEqual(code, 0, out)
+        self.assertIn("systemctl stop ruletaker-firewall-undo.timer", self.logged())
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "units", "ruletaker-firewall.service")))
+        self.assertEqual(self.fw("status")[1].strip(), "on")
+        code, out = self.fw("remove")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.fw("status")[1].strip(), "off")
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "units", "ruletaker-firewall.service")))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "etc", "firewall.nft")))
+
+    def test_a_ruleset_refused_or_no_undo_to_be_had_loads_nothing(self) -> None:
+        for extra in ({"FAKE_NFT_BAD": "1"}, {"FAKE_RUN_BAD": "1"}):
+            code, out = self.fw("arm", **extra)
+            self.assertNotEqual(code, 0, extra)
+            self.assertIn("没", out)
+            self.assertNotIn("nft -f", self.logged(), extra)
+            self.assertEqual(self.fw("status")[1].strip(), "off")
+        code, out = self.fw("confirm")  # (nothing armed: nothing kept)
+        self.assertNotEqual(code, 0)
+
+    @unittest.skipUnless(shutil.which("nft"), "no nft")
+    def test_the_real_ruleset_is_one_nft_takes(self) -> None:
+        out = subprocess.run(["nft", "-c", "-f", os.path.join(ROOT, "deploy", "gcp", "ruletaker-firewall.nft")],
+                             capture_output=True, text=True, timeout=30, check=False)
+        if "Operation not permitted" in out.stderr:
+            self.skipTest("nft may not check here")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        with open(os.path.join(ROOT, "deploy", "gcp", "ruletaker-firewall.nft")) as f:
+            rules = f.read()
+        self.assertIn("policy drop", rules)
+        self.assertIn("ip saddr 35.235.240.0/20 tcp dport 22 accept", rules)  # (rt.sh's IAP_RANGE)
+        self.assertIn("udp sport 67 udp dport 68 accept", rules)  # (the address lease: never cut off)
+
+
+@unittest.skipUnless(shutil.which("systemd-analyze"), "no systemd-analyze")
+class UnitSandboxTest(unittest.TestCase):
+    def test_the_unit_s_sandbox_scores_well_and_its_relaxing_drop_in_undoes_only_what_was_added(self) -> None:
+        unit = os.path.join(ROOT, "deploy", "gcp", "ruletaker.service")
+        out = subprocess.run(["systemd-analyze", "security", "--offline=yes", unit], capture_output=True, text=True, timeout=60,
+                             check=False)
+        last = (out.stdout.strip().splitlines() or [""])[-1]
+        if "exposure level" not in last:
+            self.skipTest("systemd-analyze cannot score offline here")
+        score = float(last.split(":")[1].split()[0])
+        self.assertLessEqual(score, 3.5, last)
+        with open(os.path.join(ROOT, "deploy", "gcp", "ruletaker-relaxed.conf")) as f:
+            relaxed = {line.split("=", 1)[0] for line in f if "=" in line and not line.startswith("#")}
+        with open(unit) as f:
+            added = f.read().split("CapabilityBoundingSet=", 1)[1].split("[Install]", 1)[0]
+        names = {"CapabilityBoundingSet", *(line.split("=", 1)[0] for line in added.splitlines() if "=" in line and not line.startswith("#"))}
+        # (each line the sandbox added undone by it, and no other; AmbientCapabilities= empty is the default: nothing to undo)
+        self.assertEqual(relaxed, names - {"AmbientCapabilities"})
 
 
 class ConsolePageTest(unittest.TestCase):

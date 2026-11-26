@@ -98,10 +98,15 @@ if [ ! -f /etc/ruletaker/ruletaker.env ]; then
   exit 1
 fi
 
+echo "== 服务器加固 =="
+bash "$APP/deploy/gcp/vm-harden.sh" || echo "（加固没做完，服务照常；原因见上面）"
+
 # The unit first (it opens a key kept encrypted), then the key out of the settings file into encrypted keeping — proved to
 # open before anything is changed; anything wrong leaves it where it was — then the settings checked the way the service
-# will read them (its user, its key), and only then the restart.
+# will read them (its user, its key), and only then the restart. The unit's sandbox tried in full each time: a relaxing
+# drop-in left by an earlier run (ruletaker-relaxed.conf, below) taken out first.
 install -m 644 "$APP/deploy/gcp/ruletaker.service" /etc/systemd/system/ruletaker.service
+rm -f /etc/systemd/system/ruletaker.service.d/relaxed.conf
 systemctl daemon-reload
 systemctl enable ruletaker >/dev/null 2>&1
 bash "$APP/deploy/gcp/vm-key.sh" move || echo "（没收走的照旧在设置文件里，服务照常运行；原因见上面）"
@@ -110,5 +115,16 @@ echo "== 设置自检 =="
 bash "$APP/deploy/gcp/vm-key.sh" run plan --env /etc/ruletaker/ruletaker.env   # (a setting that does not parse stops here)
 systemctl restart ruletaker
 sleep 3
+if ! systemctl is-active --quiet ruletaker; then
+  # (not started under the unit's sandbox — an older kernel or systemd refusing one of its lines, say: those lines undone
+  # by a drop-in, the rest as it is, so the service runs; said, with the log, for the next version to fix)
+  echo "!! 服务在新的沙箱设置下没起来：退回不加那几项限制再启动（其余加固和加密保存照旧）。把下面几行日志发给开发者："
+  journalctl -u ruletaker -n 12 --no-pager 2>/dev/null | tail -12 || true
+  install -d -m 755 /etc/systemd/system/ruletaker.service.d
+  install -m 644 "$APP/deploy/gcp/ruletaker-relaxed.conf" /etc/systemd/system/ruletaker.service.d/relaxed.conf
+  systemctl daemon-reload
+  systemctl restart ruletaker
+  sleep 3
+fi
 systemctl --no-pager --lines=15 status ruletaker || true
 echo "== 现在运行的是：$([ "$IMPL" = rust ] && echo "Rust 版（$APP/bin/ruletaker）" || echo "Python 版（$APP/python）") =="
