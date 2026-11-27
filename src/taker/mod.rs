@@ -79,6 +79,12 @@ pub const REST_MIN_S: f64 = 0.1;
 pub const REST_SOON_S: f64 = 0.005;
 pub const FOLLOW_EVERY_MS: i64 = 1_000;
 pub const UNKNOWN_EVERY_MS: i64 = 10_000;
+/// A withdrawal Predict confirmed with its record still open this long on (its record may lag the cancel a moment): it did
+/// not take — the order is on the book, counted as open, and asked to be withdrawn again.
+pub const REMOVE_SETTLE_MS: i64 = 3_000;
+/// Asks to withdraw an order still on the book at the follow's pace (FOLLOW_EVERY_MS); past them, every UNKNOWN_EVERY_MS
+/// (the key's budget kept for the races) — never given up while it is open, until its signed expiry is GIVE_UP_MS gone.
+pub const REMOVE_TRIES: i64 = 5;
 pub const GIVE_UP_MS: i64 = 15 * 60_000;
 pub const REJECT_PAUSE_MS: i64 = 30_000;
 pub const CONNECT_RETRY_MS: i64 = 2_000; // an order that got no connection (nothing sent): the window looks again this soon
@@ -114,6 +120,10 @@ pub const CONFLICT_MISSES: i64 = 6;
 pub const LAST_WITHDRAW_S: f64 = 4.0;
 pub const BALANCE_BUSY_MS: i64 = 20_000;
 pub const BALANCE_IDLE_MS: i64 = 120_000;
+/// A balance read that failed is tried again this long on, twice that after a second failure in a row, … at most
+/// BALANCE_RETRY_MAX_MS (on its own clock: the busy stretches' BALANCE_BUSY_MS never hurries it).
+pub const BALANCE_RETRY_MS: i64 = 15_000;
+pub const BALANCE_RETRY_MAX_MS: i64 = 60_000;
 pub const BALANCE_LAG_MS: i64 = 10_000;
 pub const RECENT_MS: i64 = 2 * DAY_MS;
 /// A thread making the journal's lines durable when asked (lines written meanwhile covered by the one sync); it ends with the
@@ -247,6 +257,10 @@ pub struct Taker {
     pub balance_ms: i64,
     pub balance_asked_ms: i64,
     pub balance_error: String,
+    /// no balance read before this (the clock's ms): a failed read's backoff; 0 when the last read was good
+    pub balance_retry_ms: i64,
+    /// failed balance reads in a row
+    pub balance_fails: u32,
     pub allowance: HashMap<String, (i64, u128)>,
     pub allowance_task: Option<JoinHandle<()>>,
     pub fast: bool,
@@ -426,6 +440,8 @@ impl Taker {
             balance_ms: 0,
             balance_asked_ms: 0,
             balance_error: String::new(),
+            balance_retry_ms: 0,
+            balance_fails: 0,
             allowance: HashMap::new(),
             allowance_task: None,
             fast: false,
@@ -644,8 +660,14 @@ impl Taker {
         }
         let today = day_of(self.now());
         if self.loss_floor_at.s("day") == today {
-            let floor = self.loss_floor_at.f("floor");
-            return Some(if floor != 0.0 { floor } else { -self.loss_cap });
+            // resumed today: the cap counted from the P&L then — the cap in force now (one changed since applies at once);
+            // a record of an earlier version holds its floor alone (0 among them: a floor, not a missing one)
+            if let Some(base) = self.loss_floor_at.get("base").and_then(Value::as_f64) {
+                return Some(base - self.loss_cap);
+            }
+            if let Some(floor) = self.loss_floor_at.get("floor").and_then(Value::as_f64) {
+                return Some(floor);
+            }
         }
         Some(-self.loss_cap)
     }

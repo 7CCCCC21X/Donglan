@@ -63,6 +63,129 @@ class LossStopTest(unittest.TestCase):
         run(go())
 
 
+class LossFloorTest(unittest.TestCase):
+    def test_a_resumed_day_s_floor_follows_the_cap_and_may_be_zero(self) -> None:
+        async def go() -> None:
+            taker, api, _chain, _stream, _clock = make_taker(START - 3_600_000, RULE_MAX_DAILY_LOSS_USD="10")
+            await found(taker, api)
+            settle(taker, "a", -12.0)
+            settle(taker, "b", 22.0)  # +$10 now: the stop held all the same
+            self.assertIn("停机线", taker.state()["loss_stop"])  # (the console's resume)
+            # resumed at exactly the cap: the line at $0 — a line, not a missing one
+            reply = await taker.control("resume", "")
+            self.assertIn("停机线移到 +$0.00", reply)
+            self.assertEqual(taker.loss_floor(), 0.0)
+            self.assertEqual(taker.state()["loss_stop"], "")
+            settle(taker, "c", -10.5)  # -$0.50: under it
+            self.assertIn("停机线", taker.block(0.0))
+
+            taker, api, _chain, _stream, _clock = make_taker(START - 3_600_000, RULE_MAX_DAILY_LOSS_USD="10")
+            await found(taker, api)
+            settle(taker, "a", -12.0)
+            self.assertIn("停机线移到 −$22.00", await taker.control("resume", ""))  # -$12 -> the line at -$22
+            settle(taker, "b", -7.0)  # -$19: over the line
+            self.assertEqual(taker.block(0.0), "")
+            # the cap tightened to $5 the same day: counted from the P&L at the resume, -$17 — under it now, stopped at once
+            await taker.save_settings({"RULE_MAX_DAILY_LOSS_USD": "5"})
+            self.assertEqual(taker.loss_floor(), -17.0)
+            self.assertIn("停机线", taker.block(0.0))
+            # and back to the deploy's $10: -$22 again (the stop reached meanwhile holds until /resume)
+            await taker.reset_settings(None)
+            self.assertEqual(taker.loss_floor(), -22.0)
+        run(go())
+
+    def test_the_console_button_resumes_a_loss_stop_as_well_as_a_pause(self) -> None:
+        with open(os.path.join(os.path.dirname(__file__), "..", "ruletaker", "web", "console.html"), encoding="utf-8") as f:
+            page = f.read()
+        self.assertIn("held=!!(s.paused||s.loss_stop)", page)
+        self.assertIn("if(s.loss_stop){if(confirm(", page)
+
+
+class ReadyTest(unittest.TestCase):
+    def test_a_failed_renewal_with_the_token_still_good_holds_nothing_up(self) -> None:
+        async def go() -> None:
+            taker, api, _chain, _stream, _clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            await taker.prepare()
+            self.assertTrue(taker.ready)
+
+            async def down() -> None:
+                raise RemoteError("HTTP 502: Bad Gateway")
+            api.renew_auth = down
+            api.usable = lambda: True  # (good 200 s more: renewed ahead, still good for an order)
+            await taker.prepare()
+            self.assertTrue(taker.ready, taker.not_ready_why)
+            self.assertEqual(taker.block(0.0), "")
+            api.usable = lambda: False  # run out with the sign-in still down: that holds the orders
+            await taker.prepare()
+            self.assertIn("502", taker.not_ready_why)
+        run(go())
+
+    def test_a_chain_node_s_empty_answer_is_an_error_never_a_zero(self) -> None:
+        import types
+
+        from ruletaker.predict import Chain
+        answer: dict = {"result": None}
+
+        def fake_request(url, payload=None, timeout=15, headers=None, gate=None, trace=None):
+            return json.dumps({"jsonrpc": "2.0", "id": 1, "result": answer["result"]}).encode()
+        wallet = types.SimpleNamespace(addresses={"USDT": "0x" + "11" * 20, "ECDSA_VALIDATOR": "0x" + "22" * 20,
+                                                  "CTF_EXCHANGE": "0x" + "33" * 20}, maker="0x" + "44" * 20, signer="0x" + "55" * 20)
+        account = "0x" + "ab" * 20
+
+        async def go() -> None:
+            chain = Chain("https://bsc-rpc.test/", wallet)
+            saved = nethttp.request
+            nethttp.request = fake_request
+            try:
+                for slip in ("0x", None, "0x123", "0xzz", "0x" + "00" * 31):
+                    answer["result"] = slip
+                    for read in (chain.usdt_balance, lambda: chain.allowance("CTF_EXCHANGE"), lambda: chain.account_owner(account)):
+                        with self.assertRaises(RemoteError, msg=repr(slip)):
+                            await read()
+                answer["result"] = "0x"  # BNB's balance: a quantity, "0x0" for none
+                with self.assertRaises(RemoteError):
+                    await chain.bnb_balance()
+                answer["result"] = "0x0"
+                self.assertEqual(await chain.bnb_balance(), 0)
+                answer["result"] = "0x" + "00" * 32  # a whole word of zeros is a zero: an account the validator does not know
+                self.assertEqual(await chain.usdt_balance(), 0)
+                self.assertEqual(await chain.account_owner(account), "0x" + "0" * 40)
+            finally:
+                nethttp.request = saved
+        run(go())
+
+    def test_a_failed_balance_read_backs_off_on_its_own_clock_in_a_busy_stretch(self) -> None:
+        async def go() -> None:
+            taker, api, chain, _stream, clock = make_taker(START - 50_000)  # (busy: the balance read every 20 s)
+            await found(taker, api)
+            await taker.refresh_balance()
+
+            def due() -> bool:
+                return taker.balance_due(taker.now(), T.BALANCE_BUSY_MS)
+            clock.ms += T.BALANCE_BUSY_MS
+            self.assertTrue(due())
+
+            async def slip() -> int:
+                raise RemoteError("链上节点的应答只有 0 字节（应有 32）")
+            good, chain.usdt_balance = chain.usdt_balance, slip
+            await taker.refresh_balance()
+            # its last good read 20 s and more old, yet no read again before 15 s are out — then 30, then every minute
+            for wait in (T.BALANCE_RETRY_MS, 2 * T.BALANCE_RETRY_MS, T.BALANCE_RETRY_MAX_MS, T.BALANCE_RETRY_MAX_MS):
+                clock.ms += 2_000
+                self.assertFalse(due())
+                clock.ms += wait - 2_000
+                self.assertTrue(due(), wait)
+                await taker.refresh_balance()
+            chain.usdt_balance = good
+            clock.ms += T.BALANCE_RETRY_MAX_MS
+            await taker.refresh_balance()
+            self.assertEqual(taker.balance_error, "")
+            clock.ms += T.BALANCE_BUSY_MS
+            self.assertTrue(due())
+        run(go())
+
+
 class BalanceTest(unittest.TestCase):
     def test_the_balance_keeps_what_an_unconfirmed_order_may_still_take(self) -> None:
         async def go() -> None:

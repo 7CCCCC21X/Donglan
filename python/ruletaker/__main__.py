@@ -188,14 +188,21 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
     delay between regions: the smaller, the nearer to Predict's books. ``say``: where each line of the report goes (printed;
     Telegram's /speed keeps them)."""
     from . import http
-    from .predict import API_BASES, PREDICT_REST, READ_POOL, predict_markets
+    from .predict import (
+        API_BASES,
+        PREDICT_REST,
+        READ_POOL,
+        http_status,
+        predict_markets,
+    )
     from .stream import PREDICT_WS_URL, ws_connect
     base = base or API_BASES.get(config.chain_id, PREDICT_REST)  # (``base`` / ``ws_url``: stand-ins, for the tests)
     host = urllib.parse.urlsplit(base).hostname or ""
     headers = {"x-api-key": config.api_key} if config.api_key else {}
     spread = lambda xs: f"中位 {statistics.median(xs):.1f} ms（最快 {min(xs):.1f}，最慢 {max(xs):.1f}）" if xs else "没量到"
     zone = config.region or await asyncio.to_thread(gce_zone)
-    found: dict = {"region": zone, "reads": [], "pings": [], "first": None, "ws_open": None, "ws_book": None, "lags": [], "index": []}
+    found: dict = {"region": zone, "reads": [], "pings": [], "first": None, "ws_open": None, "ws_book": None, "lags": [], "index": [],
+                   "limited": 0}  # (limited: this measurement's requests Predict refused with a 429 — the key's budget spent)
     say(f"Predict 网络延迟探测（只读，不下单）｜区域 {zone or '未知'}｜版本 {VERSION}" + ("" if config.api_key else "｜没有设置 API Key：可能被拒绝"))
     say("（约 1 分钟，其间占这把 Key 每分钟额度的四分之一左右：别在抢单时段跑）")
     loop = asyncio.get_running_loop()
@@ -211,6 +218,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
         market_id = markets[0]["id"] if markets else ""
         say(f"第一次请求（含新建连接）{found['first']:.0f} ms｜市场 {slug} → {market_id or '没找到'}")
     except Exception as error:
+        found["limited"] += http_status(error) == 429
         say(f"读市场失败：{clean_error(error) or type(error).__name__}")
     watched = [market_id] if market_id else []
     try:  # (the next quarter hour's market too: twice the books to time)
@@ -230,6 +238,7 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
             await loop.run_in_executor(READ_POOL, http.request, base + path, None, 10, headers)
             found["reads"].append((time.perf_counter() - began) * 1000)
         except Exception as error:
+            found["limited"] += http_status(error) == 429
             why = clean_error(error) or type(error).__name__
             if why.startswith("HTTP "):
                 refused.append((time.perf_counter() - began) * 1000)
@@ -259,7 +268,8 @@ async def latency(config: Config, rounds: int = 10, push_seconds: float = PUSH_S
             sent[0] += 1
             try:
                 answer = await loop.run_in_executor(READ_POOL, http.request_json, f"{base}/markets/{polled}/orderbook", None, 10, headers)
-            except Exception:
+            except Exception as error:
+                found["limited"] += http_status(error) == 429
                 answer = None
             if isinstance(answer, dict):
                 got = time.perf_counter()

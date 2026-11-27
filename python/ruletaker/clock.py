@@ -159,6 +159,8 @@ def day_spans(text: str, name: str = "RULE_FAST_HOURS") -> tuple[tuple[int, int]
     if text in {"", "off", "0", "关"}:
         return ()
     out = []
+    # (spaces around a span's dash taken out first — "01:00 - 07:00" is one span; spans may still be set apart by spaces)
+    text = re.sub(r"\s*([-–—~～至到])\s*", r"\1", text)
     for part in re.split(r"[,，;；\s]+", text):
         if not part:
             continue

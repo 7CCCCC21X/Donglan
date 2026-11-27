@@ -167,7 +167,10 @@ pub fn records_csv(recs: &Recs) -> String {
     all.sort_by_key(|r| r.i("start_ms"));
     for r in all {
         let rule = rule_of(&r.s("rule"));
-        for o in orders(r) {
+        let list: Vec<&Obj> = orders(r).collect();
+        // the window's P&L once, on its first order with a fill (else its first): the column summed counts each window once
+        let carrier = list.iter().position(|o| o.f("filled") > crate::util::DUST).unwrap_or(0);
+        for (i, o) in list.into_iter().enumerate() {
             let pair = |a: &str, b: &str| if o.t(a) && o.t(b) { (o.i(a) - o.i(b)).to_string() } else { String::new() };
             row(vec![
                 bj(r.i("start_ms"), true),
@@ -188,7 +191,7 @@ pub fn records_csv(recs: &Recs) -> String {
                 pair("sent_wall", "seen_wall"),
                 pair("answered_wall", "sent_wall"),
                 r.s("result"),
-                if r.none("pnl") { String::new() } else { py_str(&r["pnl"]) },
+                if i != carrier || r.none("pnl") { String::new() } else { py_str(&r["pnl"]) },
             ]);
         }
     }
@@ -215,5 +218,16 @@ mod tests {
         let csv = records_csv(&recs);
         assert!(csv.contains(",0xab,final,0.55,10.0,10.0,0.55,200,,"), "{csv}");
         assert!(csv.contains(",50,2,28,up,4.5\r\n"), "{csv}");
+        // a window of three orders (one never sent, two filled): its P&L on one line — the column summed counts it once
+        let rec: Obj = serde_json::from_value(json!({"slug": "w2", "rule": "gold_shut", "mode": "on", "side": "up",
+            "start_ms": 1_763_600_000_000i64, "pnl": 10.5, "result": "up",
+            "orders": [{"hash": "0x1", "state": "not_sent", "shares": 50.0, "limit": 0.58},
+                       {"hash": "0x2", "state": "final", "shares": 20.0, "filled": 20.0, "limit": 0.58, "avg": 0.55},
+                       {"hash": "0x3", "state": "final", "shares": 30.0, "filled": 30.0, "limit": 0.58, "avg": 0.56}]})).unwrap();
+        recs.insert("w2".into(), rec);
+        let csv = records_csv(&recs);
+        let cells: Vec<Vec<&str>> = csv.split("\r\n").filter(|l| l.contains(",w2,")).map(|l| l.split(',').collect()).collect();
+        let pnl: Vec<&str> = cells.iter().map(|c| *c.last().unwrap()).collect();
+        assert_eq!(pnl, vec!["", "10.5", ""], "{csv}");
     }
 }

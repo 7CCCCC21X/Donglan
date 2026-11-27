@@ -94,8 +94,21 @@ class Store:
             target = self.queued
             return self.cond.wait_for(lambda: self.written >= target, timeout)
 
+    # (the writer's first open tried again, as src/store.rs does: a lock held a moment, a disk slow to come up — never a writer
+    # thread gone with nobody told; the error said meanwhile, so no order goes out on a store that cannot write)
+    CONNECT_RETRY_S = 2.0
+
     def write_loop(self) -> None:
-        conn = self.connect()
+        conn = None
+        tries = 0
+        while conn is None:
+            try:
+                conn = self.connect()
+            except (sqlite3.Error, OSError) as error:
+                tries += 1
+                self.error = f"数据库写入失败：{error}"
+                LOG.error("%s（打开数据库第 %d 次，稍后再试）", self.error, tries)
+                time.sleep(self.CONNECT_RETRY_S)
         while True:
             item = self.queue.get()
             batch = [item]

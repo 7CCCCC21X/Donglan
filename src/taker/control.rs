@@ -100,7 +100,8 @@ fn resume(me: &Me) -> String {
         if let Some(floor) = floor {
             if pnl <= floor || held {
                 let new_floor = pnl - t.loss_cap;
-                t.loss_floor_at = crate::obj! {"day" => today, "floor" => jf(new_floor)};
+                // (the P&L now kept: the floor follows the cap should it change later today)
+                t.loss_floor_at = crate::obj! {"day" => today, "base" => jf(pnl), "floor" => jf(new_floor)};
                 let saved = Value::Object(t.loss_floor_at.clone());
                 t.store.put("control:loss_floor", &saved);
                 parts.push(format!(
@@ -762,6 +763,8 @@ pub async fn order_test(me: &Me) -> String {
 /// How close to a race (a per-second stretch, the makers' moment, a window's last minutes) /speed still runs: it takes a quarter
 /// of the key's budget for about a minute.
 pub const SPEED_CLEAR_MS: i64 = 3 * 60_000;
+/// Review spans kept worked out (review_data): the page's and /review's few.
+pub const REVIEW_HELD: usize = 8;
 
 /// /speed: the measurement ``ruletaker latency`` makes, run here (read-only, about a minute) and its report sent back — the push
 /// delay, the REST reads against the pushes, Binance's index, the key's figures — and the service's own push connections beside
@@ -786,14 +789,35 @@ pub async fn speed_test(me: &Me, args: &str) -> String {
             _ => return "用法：/speed，或 /speed 4000（4000 = 这次测量用的每分钟请求数，1～6000；设置不动）".into(),
         }
     }
+    {
+        let t = me.borrow();
+        if t.stop.is_set() {
+            return "⏳ 服务正在停止：不测速".into();
+        }
+        // (the measurement goes through the main key: never while it cools — it would be refused, and its refusals add on)
+        let left = t.api.key_cooling(0).max(t.cooling());
+        if left > 0.0 {
+            return format!("⏳ 这把 Key 正在限流冷却（还要 {} 秒）：不测速，过了再发 /speed", left as u64 + 1);
+        }
+    }
     if std::mem::replace(&mut me.borrow_mut().speeding, true) {
         return "⏳ 测速正在进行，等它的结果（同一时间只测一次）".into();
     }
     let _done = SpeedUnderWay(me.clone());
     let say = crate::Say::keeping();
     let base = crate::predict::api_base(config.chain_id).to_string();
-    crate::probe(config, 10, &base, crate::stream::PREDICT_WS_URL, crate::PUSH_SECONDS, &say).await;
+    let found = crate::probe(config, 10, &base, crate::stream::PREDICT_WS_URL, crate::PUSH_SECONDS, &say).await;
     let mut lines = say.lines.take();
+    if found.limited > 0 {
+        // its requests went through the main key outside the service's pace: a 429 on them is that key's budget spent — the
+        // service's own requests kept off it for the cooldown, as a 429 of theirs would
+        me.borrow().api.cool_key(0);
+        lines.push(format!(
+            "⚠️ 测速的请求被 Predict 限流 {} 次（429）：这把 Key 先冷却 {} 秒，服务的请求这期间走备用 Key（没有备用 Key 就等）——测速别用超过这把 Key 额度的速率",
+            found.limited,
+            crate::predict::PredictApi::BACKOFF_SECONDS
+        ));
+    }
     // the service's own pushes beside it: what its extra connections save
     let hedge = me.borrow().stream.hedge();
     lines.push(match hedge {
@@ -1278,6 +1302,11 @@ impl Taker {
             return json!({"busy": "抢单时刻前后这几秒不算复盘数据，稍后再刷新", "computed_ms": now});
         }
         let data = crate::review::review(&self.recs, &self.settings, now, days);
+        // (a few spans kept, the one asked longest ago let go: /review 1 … /review 3650 never pile up)
+        while self.review_held.len() >= REVIEW_HELD && !self.review_held.contains_key(&days) {
+            let Some(oldest) = self.review_held.iter().min_by_key(|(_, (at, _))| *at).map(|(d, _)| *d) else { break };
+            self.review_held.remove(&oldest);
+        }
         self.review_held.insert(days, (now, data.clone()));
         let mut out = data;
         out["computed_ms"] = json!(now);
@@ -1319,7 +1348,8 @@ impl Taker {
         json!({
             "version": version(), "now_ms": now, "region": self.region, "mode": s.mode, "env_mode": self.env_mode,
             "modes": {"off": mode_name("off"), "paper": mode_name("paper"), "on": mode_name("on")},
-            "paused": self.paused, "blocked": if s.mode == "on" { self.block(0.0, None) } else { String::new() }, "ready": self.ready(),
+            "paused": self.paused, "loss_stop": self.loss_stop_why(),
+            "blocked": if s.mode == "on" { self.block(0.0, None) } else { String::new() }, "ready": self.ready(),
             "not_ready": if s.mode == "on" && !self.ready() { self.not_ready_why() } else { String::new() },
             "trading_allowed": self.config.trading_allowed,
             "account": {

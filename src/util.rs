@@ -259,12 +259,26 @@ fn redact_with(text: &str, urls: bool) -> String {
                 j += 1;
             }
             let url: String = chars[i..j].iter().collect();
-            if urls || url.contains("telegram.org") || url.contains("key=") || url.contains("token=") {
+            let (head, rest) = url[scheme..].split_once(['/', '?', '#']).map_or((url.as_str(), ""), |(host, _)| {
+                let cut = scheme + host.len();
+                (&url[..cut], &url[cut..])
+            });
+            let host = &head[scheme..];
+            if urls || host.contains('@') || url.contains("telegram.org") || url.contains("key=") || url.contains("token=") {
                 out.push_str("[URL]");
                 i = j;
                 continue;
             }
-            out.push_str(&url);
+            // (a log line's URL kept to its host: its path and query dropped — a node's key may sit in its path, /v2/<key> —
+            // unless it is the machine's own, the console's link)
+            let name = host.to_ascii_lowercase();
+            let name = if name.starts_with("[::1]") { "[::1]" } else { name.rsplit_once(':').map_or(name.as_str(), |(n, _)| n) };
+            if rest.is_empty() || rest == "/" || ["127.0.0.1", "localhost", "[::1]", "0.0.0.0"].contains(&name) {
+                out.push_str(&url);
+            } else {
+                out.push_str(head);
+                out.push_str("/[…]");
+            }
             i = j;
             continue;
         }
@@ -691,6 +705,12 @@ mod tests {
         assert_eq!(http_status("网络错误"), 0);
         assert_eq!(clean_error_keep("控制台：http://127.0.0.1:8080/"), "控制台：http://127.0.0.1:8080/");
         assert_eq!(clean_error_keep("POST https://api.telegram.org/bot1234567:ABCDEFGHIJKLMNOPQRS/sendMessage"), "POST [URL]");
+        // a log line's URL kept to its host: a node's key in its path never written (src: python/ruletaker/util.py redact_log)
+        assert_eq!(clean_error_keep("节点 https://bsc.example:8545/v2/SUPER_SECRET_KEY 慢"), "节点 https://bsc.example:8545/[…] 慢");
+        assert_eq!(clean_error_keep("https://user:pw@rpc.example/"), "[URL]");
+        assert_eq!(clean_error_keep("https://rpc.example/?apikey=abc"), "[URL]");
+        assert_eq!(clean_error_keep("状态：http://0.0.0.0:8080/status"), "状态：http://0.0.0.0:8080/status");
+        assert_eq!(clean_error_keep("http://localhost:8080/status 和 https://api.predict.fun/"), "http://localhost:8080/status 和 https://api.predict.fun/");
     }
 
     #[test]

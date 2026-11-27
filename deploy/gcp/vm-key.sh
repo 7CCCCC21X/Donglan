@@ -16,6 +16,9 @@
 #                             checked the way the service reads it, the service restarted; a check that fails puts it back. A
 #                             secret (SECRETS) goes to the encrypted store, never into the file; an empty one is taken out
 #   bash vm-key.sh run ARGS   the service's command line (plan, check, …) run the way the service runs: its user, its key
+#   bash vm-key.sh measure [RATE]  the latency measurement (rt.sh latency) the same way, with the API keys kept encrypted
+#                             opened for it — never the private key (RULE_TAKER=off: a measurement needs none); RATE: this
+#                             measurement's own PREDICT_RATE_PER_MIN
 #   bash vm-key.sh status     where the key and the secrets are kept (never a value)
 #
 # Every change is proved before it is made: the encrypted key is opened by systemd the way the service's will be, and the
@@ -515,6 +518,17 @@ case "${1:-}" in
   run)
     shift
     run_cli "$@"
+    ;;
+  measure)
+    rate="${2:-}"
+    case "$rate" in
+      '') ;;
+      *[!0-9]*) echo "用法：bash vm-key.sh measure [每分钟请求数]"; exit 2 ;;
+    esac
+    props=(Environment=RULE_TAKER=off)
+    [ -z "$rate" ] || props+=("Environment=PREDICT_RATE_PER_MIN=$rate")
+    [ -s "$SSTORE" ] && props+=("LoadCredentialEncrypted=$SNAME:$SSTORE")
+    as_service "${props[@]}" -- "${RUN[@]}" latency --env "$F"
     ;;
   status)
     if [ -s "$STORE" ]; then

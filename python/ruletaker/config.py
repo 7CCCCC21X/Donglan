@@ -217,7 +217,7 @@ class Config:
     secrets_kept: int = 0             # how many of the secrets (SECRET_SETTINGS) came from the encrypted store, not the settings file
     account: str = ""
     chain_id: int = 56
-    rpc_url: str = ""
+    rpc_url: str = dataclasses.field(default="", repr=False)  # BSC_RPC_URL: a node's own key may sit in its path (secret: never in a repr)
     fee_bps: int = 200
     rate_per_min: float = 220.0
     verify_ms: float = 340.0  # how often the REST read beside the pushes may run at the makers' moment (RULE_VERIFY_MS)

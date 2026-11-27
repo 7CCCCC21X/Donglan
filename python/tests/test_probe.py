@@ -119,6 +119,33 @@ class ProbeTest(unittest.TestCase):
         self.assertTrue(all(0 <= lag < 200 for lag in found["index"]), found["index"])
 
 
+class _Limited(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        body = b'{"success":false,"message":"Rate limit exceeded"}'
+        self.send_response(429)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Retry-After", "30")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class ProbeLimitedTest(unittest.TestCase):
+    def test_the_probe_counts_the_429s_of_its_own_requests(self) -> None:
+        from ruletaker.__main__ import latency
+        api = http.server.HTTPServer(("127.0.0.1", 0), _Limited)
+        threading.Thread(target=api.serve_forever, daemon=True).start()
+        try:
+            config = make_config(RULE_TAKER="off", RULE_REGION="test", BINANCE_WS_URL="ws://127.0.0.1:9")
+            found = asyncio.run(latency(config, rounds=2, push_seconds=0.2, say=lambda line: None,
+                                        base=f"http://127.0.0.1:{api.server_address[1]}/v1", ws_url="ws://127.0.0.1:9"))
+        finally:
+            api.shutdown()
+        self.assertGreaterEqual(found["limited"], 3, found)  # (the markets' read and the two rounds)
+
+
 class VerifyPaceTest(unittest.TestCase):
     def test_the_rest_reads_at_the_moment_keep_within_the_key_s_budget(self) -> None:
         from fakes import make_taker

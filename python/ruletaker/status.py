@@ -31,6 +31,7 @@ from .util import LOG, NotOnDisk, clean_error
 PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "console.html")
 MAX_BODY = 65_536
 MAX_CONNECTIONS = 32  # requests served at once (more are closed at once: the page asks again in two seconds)
+WRITE_TIMEOUT_S = 10.0  # an answer's write given this long: a reader that stops reading lets go of its place then
 
 
 def reset_keys(reset: Any) -> list[str] | None | str:
@@ -128,7 +129,10 @@ class StatusServer:
                      f"Content-Length: {len(data)}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
                      f"Referrer-Policy: no-referrer\r\nConnection: close\r\n\r\n".encode() + data)
         with contextlib.suppress(Exception):
-            await writer.drain()
+            # (a reader that stops taking the answer holds its place WRITE_TIMEOUT_S at the most: never one of the
+            # MAX_CONNECTIONS for good)
+            await asyncio.wait_for(writer.drain(), WRITE_TIMEOUT_S)
+        with contextlib.suppress(Exception):
             writer.close()
 
     async def route(self, method: str, path: str, query: dict, headers: dict, body: bytes = b"") -> tuple[int, str, str]:

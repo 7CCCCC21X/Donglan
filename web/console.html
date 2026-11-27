@@ -173,8 +173,9 @@ function renderState(s){
     title:rank[m]>rank[s.env_mode]?"高于部署设置 RULE_TAKER="+s.env_mode+"：要先改设置文件再重启":null,
     onclick:async()=>{if(m==="on"&&!confirm("切到真实吃单？"))return;await act({action:"mode",arg:m})}},MODE[m])));
   $("modehint").textContent=(s.env_mode!=="on"?"部署设置 RULE_TAKER="+s.env_mode+"：这里最多调到 "+MODE[s.env_mode]+"。":"")+(s.not_ready?"未就绪："+s.not_ready:"")+(s.trading_allowed?"":"｜LIVE_TRADING_ALLOWED 不是 on：不会真实下单");
-  const pb=$("pause");pb.textContent=s.paused?"恢复":"暂停";pb.className="b"+(s.paused?" pri":"");
-  pb.onclick=async()=>{if(s.paused)await act({action:"resume"});else if(confirm("暂停开新单？挂着的单会当场撤掉"))await act({action:"pause",arg:"控制台"})};
+  const held=!!(s.paused||s.loss_stop),pb=$("pause");pb.textContent=held?"恢复":"暂停";pb.className="b"+(held?" pri":"");
+  pb.onclick=async()=>{if(s.loss_stop){if(confirm(s.loss_stop+"\n\n恢复会从现在的盈亏起再给一个 RULE_MAX_DAILY_LOSS_USD 的额度"+(s.paused?"（暂停也一起解除）":"")+"，确定？"))await act({action:"resume"})}
+    else if(s.paused)await act({action:"resume"});else if(confirm("暂停开新单？挂着的单会当场撤掉"))await act({action:"pause",arg:"控制台"})};
   $("withdraw").onclick=async()=>{if(confirm("撤掉规则吃单所有挂着的单？"))await act({action:"withdraw"})};
   // the rules' next windows
   $("next").replaceChildren(h("thead",{},h("tr",{},["规则","买","价格","下一场（北京）","对手挂单时刻","现在"].map(x=>h("th",{},x)))),

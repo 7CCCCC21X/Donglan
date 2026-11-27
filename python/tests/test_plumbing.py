@@ -6,7 +6,9 @@ import contextlib
 import http.client
 import json
 import os
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from decimal import Decimal as D
@@ -363,6 +365,20 @@ class IndexTest(unittest.TestCase):
         self.assertEqual(feed.price_problem("XAUUSDT", end, now), "")
         self.assertIn("未更新", feed.price_problem("XAUUSDT", end, now + 20_000))  # 12 s allowed with 10 minutes left
 
+    def test_a_start_line_that_never_reads_is_kept_as_a_few_errors_only(self) -> None:
+        async def go() -> dict:
+            async def getter(path: str, params: dict) -> list:
+                raise RemoteError("HTTP 503: down")
+            feed = IndexFeed(["XAUUSDT"], getter=getter)
+            start = 1_795_039_200_000
+            for i in range(450):
+                at = start + i * 900_000
+                self.assertIsNone(await feed.ensure_start("XAUUSDT", at, at + 2_000))
+            return feed.candle_error
+        errors = asyncio.run(go())
+        self.assertEqual(len(errors), 400)
+        self.assertTrue(all(minute >= 1_795_039_200_000 + 50 * 900_000 - 60_000 for _, minute in errors))  # (the oldest let go)
+
     def test_start_candle(self) -> None:
         async def go() -> None:
             start = 1_795_039_200_000
@@ -394,6 +410,28 @@ class StoreTest(unittest.TestCase):
         again.delete_keys(["rule:x"])
         again.flush()
         self.assertIsNone(Store(path).get("rule:x"))
+
+
+    def test_the_writer_s_first_open_is_tried_again_and_said_meanwhile(self) -> None:
+        folder = tempfile.mkdtemp()
+        path = os.path.join(folder, "s.sqlite3")
+        opened: list = []
+
+        class Slow(Store):
+            CONNECT_RETRY_S = 0.05
+
+            def connect(self):  # (the reader's open in __init__ passes; the writer's first two are refused — a lock held)
+                opened.append(threading.current_thread().name)
+                if opened.count("store-writer") <= 2 and threading.current_thread().name == "store-writer":
+                    raise sqlite3.OperationalError("database is locked")
+                return super().connect()
+        s = Slow(path)
+        s.put("rule:x", {"a": 1})
+        self.assertTrue(s.flush(5.0), s.error)  # (written once the writer got its connection)
+        self.assertEqual(s.error, "")
+        self.assertEqual(opened.count("store-writer"), 3)
+        self.assertTrue(s.writer.is_alive())
+        self.assertEqual(Store(path).get("rule:x"), {"a": 1})
 
 
 class TextTest(unittest.TestCase):

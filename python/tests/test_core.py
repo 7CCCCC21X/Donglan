@@ -68,6 +68,9 @@ class ClockTest(unittest.TestCase):
         self.assertEqual((weekday, hour, minute), (2, 17, 15))
 
     def test_day_spans(self) -> None:
+        # spaces around the dash: one span; spans set apart by spaces: as many (as src/clock.rs reads them)
+        self.assertEqual(day_spans("01:00 - 07:00"), ((60, 420),))
+        self.assertEqual(day_spans(" 01:00 至  07:00 ， 23:00 -02:00 09:00-10:00"), ((60, 420), (1380, 120), (540, 600)))
         spans = day_spans("01:00-07:00,23:00-02:00")
         self.assertEqual(spans, ((60, 420), (1380, 120)))
         self.assertEqual(day_spans_text(spans), "01:00-07:00,23:00-02:00")
@@ -215,3 +218,19 @@ class LockTest(unittest.TestCase):
         self.assertEqual(len(blocks), len(locked))
         for block in blocks:
             self.assertRegex(block, r"--hash=sha256:[0-9a-f]{64}", block.splitlines()[0])
+
+class LogRedactTest(unittest.TestCase):
+    def test_a_log_line_s_url_is_kept_to_its_host(self) -> None:
+        from ruletaker.util import LOG, redact_log
+        # a node's key in its path never written (as src/util.rs clean_error_keep writes a line)
+        self.assertEqual(redact_log("节点 https://bsc.example:8545/v2/SUPER_SECRET_KEY 慢"), "节点 https://bsc.example:8545/[…] 慢")
+        self.assertEqual(redact_log("https://user:pw@rpc.example/"), "[URL]")
+        self.assertEqual(redact_log("https://rpc.example/?apikey=abc"), "[URL]")
+        self.assertEqual(redact_log("POST https://api.telegram.org/bot1234567:ABCDEFGHIJKLMNOPQRS/sendMessage"), "POST [URL]")
+        self.assertEqual(redact_log("控制台：http://127.0.0.1:8080/"), "控制台：http://127.0.0.1:8080/")
+        self.assertEqual(redact_log("状态：http://0.0.0.0:8080/status"), "状态：http://0.0.0.0:8080/status")
+        self.assertEqual(redact_log("http://localhost:8080/status 和 https://api.predict.fun/"),
+                         "http://localhost:8080/status 和 https://api.predict.fun/")
+        with self.assertLogs(LOG, "WARNING") as seen:
+            LOG.warning("读不到 %s", "https://bsc.example/v2/SUPER_SECRET_KEY")
+        self.assertNotIn("SUPER_SECRET_KEY", "\n".join(seen.output))

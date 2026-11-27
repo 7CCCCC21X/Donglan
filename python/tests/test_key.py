@@ -77,6 +77,10 @@ class KeptKeyTest(unittest.TestCase):
         shown = repr(c) + str(c) + repr(stored)
         for secret in ("kept-api-key", "kept-token", "spare-two", "file-api-key"):
             self.assertNotIn(secret, shown)
+        # a node's address with its key in the path: never in a repr either (a traceback's locals show one)
+        c = Config.load({"RULE_TAKER": "off", "BSC_RPC_URL": "https://bsc-mainnet.example/v2/SUPER_SECRET_KEY"}, Stored())
+        self.assertEqual(c.rpc_url, "https://bsc-mainnet.example/v2/SUPER_SECRET_KEY")
+        self.assertNotIn("SUPER_SECRET_KEY", repr(c) + str(c))
 
     def test_systemd_s_directory_is_read_and_an_unreadable_key_is_no_silent_none(self) -> None:
         self.assertFalse(Stored.from_dir(None).store)

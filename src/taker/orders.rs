@@ -113,13 +113,16 @@ pub async fn follow_order(me: &Me, key: &str, hash: &str, now: i64) -> crate::ut
             o.insert("state".into(), json!("final"));
             break 'read None;
         }
-        if order_final(&row, shares) && !o.t("removed") && !o.t("closed_as") {
-            // closed on Predict's side, never by us (a rest is withdrawn only here, at a follow): its word kept — an order
-            // meeting the account's own resting one is cancelled as the taker (self-trade prevention), nothing bought
+        let closed = order_final(&row, shares);
+        if closed && o.i("removes") == 0 && !o.t("removed") && !o.t("closed_as") {
+            // closed on Predict's side, never asked of it by us (a rest is withdrawn at a follow, a pause or a stop, each
+            // ask counted): its word kept — an order meeting the account's own resting one is cancelled as the taker
+            // (self-trade prevention), nothing bought
             let status = row.s("status");
             o.insert("closed_as".into(), json!(if status.is_empty() { "?".to_string() } else { status }));
         }
-        if order_final(&row, shares) || o.t("removed") {
+        if closed {
+            // off the book on Predict's own record: the late fills taken until LATE_FILL_MS after it left, then final
             let left = if o.t("left_ms") { o.i("left_ms") } else { now };
             o.insert("left_ms".into(), json!(left));
             if now - left >= LATE_FILL_MS || late {
@@ -135,11 +138,26 @@ pub async fn follow_order(me: &Me, key: &str, hash: &str, now: i64) -> crate::ut
             o.insert("error".into(), json!("到期后仍显示挂着：按已知成交记"));
             break 'read None;
         }
+        if o.t("removed") {
+            // its withdrawal confirmed, Predict's record of it still open: never final on the answer alone (an order still on
+            // the book may take shares no read would follow) — read again shortly; still open REMOVE_SETTLE_MS on, the
+            // withdrawal did not take: on the book, counted as open again, and asked to be withdrawn again
+            if now - o.i("removed") < REMOVE_SETTLE_MS {
+                let every = if o.i("removes") >= REMOVE_TRIES { UNKNOWN_EVERY_MS } else { FOLLOW_EVERY_MS };
+                o.insert("next_ms".into(), json!(now + every));
+                break 'read None;
+            }
+            o.insert("removed".into(), json!(0));
+            o.insert("state".into(), json!("open"));
+        }
         let id = o.s("id");
         if id.is_empty() {
             o.insert("next_ms".into(), json!(now + UNKNOWN_EVERY_MS));
             break 'read None;
         }
+        // (counted as it is asked: an answer lost on the way may have been carried out all the same)
+        let asked = o.i("removes") + 1;
+        o.insert("removes".into(), json!(asked));
         Some(id)
     };
     let Some(id) = to_remove else { return Ok(()) };
@@ -147,21 +165,28 @@ pub async fn follow_order(me: &Me, key: &str, hash: &str, now: i64) -> crate::ut
     let (removed, noop) = api.remove_orders(std::slice::from_ref(&id)).await?;
     let mut t = me.borrow_mut();
     if let Some(o) = t.order_mut(key, hash) {
+        let every = if o.i("removes") >= REMOVE_TRIES { UNKNOWN_EVERY_MS } else { FOLLOW_EVERY_MS };
         if removed.contains(&id) || noop.contains(&id) {
             o.insert("removed".into(), json!(now));
             o.insert("left_ms".into(), json!(now));
+            o.insert("state".into(), json!("cancelling"));
         }
-        o.insert("state".into(), json!("cancelling"));
-        o.insert("next_ms".into(), json!(now + FOLLOW_EVERY_MS));
+        // (not named in the answer: withdrawn as far as anyone knows only once Predict's record says so — open as it was, its
+        // shares still claimed, asked again at the next follow)
+        o.insert("next_ms".into(), json!(now + every));
     }
     Ok(())
 }
 
 pub async fn withdraw_one(me: &Me, key: &str, hash: &str) {
     let (api, id, now) = {
-        let t = me.borrow();
-        let Some(o) = t.order_of(key, hash) else { return };
-        (t.api.clone(), o.s("id"), t.now())
+        let mut t = me.borrow_mut();
+        let now = t.now();
+        let api = t.api.clone();
+        let Some(o) = t.order_mut(key, hash) else { return };
+        let asked = o.i("removes") + 1;
+        o.insert("removes".into(), json!(asked));
+        (api, o.s("id"), now)
     };
     let result = api.remove_orders(std::slice::from_ref(&id)).await;
     let mut t = me.borrow_mut();
@@ -236,6 +261,15 @@ pub async fn withdraw_all(me: &Me, why: &str) -> String {
     let mut done: HashSet<String> = HashSet::new();
     let mut error = String::new();
     if !resting.is_empty() {
+        {
+            let mut t = me.borrow_mut();
+            for (key, hash, _) in &resting {
+                if let Some(o) = t.order_mut(key, hash) {
+                    let asked = o.i("removes") + 1;
+                    o.insert("removes".into(), json!(asked));
+                }
+            }
+        }
         let ids: Vec<String> = resting.iter().map(|(_, _, id)| id.clone()).collect();
         match api.remove_orders(&ids).await {
             Ok((removed, noop)) => done = removed.into_iter().chain(noop).collect(),

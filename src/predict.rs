@@ -372,6 +372,15 @@ impl PredictApi {
         self.blocked.borrow().get(k).map(|until| until - mono()).unwrap_or(0.0)
     }
 
+    /// Key ``k``'s budget seen spent outside these requests (the speed test's own got a 429 on it): cooled BACKOFF_SECONDS
+    /// as one of these would cool it — the requests here go through a spare meanwhile, or wait, never into the same 429.
+    pub fn cool_key(&self, k: usize) {
+        let until = mono() + Self::BACKOFF_SECONDS;
+        if let Some(b) = self.blocked.borrow_mut().get_mut(k) {
+            *b = b.max(until);
+        }
+    }
+
     /// One read through key ``k`` alone (a spare checked before it is needed): its round trip, ms — or why Predict refused it.
     /// Outside the budget and the cooling: the self-check's, a handful a check.
     pub async fn try_key(&self, k: usize, path: &str) -> Res<f64> {
@@ -495,22 +504,25 @@ impl PredictApi {
         if left > 0.0 {
             return Err(Self::cooling_error(left));
         }
-        if let Some(g) = &gate {
-            let hook = self.pre_send.borrow().clone();
-            if let Some(hook) = hook {
-                hook();
-            }
-            let why = g();
-            if !why.is_empty() {
-                return Err(RemoteError::not_sent(why));
-            }
-        }
         let began = mono();
         if let Some(t) = &trace {
             t.queued_ms.set((began - t.entered.get()) * 1000.0);
         }
         let mut tried = 0;
         loop {
+            // an order's last check, before each try: a 429's round trip on one key is a wait as well (the pause, the start's
+            // line may come during it) — and the spare's try may go out on the warm connection the 429 came back on, where the
+            // network layer has no wait of its own to judge it again after
+            if let Some(g) = &gate {
+                let hook = self.pre_send.borrow().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+                let why = g();
+                if !why.is_empty() {
+                    return Err(RemoteError::not_sent(why));
+                }
+            }
             let k = self.pick_key();
             let req = Req {
                 url: format!("{}{path}", self.base),
@@ -537,7 +549,7 @@ impl PredictApi {
                             push_cap(&mut self.limited.borrow_mut(), mono(), 500);
                             self.pacer.borrow_mut().note_429();
                             // refused before anything was done (an order too: nothing placed): the same request again at once
-                            // through a spare that is free — an order's own check before its bytes go judges it again
+                            // through a spare that is free — an order judged again first (above)
                             tried += 1;
                             if tried < self.keys.len() && self.cooling() <= 0.0 {
                                 continue;
@@ -1167,7 +1179,9 @@ pub fn order_hash_of(row: &Value) -> String {
 }
 
 pub const FILLED_STATUSES: [&str; 4] = ["FILLED", "MATCHED", "COMPLETED", "DONE"];
-pub const FINAL_STATUSES: [&str; 14] = [
+/// (No "UNKNOWN" here: a status Predict does not name as open or closed is taken as open — followed, withdrawn — unless the
+/// order is filled whole.)
+pub const FINAL_STATUSES: [&str; 13] = [
     "FILLED",
     "CANCELLED",
     "CANCELED",
@@ -1181,7 +1195,6 @@ pub const FINAL_STATUSES: [&str; 14] = [
     "DONE",
     "SETTLED",
     "RESOLVED",
-    "UNKNOWN",
 ];
 pub const OPEN_STATUSES: [&str; 9] =
     ["OPEN", "PENDING", "ACTIVE", "LIVE", "NEW", "PARTIAL", "PARTIALLY_FILLED", "PARTIALLY FILLED", "RESTING"];
@@ -1219,8 +1232,9 @@ pub fn order_fill(row: &Obj, ordered_shares: f64) -> (f64, String) {
                     Some(other) => Some(as_f64(other)),
                 }
             };
-            match (f(row.get("amount")), f(row.get("amountFilled"))) {
-                (Some(a), Some(g)) => (a.trunc(), g.trunc()),
+            // (the same fields as above — amountFilled, else filled — and their fractions kept: shares written as "12.5")
+            match (f(row.get("amount")), f(got_value)) {
+                (Some(a), Some(g)) => (a, g),
                 _ => return (0.0, status),
             }
         }
@@ -1258,6 +1272,11 @@ pub fn order_price(row: &Obj) -> Option<f64> {
         }
         let Some(mut price) = dec_of(value) else { continue };
         if price > Decimal::ONE {
+            // a price over a dollar is one in wei — at 1e12 and up (a millionth of a dollar); between, it is in no unit read
+            // here (cents?): not taken, never shrunk into a price of almost nothing
+            if price < Decimal::from(1_000_000_000_000u64) {
+                continue;
+            }
             price /= Decimal::from_str("1000000000000000000").unwrap_or(Decimal::ONE);
         }
         if price > Decimal::ZERO && price <= Decimal::ONE {
@@ -1334,12 +1353,19 @@ impl Chain {
         Ok(data.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    fn hex_bytes(result: &Value) -> Vec<u8> {
-        let text = match result {
-            Value::String(s) => s.clone(),
-            _ => "0x".into(),
+    /// An eth_call's answer as its bytes: a 0x hex string of whole bytes, a 32-byte word at the least — anything else (no
+    /// result, a "0x" with nothing in it, odd or bad hex, a short answer) an error: a node's slip is never read as a zero (a
+    /// balance or an allowance of nothing, an account nobody controls).
+    fn word_bytes(result: &Value) -> Res<Vec<u8>> {
+        let Value::String(text) = result else {
+            return Err(RemoteError::new(format!("链上节点的应答不是十六进制数据（{}）", type_name(result))));
         };
-        hex::decode(text.trim_start_matches("0x")).unwrap_or_default()
+        let out = hex::decode(text.trim_start_matches("0x"))
+            .map_err(|_| RemoteError::new(format!("链上节点的应答不是有效的十六进制：{}", brief_error(text, 40))))?;
+        if out.len() < 32 {
+            return Err(RemoteError::new(format!("链上节点的应答只有 {} 字节（应有 32）", out.len())));
+        }
+        Ok(out)
     }
 
     pub async fn call_uint(&self, to: &str, signature: &str, addresses: &[&str]) -> Res<u128> {
@@ -1348,7 +1374,7 @@ impl Chain {
             data.extend_from_slice(&crate::wallet::address_word(a).map_err(RemoteError::new)?);
         }
         let result = self.rpc("eth_call", json!([{"to": to, "data": format!("0x{}", hex::encode(&data))}, "latest"])).await?;
-        Ok(word_u128(&Self::hex_bytes(&result)))
+        Ok(word_u128(&Self::word_bytes(&result)?))
     }
 
     pub async fn usdt_balance(&self) -> Res<u128> {
@@ -1358,12 +1384,10 @@ impl Chain {
 
     pub async fn bnb_balance(&self) -> Res<u128> {
         let result = self.rpc("eth_getBalance", json!([self.wallet.signer, "latest"])).await?;
-        let text = match &result {
-            Value::String(s) => s.clone(),
-            _ => "0x0".into(),
-        };
-        let text = text.trim_start_matches("0x");
-        Ok(u128::from_str_radix(if text.is_empty() { "0" } else { text }, 16).unwrap_or(u128::MAX))
+        // (a hex quantity, "0x0" for none: anything else is the node's slip, never a balance)
+        let digits = result.as_str().map(|t| t.trim_start_matches("0x")).unwrap_or("");
+        u128::from_str_radix(digits, 16)
+            .map_err(|_| RemoteError::new(format!("链上节点的余额应答读不出：{}", brief_error(&result.to_string(), 40))))
     }
 
     pub async fn allowance(&self, spender_key: &str) -> Res<u128> {
@@ -1378,8 +1402,9 @@ impl Chain {
         data.extend_from_slice(&crate::wallet::address_word(account).map_err(RemoteError::new)?);
         let to = self.wallet.address("ECDSA_VALIDATOR");
         let result = self.rpc("eth_call", json!([{"to": to, "data": format!("0x{}", hex::encode(&data))}, "latest"])).await?;
-        let out = Self::hex_bytes(&result);
-        Ok(if out.len() >= 32 { format!("0x{}", hex::encode(&out[12..32])) } else { format!("0x{}", "0".repeat(40)) })
+        // (an account the validator does not know is a whole word of zeros — told apart from an answer with no word in it)
+        let out = Self::word_bytes(&result)?;
+        Ok(format!("0x{}", hex::encode(&out[12..32])))
     }
 }
 
@@ -1409,8 +1434,23 @@ mod tests {
         assert!(!order_final(&row, 50.0));
         let row: Obj = serde_json::from_value(json!({"status": "FILLED", "amount": "0"})).unwrap();
         assert_eq!(order_fill(&row, 50.0).0, 50.0);
+        // a status Predict does not name as open or closed: open (followed, withdrawn) unless filled whole
+        let row: Obj = serde_json::from_value(json!({"status": "UNKNOWN", "amount": "50", "amountFilled": "10"})).unwrap();
+        assert!(!order_final(&row, 50.0));
+        let row: Obj = serde_json::from_value(json!({"status": "unknown", "amount": "50", "amountFilled": "50"})).unwrap();
+        assert!(order_final(&row, 50.0));
         let row: Obj = serde_json::from_value(json!({"averagePrice": "580000000000000000"})).unwrap();
         assert_eq!(order_price(&row), Some(0.58));
+        // a price in no unit read here (58: cents?) is not taken, never 5.8e-17; the next field is
+        let row: Obj = serde_json::from_value(json!({"averagePrice": "58", "avgPrice": "0.57"})).unwrap();
+        assert_eq!(order_price(&row), Some(0.57));
+        let row: Obj = serde_json::from_value(json!({"averagePrice": 58})).unwrap();
+        assert_eq!(order_price(&row), None);
+        // shares written with fractions: read as they are, from amountFilled or else filled
+        let row: Obj = serde_json::from_value(json!({"status": "OPEN", "amount": "20.0", "filled": "12.5"})).unwrap();
+        assert_eq!(order_fill(&row, 20.0).0, 12.5);
+        let row: Obj = serde_json::from_value(json!({"status": "OPEN", "amount": "0.8", "amountFilled": "0.4"})).unwrap();
+        assert_eq!(order_fill(&row, 10.0).0, 5.0);
         assert_eq!(word_u128(&[0xff; 32]), u128::MAX);
         assert_eq!(answer_shape(&json!({"success": true, "data": {"b": 1, "a": 2}})), "data,success,data{a,b}");
         let jwt = format!("x.{}.y", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1790000000}"#));

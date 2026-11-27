@@ -10,6 +10,7 @@ import unittest
 
 from fakes import make_taker, run
 from ruletaker import console
+from ruletaker import taker as T
 from ruletaker.review import daily, records_csv, review, totals
 from ruletaker.status import StatusServer
 from ruletaker.store import Store
@@ -145,6 +146,27 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(review(recs, taker.settings, START, 2)["totals"]["on"]["windows"], 2)  # the last two days' windows alone
         lines = records_csv(recs).strip().splitlines()
         self.assertEqual(len(lines), 5)
+        # a window of three orders (one never sent, two filled): its P&L on one line — the column summed counts it once
+        recs["w2"] = {"slug": "w2", "rule": "gold_shut", "mode": "on", "side": "up", "start_ms": START + 86_400_000, "pnl": 10.5,
+                      "result": "up", "orders": [{"hash": "0x1", "state": "not_sent", "shares": 50.0, "limit": 0.58},
+                                                 {"hash": "0x2", "state": "final", "shares": 20.0, "filled": 20.0, "limit": 0.58, "avg": 0.55},
+                                                 {"hash": "0x3", "state": "final", "shares": 30.0, "filled": 30.0, "limit": 0.58, "avg": 0.56}]}
+        mine = [line.split(",") for line in records_csv(recs).strip().splitlines() if ",w2," in line]
+        self.assertEqual([cells[-1] for cells in mine], ["", "10.5", ""])
+
+    def test_the_kept_reviews_and_order_tests_never_pile_up(self) -> None:
+        taker, *_ = make_taker(START - 3_600_000)
+        for days in range(1, 13):
+            taker.review_data(days)
+            taker.clock.ms += 1_000
+        self.assertEqual(sorted(taker.review_held), list(range(5, 13)))  # (the spans asked longest ago let go)
+        # an order test's record goes KEEP_DAYS after it, as the windows' records do
+        now = taker.now()
+        taker.store.put("test:0xold", {"at": now - T.KEEP_DAYS * 86_400_000 - 1, "hash": "0xold"})
+        taker.store.put("test:0xnew", {"at": now - 86_400_000, "hash": "0xnew"})
+        taker.plan(now)
+        self.assertIsNone(taker.store.get("test:0xold"))
+        self.assertIsNotNone(taker.store.get("test:0xnew"))
 
     def test_cached_and_never_in_the_race_seconds(self) -> None:
         taker, *_ = make_taker(START - 3_600_000)

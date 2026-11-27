@@ -116,6 +116,9 @@ class IndexFeed:
             raise
         except Exception as error:
             self.candle_error[key] = clean_error(error) or type(error).__name__
+            if len(self.candle_error) > 400:  # (as the candles themselves: the oldest let go)
+                for old in sorted(self.candle_error)[:len(self.candle_error) - 400]:
+                    self.candle_error.pop(old, None)
             return None
 
     async def read_price(self, symbol: str) -> None:

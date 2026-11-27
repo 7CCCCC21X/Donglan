@@ -1,6 +1,7 @@
 """Small shared helpers: the clock zones, errors, the text forms, JSON (orjson when installed)."""
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import logging
@@ -59,6 +60,37 @@ def clean_error(error: BaseException | str) -> str:
     text = re.sub(r"\b\d{5,}:[A-Za-z0-9_-]{15,}\b", "[TOKEN REDACTED]", text)
     text = re.sub(r"https?://\S+", "[URL]", text)
     return text[:280]
+
+
+_LOG_URL = re.compile(r"(https?://)([^/\s?#]*)(\S*)")
+_LOOPBACK = ("127.0.0.1", "localhost", "[::1]", "0.0.0.0")
+
+
+def redact_log(text: str) -> str:
+    """A log line as it is written (src/util.rs clean_error_keep): a Telegram bot token taken out; a URL kept to its host — its
+    path and query dropped (a node's key may sit in its path, /v2/<key>; a query's key= or token=) unless it is the machine's
+    own (the console's link); one with a login in it (user:password@) or Telegram's taken out whole."""
+    text = re.sub(r"\b\d{5,}:[A-Za-z0-9_-]{15,}\b", "[TOKEN REDACTED]", text)
+
+    def one(m: re.Match) -> str:
+        scheme, host, rest = m.group(1), m.group(2), m.group(3)
+        if "@" in host or "telegram.org" in m.group(0) or "key=" in rest or "token=" in rest:
+            return "[URL]"
+        if rest in ("", "/") or host.lower().rsplit(":", 1)[0] in _LOOPBACK or host.lower().startswith("[::1]"):
+            return m.group(0)
+        return f"{scheme}{host}/[…]"
+    return _LOG_URL.sub(one, text)
+
+
+class _RedactLog(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # (a line that will not format is left to logging's own report: never an error in the caller's path)
+        with contextlib.suppress(Exception):
+            record.msg, record.args = redact_log(record.getMessage()), None
+        return True
+
+
+LOG.addFilter(_RedactLog())
 
 
 def brief_error(text: str, limit: int = 60) -> str:

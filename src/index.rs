@@ -36,7 +36,7 @@ pub struct IndexFeed {
     pub index_ms: RefCell<HashMap<String, i64>>,
     pub priced_ms: RefCell<HashMap<String, i64>>,
     pub candles: RefCell<BTreeMap<(String, i64), Decimal>>,
-    pub candle_error: RefCell<HashMap<(String, i64), String>>,
+    pub candle_error: RefCell<BTreeMap<(String, i64), String>>,
     /// (symbol, the index's own time) — the in-play looks
     pub on_change: RefCell<Option<Rc<dyn Fn(&str, i64)>>>,
     /// whether an in-play window needs the index now (the REST read's pace)
@@ -64,7 +64,7 @@ impl IndexFeed {
             index_ms: RefCell::new(HashMap::new()),
             priced_ms: RefCell::new(HashMap::new()),
             candles: RefCell::new(BTreeMap::new()),
-            candle_error: RefCell::new(HashMap::new()),
+            candle_error: RefCell::new(BTreeMap::new()),
             on_change: RefCell::new(None),
             needed: RefCell::new(None),
             wanted: RefCell::new(None),
@@ -194,7 +194,12 @@ impl IndexFeed {
                 Some(close)
             }
             Err(error) => {
-                self.candle_error.borrow_mut().insert(key, clean_error(&error));
+                let mut errors = self.candle_error.borrow_mut();
+                errors.insert(key, clean_error(&error));
+                // (as the candles themselves: the oldest let go — a window whose minute never reads adds one only)
+                while errors.len() > 400 {
+                    errors.pop_first();
+                }
                 None
             }
         }
@@ -331,5 +336,23 @@ mod tests {
         assert!(!f.push_index("XAUUSDT", Decimal::from_str("4013").unwrap(), now - 1, now)); // older
         assert_eq!(f.price_problem("XAUUSDT", now + 600_000, now), "");
         assert!(f.price_problem("XAUUSDT", now + 60_000, now + 30_000).starts_with("指数 30 秒未更新"));
+    }
+
+    #[test]
+    fn a_start_line_that_never_reads_is_kept_as_a_few_errors_only() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let f = IndexFeed::new(&["xauusdt"], "https://fapi.binance.test", "wss://fstream.binance.test/market");
+            let getter: Getter = Rc::new(|_, _| Box::pin(async { Err(crate::util::RemoteError::new("HTTP 503: down")) }));
+            *f.getter.borrow_mut() = Some(getter);
+            let start = 1_795_039_200_000i64;
+            for i in 0..450 {
+                let at = start + i * 900_000;
+                assert!(f.ensure_start("XAUUSDT", at, at + 2_000).await.is_none());
+            }
+            let errors = f.candle_error.borrow();
+            assert_eq!(errors.len(), 400);
+            assert!(errors.keys().all(|(_, minute)| *minute >= start + 50 * 900_000 - 60_000), "the oldest let go");
+        });
     }
 }

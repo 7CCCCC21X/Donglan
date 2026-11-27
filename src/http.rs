@@ -679,8 +679,13 @@ impl Http {
                     t.wrote_wall.set(crate::util::now_ms());
                 }
                 if let Err(e) = sent {
+                    // the server had closed it: once more, on another (judged again first). Safe for a POST too: a write that
+                    // fails or times out never handed the whole request to the kernel (write_all and the TLS flush end only
+                    // once every byte is in), so the server has at most part of it — a TLS record cut short it cannot even
+                    // open — which it drops with the connection: no order can come of it. An answer that does not come
+                    // after a whole request is another thing: below, never sent again.
                     if reused {
-                        self.stats.borrow_mut().retried += 1; // the server had closed it; nothing of this request was taken
+                        self.stats.borrow_mut().retried += 1;
                         waited = true;
                         continue;
                     }

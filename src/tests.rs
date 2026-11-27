@@ -38,6 +38,9 @@ pub fn market_of(mid: &str, slug: &str, status: &str) -> Obj {
 }
 
 /// What PredictApi asks of Predict, answered from maps; every request recorded.
+/// What happens meanwhile, given a request's path.
+pub type PathHook = Rc<dyn Fn(&str)>;
+
 #[derive(Default)]
 pub struct FakePredict {
     pub markets: RefCell<HashMap<String, Obj>>,
@@ -70,8 +73,8 @@ pub struct FakePredict {
     pub prewarms: Cell<usize>,
     /// GET /orders/{hash}, one answer each in turn: "" as it stands, "empty" a 200 with no order in it, "timeout" lost
     pub order_reads: RefCell<std::collections::VecDeque<&'static str>>,
-    /// a cancel answered without naming the ids ("silent": carried out all the same; "ignored": not carried out) or naming
-    /// them as nothing to do ("noop": filled or gone already)
+    /// a cancel answered without naming the ids ("silent": carried out all the same; "ignored": not carried out), naming
+    /// them as nothing to do ("noop": filled or gone already), or naming them as withdrawn and not carrying it out ("phantom")
     pub remove_mode: Cell<&'static str>,
     /// the USDT allowance per exchange (wallet::EXCHANGES key); one not named has ``chain_allowed``
     pub allowed_by: RefCell<HashMap<&'static str, u128>>,
@@ -80,8 +83,14 @@ pub struct FakePredict {
     pub stp_cancel: Cell<bool>,
     /// API keys whose every request Predict refuses with a 429 (its budget spent), before anything is done
     pub limited_keys: RefCell<HashSet<String>>,
+    /// whatever happens while a 429 is on its way back (the clock past a line, a pause), given the request's path
+    pub on_429: RefCell<Option<PathHook>>,
     /// API keys Predict does not know (401)
     pub unknown_keys: RefCell<HashSet<String>>,
+    /// a chain node's slip: this as the result of every eth_call and eth_getBalance ("0x", null, bad hex …)
+    pub chain_slip: RefCell<Option<Value>>,
+    /// the sign-in refused with this (Predict's auth down a moment)
+    pub auth_error: RefCell<Option<String>>,
 }
 
 impl FakePredict {
@@ -105,6 +114,9 @@ impl FakePredict {
     fn answer(&self, method: &str, path: &str, body: Option<&[u8]>) -> Res<Vec<u8>> {
         self.calls.borrow_mut().push(format!("{method} {path}"));
         let not_found = || Err(RemoteError::new("HTTP 404: not found"));
+        if let (true, Some(error)) = (path.starts_with("/auth"), self.auth_error.borrow().as_ref()) {
+            return Err(RemoteError::new(error.clone()));
+        }
         if path == "/auth/message" {
             return Self::ok(json!({"message": "Sign in to predict.fun"}));
         }
@@ -175,7 +187,7 @@ impl FakePredict {
                 body["data"]["ids"].as_array().map(|a| a.iter().map(crate::util::py_str).collect()).unwrap_or_default();
             self.removed.borrow_mut().extend(ids.clone());
             let mode = self.remove_mode.get();
-            if mode != "ignored" {
+            if mode != "ignored" && mode != "phantom" {
                 for row in self.orders.borrow_mut().values_mut() {
                     if ids.contains(&row.s("id")) && row.s("status") == "OPEN" {
                         row.insert("status".into(), json!("CANCELLED"));
@@ -184,6 +196,9 @@ impl FakePredict {
             }
             if mode == "noop" {
                 return Self::ok(json!({"removed": [], "noop": ids}));
+            }
+            if mode == "phantom" {
+                return Self::ok(json!({"removed": ids, "noop": []})); // (named as withdrawn, left on the book all the same)
             }
             if !mode.is_empty() {
                 return Self::ok(json!({"removed": [], "noop": []}));
@@ -230,6 +245,7 @@ impl FakePredict {
             }
             _ => Value::Null,
         };
+        let result = self.chain_slip.borrow().clone().unwrap_or(result);
         Ok(serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "result": result})).unwrap_or_default())
     }
 }
@@ -247,6 +263,10 @@ impl Transport for FakePredict {
             }
             let key = req.headers.iter().find(|(h, _)| h == "x-api-key").map(|(_, v)| v.clone()).unwrap_or_default();
             if self.limited_keys.borrow().contains(&key) {
+                let meanwhile = self.on_429.borrow().clone();
+                if let Some(meanwhile) = meanwhile {
+                    meanwhile(req.url.split("/v1").nth(1).unwrap_or(""));
+                }
                 return Err(RemoteError::retry("HTTP 429: Rate limit exceeded", 30)); // (refused before anything is done)
             }
             if self.unknown_keys.borrow().contains(&key) {
@@ -1857,6 +1877,180 @@ fn the_day_s_loss_stop_holds_after_a_later_profit_until_resume() {
 }
 
 #[test]
+fn a_resumed_day_s_floor_follows_the_cap_and_may_be_zero() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[("RULE_MAX_DAILY_LOSS_USD", "10")]);
+        r.found().await;
+        let settle = |t: &mut Taker, key: &str, pnl: f64| {
+            let day = t.now();
+            let rec = json!({"slug": key, "mode": "on", "rule": "gold_shut", "side": "up", "pnl": pnl, "orders": [],
+                             "settled_day": day_of(day), "start_ms": day});
+            t.recs.insert(key.into(), rec.as_object().cloned().unwrap());
+            t.pnl_epoch += 1;
+            t.hold_loss_stop();
+        };
+        settle(&mut r.me.borrow_mut(), "a", -12.0);
+        settle(&mut r.me.borrow_mut(), "b", 22.0); // +$10 now: the stop held all the same
+        assert!(!r.me.borrow().loss_stop_why().is_empty());
+        assert!(r.me.borrow().state()["loss_stop"].as_str().is_some_and(|w| w.contains("停机线")), "the console's resume");
+        // resumed at exactly the cap: the line at $0 — a line, not a missing one
+        let reply = control::control(&r.me, "resume", "").await;
+        assert!(reply.contains("停机线移到 +$0.00"), "{reply}");
+        assert_eq!(r.me.borrow().loss_floor(), Some(0.0));
+        assert_eq!(r.me.borrow().state()["loss_stop"], json!(""));
+        settle(&mut r.me.borrow_mut(), "c", -10.5); // -$0.50: under it
+        assert!(r.me.borrow().block(0.0, None).contains("停机线"), "{}", r.me.borrow().block(0.0, None));
+    });
+    run(async {
+        let r = rig(start() - 3_600_000, &[("RULE_MAX_DAILY_LOSS_USD", "10")]);
+        r.found().await;
+        let settle = |t: &mut Taker, key: &str, pnl: f64| {
+            let day = t.now();
+            let rec = json!({"slug": key, "mode": "on", "rule": "gold_shut", "side": "up", "pnl": pnl, "orders": [],
+                             "settled_day": day_of(day), "start_ms": day});
+            t.recs.insert(key.into(), rec.as_object().cloned().unwrap());
+            t.pnl_epoch += 1;
+            t.hold_loss_stop();
+        };
+        settle(&mut r.me.borrow_mut(), "a", -12.0);
+        let reply = control::control(&r.me, "resume", "").await; // -$12 -> the line at -$22
+        assert!(reply.contains("停机线移到 −$22.00"), "{reply}");
+        settle(&mut r.me.borrow_mut(), "b", -7.0); // -$19: over the line
+        assert_eq!(r.me.borrow().block(0.0, None), "");
+        // the cap tightened to $5 the same day: counted from the P&L at the resume, -$17 — under it now, stopped at once
+        let mut values = serde_json::Map::new();
+        values.insert("RULE_MAX_DAILY_LOSS_USD".into(), json!("5"));
+        assert!(matches!(control::save_settings(&r.me, &values).await, control::SaveResult::Done(_)));
+        assert_eq!(r.me.borrow().loss_floor(), Some(-17.0));
+        assert!(r.me.borrow().block(0.0, None).contains("停机线"), "{}", r.me.borrow().block(0.0, None));
+        // and back to the deploy's $10: -$22 again (the stop reached meanwhile holds until /resume)
+        assert!(matches!(control::reset_settings(&r.me, None).await, control::SaveResult::Done(_)));
+        assert_eq!(r.me.borrow().loss_floor(), Some(-22.0));
+    });
+    // the console's button resumes a loss stop as well as a pause, asked first
+    assert!(crate::server::PAGE.contains("held=!!(s.paused||s.loss_stop)"));
+    assert!(crate::server::PAGE.contains("if(s.loss_stop){if(confirm("));
+}
+
+#[test]
+fn a_failed_renewal_with_the_token_still_good_holds_nothing_up() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        flow::prepare(&r.me).await;
+        assert!(r.me.borrow().ready());
+        let api = r.me.borrow().api.clone();
+        let now_s = crate::util::now_ms() / 1000;
+        api.jwt_exp.set(now_s + 200); // good 200 s more: to be renewed ahead, still good for an order
+        assert!(api.usable() && !api.fresh());
+        *r.api.auth_error.borrow_mut() = Some("HTTP 502: Bad Gateway".into());
+        flow::prepare(&r.me).await;
+        assert!(r.me.borrow().ready(), "{}", r.me.borrow().not_ready_why());
+        assert_eq!(r.me.borrow().block(0.0, None), "");
+        // the token run out with the sign-in still down: that holds the orders
+        api.jwt_exp.set(now_s + 20);
+        flow::prepare(&r.me).await;
+        assert!(r.me.borrow().not_ready_why().contains("502"), "{}", r.me.borrow().not_ready_why());
+        // signed in again: free
+        *r.api.auth_error.borrow_mut() = None;
+        flow::prepare(&r.me).await;
+        assert!(r.me.borrow().ready(), "{}", r.me.borrow().not_ready_why());
+    });
+}
+
+#[test]
+fn a_chain_node_s_empty_answer_is_an_error_never_a_zero() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        flow::refresh_balance(&r.me).await;
+        let before = r.me.borrow().usdt;
+        assert!(before.is_some_and(|u| u > 0));
+        let chain = r.me.borrow().chain.clone().unwrap();
+        let account = format!("0x{}", "ab".repeat(20));
+        for slip in [json!("0x"), Value::Null, json!("0x123"), json!("0xzz"), json!(format!("0x{}", "00".repeat(31)))] {
+            *r.api.chain_slip.borrow_mut() = Some(slip.clone());
+            assert!(chain.usdt_balance().await.is_err(), "{slip}");
+            assert!(chain.allowance("CTF_EXCHANGE").await.is_err(), "{slip}");
+            assert!(chain.account_owner(&account).await.is_err(), "{slip}");
+            flow::refresh_balance(&r.me).await;
+            assert_eq!(r.me.borrow().usdt, before, "{slip}: the balance read before kept");
+            assert!(!r.me.borrow().balance_error.is_empty(), "{slip}");
+        }
+        // BNB's balance: a quantity, "0x0" for none
+        *r.api.chain_slip.borrow_mut() = Some(json!("0x"));
+        assert!(chain.bnb_balance().await.is_err());
+        *r.api.chain_slip.borrow_mut() = Some(json!("0x0"));
+        assert_eq!(chain.bnb_balance().await.unwrap(), 0);
+        // a whole word of zeros is a zero: nothing there, an account the validator does not know
+        *r.api.chain_slip.borrow_mut() = Some(json!(format!("0x{}", "00".repeat(32))));
+        assert_eq!(chain.usdt_balance().await.unwrap(), 0);
+        assert_eq!(chain.account_owner(&account).await.unwrap(), format!("0x{}", "0".repeat(40)));
+    });
+}
+
+#[test]
+fn a_failed_balance_read_backs_off_on_its_own_clock_in_a_busy_stretch() {
+    run(async {
+        let r = rig(start() - 50_000, &[]); // (busy: the start within a minute — the balance read every 20 s)
+        r.found().await;
+        flow::refresh_balance(&r.me).await;
+        let due = |r: &Rig| {
+            let t = r.me.borrow();
+            flow::balance_due(&t, t.now(), taker::BALANCE_BUSY_MS)
+        };
+        r.advance(taker::BALANCE_BUSY_MS);
+        assert!(due(&r));
+        *r.api.chain_slip.borrow_mut() = Some(json!("0x"));
+        flow::refresh_balance(&r.me).await;
+        // its last good read 20 s and more old, yet no read again before 15 s are out — then 30, then every minute
+        for wait in [taker::BALANCE_RETRY_MS, 2 * taker::BALANCE_RETRY_MS, taker::BALANCE_RETRY_MAX_MS, taker::BALANCE_RETRY_MAX_MS] {
+            r.advance(2_000);
+            assert!(!due(&r), "a read 2 s after a failure");
+            r.advance(wait - 2_000);
+            assert!(due(&r), "{wait}");
+            flow::refresh_balance(&r.me).await;
+        }
+        // read again: the backoff gone
+        *r.api.chain_slip.borrow_mut() = None;
+        r.advance(taker::BALANCE_RETRY_MAX_MS);
+        flow::refresh_balance(&r.me).await;
+        assert_eq!(r.me.borrow().balance_error, "");
+        r.advance(taker::BALANCE_BUSY_MS);
+        assert!(due(&r));
+    });
+}
+
+#[test]
+fn the_kept_reviews_and_order_tests_never_pile_up() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        for days in 1..=12 {
+            r.me.borrow_mut().review_data(days);
+            r.advance(1_000);
+        }
+        let held: Vec<i64> = {
+            let t = r.me.borrow();
+            let mut d: Vec<i64> = t.review_held.keys().copied().collect();
+            d.sort();
+            d
+        };
+        assert_eq!(held, (5..=12).collect::<Vec<i64>>(), "the spans asked longest ago let go");
+        // an order test's record goes KEEP_DAYS after it, as the windows' records do
+        let now = r.me.borrow().now();
+        {
+            let mut t = r.me.borrow_mut();
+            t.store.put("test:0xold", &json!({"at": now - taker::KEEP_DAYS * crate::util::DAY_MS - 1, "hash": "0xold"}));
+            t.store.put("test:0xnew", &json!({"at": now - crate::util::DAY_MS, "hash": "0xnew"}));
+            t.plan(now);
+        }
+        let t = r.me.borrow();
+        assert!(t.store.get("test:0xold").is_none());
+        assert!(t.store.get("test:0xnew").is_some());
+    });
+}
+
+#[test]
 fn the_balance_keeps_what_an_unconfirmed_order_may_still_take() {
     run(async {
         let r = rig(start() - 3_600_000, &[]);
@@ -2343,6 +2537,90 @@ fn an_order_predict_cancelled_itself_is_said_so_one_we_withdrew_is_not() {
 }
 
 #[test]
+fn a_withdrawal_predict_confirmed_but_did_not_carry_out_is_asked_again_and_followed() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.remove_mode.set("phantom"); // (named as withdrawn, left on the book all the same)
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        r.advance(taker::FILL_READ_MS);
+        orders::follow(&r.me).await;
+        assert_eq!((r.order(0).state(), r.api.removed.borrow().len()), ("cancelling", 1));
+        // a moment on, Predict's record still open: read again, not asked again yet
+        r.advance(taker::FOLLOW_EVERY_MS);
+        orders::follow(&r.me).await;
+        assert_eq!((r.order(0).state(), r.api.removed.borrow().len()), ("cancelling", 1));
+        // past the settling time it is on the book: asked again — and never final while Predict says it is open
+        for _ in 0..30 {
+            r.advance(taker::REMOVE_SETTLE_MS);
+            orders::follow(&r.me).await;
+            assert_ne!(r.order(0).state(), "final", "{:?}", r.order(0));
+        }
+        let asked = r.api.removed.borrow().len();
+        assert!(asked > taker::REMOVE_TRIES as usize, "{asked}");
+        // (past REMOVE_TRIES, every UNKNOWN_EVERY_MS: 90 s of it are not 30 asks)
+        assert!(asked < 20, "{asked}");
+        // a fill well over a minute after the first withdrawal: still taken
+        let hash = r.order(0).s("hash").to_lowercase();
+        {
+            let mut rows = r.api.orders.borrow_mut();
+            let row = rows.get_mut(&hash).unwrap();
+            let amount: u128 = row.s("amount").parse().unwrap();
+            row.insert("amountFilled".into(), json!((amount / 2).to_string()));
+        }
+        r.advance(taker::UNKNOWN_EVERY_MS);
+        orders::follow(&r.me).await;
+        assert!((r.order(0).f("filled") - r.order(0).f("shares") / 2.0).abs() < 1e-9, "{:?}", r.order(0));
+        // the withdrawal carried out at last: off the book, final a minute on, never said to be Predict's own doing
+        r.api.remove_mode.set("");
+        for _ in 0..3 {
+            r.advance(taker::UNKNOWN_EVERY_MS);
+            orders::follow(&r.me).await;
+        }
+        assert_eq!(r.order(0).state(), "closing", "{:?}", r.order(0));
+        r.advance(taker::LATE_FILL_MS);
+        orders::follow(&r.me).await;
+        let o = r.order(0);
+        assert_eq!(o.state(), "final");
+        assert!(!o.t("closed_as"), "{o:?}");
+    });
+}
+
+#[test]
+fn a_withdrawal_predict_does_not_confirm_keeps_the_order_counted_as_open() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[]);
+        r.found().await;
+        r.api.remove_mode.set("ignored"); // (the answer names nothing; the order stays on the book)
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        r.advance(taker::FILL_READ_MS);
+        orders::follow(&r.me).await;
+        let o = r.order(0);
+        assert_eq!(o.state(), "open", "{o:?}");
+        {
+            let t = r.me.borrow();
+            let rec = t.record(&slug_of(start()), Some("on")).unwrap();
+            assert_eq!(crate::rules::open_orders(rec).len(), 1);
+            assert!((crate::rules::claims(rec) - o.f("shares")).abs() < 1e-9, "its shares still claimed");
+        }
+        r.advance(taker::FOLLOW_EVERY_MS);
+        orders::follow(&r.me).await;
+        assert_eq!(r.api.removed.borrow().len(), 2, "asked again at the next follow");
+        // carried out at last (it was asked): closed by us, not by Predict on its own
+        r.api.remove_mode.set("silent");
+        r.advance(taker::FOLLOW_EVERY_MS);
+        orders::follow(&r.me).await;
+        r.advance(taker::FOLLOW_EVERY_MS);
+        orders::follow(&r.me).await;
+        let o = r.order(0);
+        assert_eq!(o.state(), "closing", "{o:?}");
+        assert!(!o.t("closed_as"), "{o:?}");
+    });
+}
+
+#[test]
 fn only_an_order_on_the_offer_s_first_showing_is_timed_against_the_fastest_hand() {
     run(async {
         let r = rig(start() - 3_600_000, &[]);
@@ -2500,6 +2778,17 @@ fn speed_test_keeps_out_of_the_races_and_runs_one_at_a_time() {
         r.me.borrow_mut().speeding = true;
         assert!(control::speed_test(&r.me, "4000").await.contains("测速正在进行"));
         assert!(control::command(&r.me, "/help", "").await.contains("/speed 测速"));
+        // never while the main key cools (refused, and its refusals add on), nor as the service stops
+        r.me.borrow_mut().speeding = false;
+        let api = r.me.borrow().api.clone();
+        api.cool_key(0);
+        assert!(api.key_cooling(0) > 0.0);
+        let said = control::speed_test(&r.me, "").await;
+        assert!(said.contains("正在限流冷却"), "{said}");
+        assert!(!r.me.borrow().speeding);
+        let r = rig(start() - 10 * 3_600_000, &[]);
+        r.me.borrow().stop.set();
+        assert!(control::speed_test(&r.me, "").await.contains("服务正在停止"));
     });
 }
 
@@ -2547,6 +2836,34 @@ fn a_429_on_the_key_in_use_sends_the_request_again_through_a_spare() {
         assert!(api.orderbook(MID).await.is_err());
         assert!(api.cooling() > 0.0);
         assert!(r.me.borrow().block(0.0, None).contains("限流冷却中"));
+    });
+}
+
+#[test]
+fn an_order_sent_again_through_a_spare_is_judged_again_first() {
+    run(async {
+        let r = rig(start() - 3_600_000, &[("RULE_API_KEY_2", "B")]);
+        r.found().await;
+        // the main key's budget spent as the order goes out (no read refused before it: the order's own try is on it)
+        let fake = r.api.clone();
+        let api = r.me.borrow().api.clone();
+        *api.pre_send.borrow_mut() = Some(Rc::new(move || {
+            fake.limited_keys.borrow_mut().insert("k".into());
+        }));
+        // the order's 429 on the main key took its round trip: the start's 15-second line passed meanwhile
+        let clock = r.clock.clone();
+        *r.api.on_429.borrow_mut() = Some(Rc::new(move |path: &str| {
+            if path == "/orders" {
+                clock.set(start() - taker::STOP_MS + 10);
+            }
+        }));
+        r.push(MID, book(&[("0.55", "100")], &[]));
+        r.sends().await;
+        assert!(r.created().is_empty(), "the spare's try held: {:?}", r.created());
+        let o = r.order(0);
+        assert_eq!(o.state(), "not_sent", "{o:?}");
+        assert!(o.s("error").contains("离开场不足 15 秒"), "{}", o.s("error"));
+        assert!(r.me.borrow().api.key_cooling(0) > 0.0, "the main key cools as before");
     });
 }
 
@@ -2819,6 +3136,24 @@ fn the_probe_times_each_pushed_change_and_answers_the_heartbeat() {
         let said = say.lines.borrow().join("\n");
         assert!(said.contains(&format!("用了 500 次（上限 600），我们这一分钟发了 {hits} 次：另外约 {} 次是别的程序", 500 - hits)), "{said}");
         assert!(said.contains("先别跑 rt.sh latency 4000"), "{said}");
+    });
+}
+
+fn probe_429(_method: &str, _path: &str, _body: &[u8]) -> Vec<u8> {
+    let body = r#"{"success":false,"message":"Rate limit exceeded"}"#;
+    format!("HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nRetry-After: 30\r\n\r\n{body}", body.len()).into_bytes()
+}
+
+#[test]
+fn the_probe_counts_the_429s_of_its_own_requests() {
+    run(async {
+        let (api_port, _) = crate::http::tests::serve(probe_429, 0).await;
+        let pairs = [("RULE_TAKER", "off"), ("RULE_REGION", "test"), ("BINANCE_WS_URL", "ws://127.0.0.1:9")];
+        let config = Config::from_env(&env_of(&pairs)).unwrap();
+        let base = format!("http://127.0.0.1:{api_port}/v1");
+        let say = crate::Say::keeping();
+        let p = crate::probe(config, 2, &base, "ws://127.0.0.1:9/ws", 0.2, &say).await;
+        assert!(p.limited >= 3, "the markets' read and the two rounds: {}", p.limited);
     });
 }
 

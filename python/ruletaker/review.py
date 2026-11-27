@@ -94,7 +94,10 @@ def records_csv(recs: dict[str, dict]) -> str:
                 "下单时刻（北京）", "推送延迟 ms", "到达→发出 ms", "往返 ms", "结果", "这一场盈亏"])
     for r in sorted(recs.values(), key=lambda r: int(r.get("start_ms") or 0)):
         rule = RULE_OF.get(r.get("rule"))
-        for o in r.get("orders") or []:
+        listed = r.get("orders") or []
+        # the window's P&L once, on its first order with a fill (else its first): the column summed counts each window once
+        carrier = next((i for i, o in enumerate(listed) if float(o.get("filled") or 0) > DUST), 0)
+        for i, o in enumerate(listed):
             lag = int(o["seen_wall"]) - int(o["book_ts"]) if o.get("book_ts") and o.get("seen_wall") else ""
             own = int(o["sent_wall"]) - int(o["seen_wall"]) if o.get("sent_wall") and o.get("seen_wall") else ""
             trip = int(o["answered_wall"]) - int(o["sent_wall"]) if o.get("answered_wall") and o.get("sent_wall") else ""
@@ -103,5 +106,5 @@ def records_csv(recs: dict[str, dict]) -> str:
                         o.get("state") or "", o.get("limit") or "", o.get("shares") or "", o.get("filled") or 0, o.get("avg") or "",
                         o.get("fee_bps") if o.get("fee_bps") is not None else "", "是" if o.get("live") else "",
                         bj(int(o.get("at") or 0)) if o.get("at") else "", lag, own, trip, r.get("result") or "",
-                        r.get("pnl") if r.get("pnl") is not None else ""])
+                        r.get("pnl") if i == carrier and r.get("pnl") is not None else ""])
     return out.getvalue()

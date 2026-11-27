@@ -255,8 +255,28 @@ pub fn day_spans(text: &str, name: &str) -> Result<Spans, String> {
     if matches!(text.as_str(), "" | "off" | "0" | "关") {
         return Ok(vec![]);
     }
+    // (spaces around a span's dash taken out first — "01:00 - 07:00" is one span; spans may still be set apart by spaces)
+    let chars: Vec<char> = text.chars().collect();
+    let dash = |c: char| matches!(c, '-' | '–' | '—' | '~' | '～' | '至' | '到');
+    let mut tight = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_whitespace() {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if !(tight.chars().last().is_some_and(dash) || (j < chars.len() && dash(chars[j]))) {
+                tight.push(' ');
+            }
+            i = j;
+            continue;
+        }
+        tight.push(chars[i]);
+        i += 1;
+    }
     let mut out = vec![];
-    for part in text.split(|c: char| matches!(c, ',' | '，' | ';' | '；') || c.is_whitespace()) {
+    for part in tight.split(|c: char| matches!(c, ',' | '，' | ';' | '；') || c.is_whitespace()) {
         if part.is_empty() {
             continue;
         }
@@ -322,6 +342,9 @@ mod tests {
     #[test]
     fn spans() {
         assert_eq!(day_spans("01:00-07:00", "X").unwrap(), vec![(60, 420)]);
+        // spaces around the dash: one span; spans set apart by spaces: as many
+        assert_eq!(day_spans("01:00 - 07:00", "X").unwrap(), vec![(60, 420)]);
+        assert_eq!(day_spans(" 01:00 至  07:00 ， 23:00 -02:00 09:00-10:00", "X").unwrap(), vec![(60, 420), (1380, 120), (540, 600)]);
         assert_eq!(day_spans("23:00-02:00，08：30至09:00", "X").unwrap(), vec![(1380, 120), (510, 540)]);
         assert_eq!(day_spans("00:55-02:00", "X").unwrap(), vec![(55, 120)]);
         assert_eq!(day_spans("22-00", "X").unwrap(), vec![(1320, 1440)]);

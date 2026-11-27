@@ -422,6 +422,90 @@ class OrderTest(unittest.TestCase):
         run(go())
 
 
+class WithdrawTest(unittest.TestCase):
+    def test_a_withdrawal_predict_confirmed_but_did_not_carry_out_is_asked_again_and_followed(self) -> None:
+        async def go() -> None:
+            taker, api, _chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            api.remove_mode = "phantom"  # (named as withdrawn, left on the book all the same)
+            stream.take(MID, book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0)
+            await asyncio.gather(*taker.sends)
+            order = taker.record(SLUG, "on")["orders"][0]
+            clock.ms += T.FILL_READ_MS
+            await taker.follow()
+            self.assertEqual((order["state"], len(api.removed)), ("cancelling", 1))
+            # a moment on, Predict's record still open: read again, not asked again yet
+            clock.ms += T.FOLLOW_EVERY_MS
+            await taker.follow()
+            self.assertEqual((order["state"], len(api.removed)), ("cancelling", 1))
+            # past the settling time it is on the book: asked again — and never final while Predict says it is open
+            for _ in range(30):
+                clock.ms += T.REMOVE_SETTLE_MS
+                await taker.follow()
+                self.assertNotEqual(order["state"], "final", order)
+            self.assertGreater(len(api.removed), T.REMOVE_TRIES)
+            self.assertLess(len(api.removed), 20)  # (past REMOVE_TRIES, every UNKNOWN_EVERY_MS: 90 s of it are not 30 asks)
+            # a fill well over a minute after the first withdrawal: still taken
+            row = api.orders[order["hash"].lower()]
+            row["amountFilled"] = str(int(row["amount"]) // 2)
+            clock.ms += T.UNKNOWN_EVERY_MS
+            await taker.follow()
+            self.assertAlmostEqual(order["filled"], order["shares"] / 2)
+            # the withdrawal carried out at last: off the book, final a minute on, never said to be Predict's own doing
+            api.remove_mode = ""
+            for _ in range(3):
+                clock.ms += T.UNKNOWN_EVERY_MS
+                await taker.follow()
+            self.assertEqual(order["state"], "closing", order)
+            clock.ms += T.LATE_FILL_MS
+            await taker.follow()
+            self.assertEqual(order["state"], "final")
+            self.assertFalse(order.get("closed_as"), order)
+        run(go())
+
+    def test_a_withdrawal_predict_does_not_confirm_keeps_the_order_counted_as_open(self) -> None:
+        from ruletaker.rules import claims, open_orders
+
+        async def go() -> None:
+            taker, api, _chain, stream, clock = make_taker(START - 3_600_000)
+            await found(taker, api)
+            api.remove_mode = "ignored"  # (the answer names nothing; the order stays on the book)
+            stream.take(MID, book(asks=[("0.55", "100")]))
+            await asyncio.sleep(0)
+            await asyncio.gather(*taker.sends)
+            order = taker.record(SLUG, "on")["orders"][0]
+            clock.ms += T.FILL_READ_MS
+            await taker.follow()
+            self.assertEqual(order["state"], "open", order)
+            rec = taker.record(SLUG, "on")
+            self.assertEqual(len(open_orders(rec)), 1)
+            self.assertAlmostEqual(claims(rec), order["shares"])  # (its shares still claimed)
+            clock.ms += T.FOLLOW_EVERY_MS
+            await taker.follow()
+            self.assertEqual(len(api.removed), 2)  # (asked again at the next follow)
+            # carried out at last (it was asked): closed by us, not by Predict on its own
+            api.remove_mode = "silent"
+            for _ in range(2):
+                clock.ms += T.FOLLOW_EVERY_MS
+                await taker.follow()
+            self.assertEqual(order["state"], "closing", order)
+            self.assertFalse(order.get("closed_as"), order)
+        run(go())
+
+    def test_a_status_predict_does_not_name_is_open_unless_filled_whole(self) -> None:
+        from ruletaker.predict import order_fill, order_final, order_price
+        self.assertFalse(order_final({"status": "UNKNOWN", "amount": "50", "amountFilled": "10"}, 50))
+        self.assertTrue(order_final({"status": "unknown", "amount": "50", "amountFilled": "50"}, 50))
+        # (as src/predict.rs reads them) a price in no unit read here (58: cents?) is not taken, never 5.8e-17; the next field is
+        self.assertEqual(order_price({"averagePrice": "580000000000000000"}), 0.58)
+        self.assertEqual(order_price({"averagePrice": "58", "avgPrice": "0.57"}), 0.57)
+        self.assertIsNone(order_price({"averagePrice": 58}))
+        # shares written with fractions: read as they are, from amountFilled or else filled
+        self.assertEqual(order_fill({"status": "OPEN", "amount": "20.0", "filled": "12.5"}, 20.0)[0], 12.5)
+        self.assertEqual(order_fill({"status": "OPEN", "amount": "0.8", "amountFilled": "0.4"}, 10.0)[0], 5.0)
+
+
 class InPlayTest(unittest.TestCase):
     def test_course_buys_only_with_the_index_ahead(self) -> None:
         from ruletaker.index import IndexFeed

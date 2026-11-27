@@ -207,6 +207,12 @@ class PredictApi:
         """Seconds until a key is free again: none cooling (or a spare free) — zero or less."""
         return self.blocked_until - time.monotonic()
 
+    def cool_key(self, k: int) -> None:
+        """Key ``k``'s budget seen spent outside these requests (the speed test's own got a 429 on it): cooled BACKOFF_SECONDS as
+        one of these would cool it — the requests here go through a spare meanwhile, or wait, never into the same 429."""
+        if 0 <= k < len(self._blocked):
+            self._blocked[k] = max(self._blocked[k], time.monotonic() + self.BACKOFF_SECONDS)
+
     def key_cooling(self, k: int) -> float:
         """Seconds key ``k`` still cools (zero or less: free)."""
         return (self._blocked[k] - time.monotonic()) if 0 <= k < len(self._blocked) else 0.0
@@ -275,14 +281,17 @@ class PredictApi:
     async def send(self, method: str, path: str, payload: Any, timeout: float, write: bool, check: str) -> tuple[bytes, float]:
         if (left := self.cooling()) > 0:  # a cooldown that began while this request waited for its slot
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
-        if check and self.before_send is not None and (why := self.before_send(check)):
-            raise NotSent(why)
         loop = asyncio.get_running_loop()
         gate = self.thread_gate(loop, check) if check and self.before_send is not None else None
         began = time.perf_counter()
         traced = {"trace": self.traces[check]} if check in self.traces else {}
         tried = 0
         while True:
+            # an order's last check, before each try: a 429's round trip on one key is a wait as well (the pause, the start's
+            # line may come during it) — and the spare's try may go out on the warm connection the 429 came back on, where the
+            # network layer has no wait of its own to judge it again after
+            if check and self.before_send is not None and (why := self.before_send(check)):
+                raise NotSent(why)
             k = self.pick_key()
             try:
                 raw = await loop.run_in_executor(WRITE_POOL if write else READ_POOL, functools.partial(
@@ -298,7 +307,7 @@ class PredictApi:
                         self.limited.append(time.monotonic())
                         self.pacer.note_429()
                         # refused before anything was done (an order too: nothing placed): the same request again at once
-                        # through a spare that is free — an order's own check before its bytes go judges it again
+                        # through a spare that is free — an order judged again first (above)
                         tried += 1
                         if tried < len(self.keys) and self.cooling() <= 0:
                             continue
@@ -688,8 +697,10 @@ def order_hash_of(row: dict) -> str:
 
 
 FILLED_STATUSES = {"FILLED", "MATCHED", "COMPLETED", "DONE"}
+# (No "UNKNOWN" here: a status Predict does not name as open or closed is taken as open — followed, withdrawn — unless the order
+# is filled whole.)
 FINAL_STATUSES = {"FILLED", "CANCELLED", "CANCELED", "EXPIRED", "INVALIDATED", "REJECTED", "FAILED", "MATCHED", "CLOSED",
-                  "COMPLETED", "DONE", "SETTLED", "RESOLVED", "UNKNOWN"}
+                  "COMPLETED", "DONE", "SETTLED", "RESOLVED"}
 OPEN_STATUSES = {"OPEN", "PENDING", "ACTIVE", "LIVE", "NEW", "PARTIAL", "PARTIALLY_FILLED", "PARTIALLY FILLED", "RESTING"}
 
 
@@ -699,8 +710,8 @@ def order_fill(row: dict, ordered_shares: float) -> tuple[float, str]:
     try:
         amount, got = int(str(row.get("amount") or "0")), int(str(row.get("amountFilled") or row.get("filled") or "0"))
     except ValueError:
-        try:
-            amount, got = int(float(row.get("amount") or 0)), int(float(row.get("amountFilled") or 0))
+        try:  # (the same fields as above — amountFilled, else filled — and their fractions kept: shares written as "12.5")
+            amount, got = float(row.get("amount") or 0), float(row.get("amountFilled") or row.get("filled") or 0)
         except (TypeError, ValueError):
             return 0.0, status
     if amount <= 0:
@@ -728,6 +739,10 @@ def order_price(row: dict) -> float | None:
         with contextlib.suppress(TypeError, ValueError, decimal.InvalidOperation):
             price = D(str(value))
             if price > 1:
+                # a price over a dollar is one in wei — at 1e12 and up (a millionth of a dollar); between, it is in no unit read
+                # here (cents?): not taken, never shrunk into a price of almost nothing
+                if price < 10 ** 12:
+                    continue
                 price = price / 10 ** 18
             if 0 < price <= 1:
                 return float(price)
@@ -765,17 +780,35 @@ class Chain:
         from .wallet import keccak
         return keccak(signature.encode())[:4]
 
+    @staticmethod
+    def word_bytes(result: Any) -> bytes:
+        """An eth_call's answer as its bytes: a 0x hex string of whole bytes, a 32-byte word at the least — anything else (no
+        result, a "0x" with nothing in it, odd or bad hex, a short answer) a RemoteError: a node's slip is never read as a zero
+        (a balance or an allowance of nothing, an account nobody controls)."""
+        if not isinstance(result, str):
+            raise RemoteError(f"链上节点的应答不是十六进制数据（{type(result).__name__}）")
+        try:
+            out = bytes.fromhex(result.removeprefix("0x"))
+        except ValueError:
+            raise RemoteError(f"链上节点的应答不是有效的十六进制：{brief_error(result, 40)}") from None
+        if len(out) < 32:
+            raise RemoteError(f"链上节点的应答只有 {len(out)} 字节（应有 32）")
+        return out
+
     async def call_uint(self, to: str, signature: str, *addresses: str) -> int:
         data = self.selector(signature) + b"".join(bytes(12) + bytes.fromhex(a[2:]) for a in addresses)
         result = await self.rpc("eth_call", [{"to": to, "data": "0x" + data.hex()}, "latest"])
-        out = bytes.fromhex(str(result or "0x").removeprefix("0x"))
-        return int.from_bytes(out[:32], "big") if out else 0
+        return int.from_bytes(self.word_bytes(result)[:32], "big")
 
     async def usdt_balance(self) -> int:
         return await self.call_uint(self.addresses["USDT"], "balanceOf(address)", self.wallet.maker)
 
     async def bnb_balance(self) -> int:
-        return int(str(await self.rpc("eth_getBalance", [self.wallet.signer, "latest"]) or "0x0"), 16)
+        result = await self.rpc("eth_getBalance", [self.wallet.signer, "latest"])
+        try:  # (a hex quantity, "0x0" for none: anything else is the node's slip, never a balance)
+            return int(result.removeprefix("0x") if isinstance(result, str) else "", 16)
+        except ValueError:
+            raise RemoteError(f"链上节点的余额应答读不出：{brief_error(str(result), 40)}") from None
 
     async def allowance(self, spender_key: str) -> int:
         return await self.call_uint(self.addresses["USDT"], "allowance(address,address)", self.wallet.maker, self.addresses[spender_key])
@@ -784,5 +817,5 @@ class Chain:
         """The signer the ECDSA validator holds for a Predict account (0x000… when the account is unknown to it)."""
         data = self.selector("ecdsaValidatorStorage(address)") + bytes(12) + bytes.fromhex(account[2:])
         result = await self.rpc("eth_call", [{"to": self.addresses["ECDSA_VALIDATOR"], "data": "0x" + data.hex()}, "latest"])
-        out = bytes.fromhex(str(result or "0x").removeprefix("0x"))
-        return "0x" + out[12:32].hex() if len(out) >= 32 else "0x" + "0" * 40
+        # (an account the validator does not know is a whole word of zeros — told apart from an answer with no word in it)
+        return "0x" + self.word_bytes(result)[12:32].hex()

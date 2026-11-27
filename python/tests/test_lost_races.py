@@ -197,14 +197,46 @@ class SpeedCommandTest(unittest.TestCase):
             taker.speeding = True
             out.append(await taker.speed_test("4000"))
             out.append(await taker.command("/help", ""))
+            # never while the main key cools (refused, and its refusals add on), nor as the service stops
+            taker.speeding = False
+            taker.api.key_cooling = lambda k: 12.0
+            out.append(await taker.speed_test(""))
+            taker, *_ = make_taker(START - 10 * 3_600_000)
+            taker.stop.set()
+            out.append(await taker.speed_test(""))
             return out
-        busy, speeding, *bad, again, help_text = run(go())
+        busy, speeding, *bad, again, help_text, cooling, stopping = run(go())
         self.assertTrue("正在抢单时段" in busy and "/speed" in busy, busy)
         self.assertFalse(speeding)
         for said in bad:
             self.assertIn("用法：/speed", said)
         self.assertIn("测速正在进行", again)
         self.assertIn("/speed 测速", help_text)
+        self.assertIn("正在限流冷却（还要 13 秒）", cooling)
+        self.assertIn("服务正在停止", stopping)
+
+    def test_a_429_on_the_speed_test_s_requests_cools_the_key_for_the_service(self) -> None:
+        from ruletaker.predict import PredictApi
+
+        async def go() -> tuple:
+            taker, *_ = make_taker(START - 10 * 3_600_000)
+            api = PredictApi("https://api.predict.fun/v1", "k", None, 0).with_spares(["B"])
+            taker.api = api
+            import ruletaker.__main__ as main
+
+            async def limited(config, say=print, **_):  # (the measurement, its reads refused with a 429)
+                say("读盘口被拒绝（HTTP 429: Rate limit exceeded）")
+                return {"limited": 3}
+            saved, main.latency = main.latency, limited
+            try:
+                said = await taker.speed_test("6000")
+            finally:
+                main.latency = saved
+            return said, api.key_cooling(0) > 0, api.pick_key()
+        said, cooling, key = run(go())
+        self.assertIn("测速的请求被 Predict 限流 3 次（429）：这把 Key 先冷却 20 秒", said)
+        self.assertTrue(cooling)
+        self.assertEqual(key, 1)  # (the service's requests through the spare meanwhile)
 
     def test_the_menu_has_the_speed_test(self) -> None:
         from ruletaker.notify import Telegram
@@ -254,6 +286,36 @@ class SpareKeyTest(unittest.TestCase):
         self.assertEqual((active, free, cooling0, switches, limits), (1, True, True, 1, 1))
         self.assertEqual((placed, active2), (1, 2))
         self.assertEqual((last, all_cooling), ("refused", True))
+
+    def test_an_order_sent_again_through_a_spare_is_judged_again_first(self) -> None:
+        from ruletaker.predict import PredictApi
+        from ruletaker.util import NotSent, RemoteError
+        created: list = []
+        line = {"passed": False}
+
+        def fake_request(url, payload=None, timeout=15, headers=None, gate=None, trace=None):
+            if (headers or {}).get("x-api-key") == "k":
+                line["passed"] = True  # (the 429 took its round trip: the start's 15-second line passed meanwhile)
+                raise RemoteError("HTTP 429: Rate limit exceeded", 30)
+            created.append(payload)  # (the spare's try on the warm connection: no wait the network layer judges it after)
+            return b'{"success": true, "data": {"orderId": "9"}}'
+
+        async def go() -> tuple:
+            api = PredictApi("https://api.predict.fun/v1", "k", None, 0).with_spares(["B"])
+            api.before_send = lambda check: "离开场不足 15 秒，这张单不再发送（它在路上等了太久）" if line["passed"] else ""
+            saved = nethttp.request
+            nethttp.request = fake_request
+            try:
+                try:
+                    await api.call("POST", "/orders", b'{"data": {"order": 1}}', priority=True, check="0xabc")
+                    return "sent", api.key_cooling(0) > 0
+                except NotSent as error:
+                    return str(error), api.key_cooling(0) > 0
+            finally:
+                nethttp.request = saved
+        answer, cooling = run(go())
+        self.assertIn("离开场不足 15 秒", answer)
+        self.assertEqual((created, cooling), ([], True))
 
     def test_the_self_check_tries_each_spare_key(self) -> None:
         import collections

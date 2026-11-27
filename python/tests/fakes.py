@@ -50,7 +50,7 @@ class FakeApi:
         self.clock: Any = None       # the taker's clock, moved on by book_ms while a REST book read is out
         self.book_ms = 0
         self.order_reads: list[str] = []
-        self.remove_mode = ""  # a cancel answered without naming the ids: "silent" carried out all the same, "ignored" not  # GET /orders/{hash}, one answer each in turn: "" as it stands, "timeout" lost
+        self.remove_mode = ""  # a cancel answered without naming the ids: "silent" carried out all the same, "ignored" not; "phantom" named as withdrawn, not carried out  # GET /orders/{hash}, one answer each in turn: "" as it stands, "timeout" lost
         self.jwt_ok = True
         self.stream: Any = None
         self.pre_send: Any = None
@@ -147,12 +147,14 @@ class FakeApi:
     async def remove_orders(self, ids: list[str]) -> dict:
         self.calls.append(("remove", tuple(ids)))
         self.removed.extend(ids)
-        if self.remove_mode != "ignored":
+        if self.remove_mode not in ("ignored", "phantom"):
             for row in self.orders.values():
                 if row["id"] in ids and row["status"] == "OPEN":
                     row["status"] = "CANCELLED"
         if self.remove_mode == "noop":  # (Predict: nothing to withdraw — filled or gone already)
             return {"removed": [], "noop": list(ids)}
+        if self.remove_mode == "phantom":  # (named as withdrawn, left on the book all the same)
+            return {"removed": list(ids), "noop": []}
         if self.remove_mode:
             self.last_remove = '{"success":true,"data":{"removed":[],"noop":[]}}'
             return {"removed": [], "noop": []}

@@ -468,14 +468,17 @@ case "$cmd" in
     vm_call control "$cmd"
     ;;
   latency)
-    # (RULE_TAKER=off: a measurement needs no private key, and is not handed one. A rate given here is this measurement's
-    # alone — the REST reads use a quarter of it — and the service's own settings stay as they are)
+    # (RULE_TAKER=off: a measurement needs no private key, and is not handed one — the API keys kept encrypted are opened for
+    # it, as for the service: vm-key.sh measure. A rate given here is this measurement's alone — the REST reads use a quarter
+    # of it — and the service's own settings stay as they are. A VM still on the version before: as before.)
     rate="${1:-}"
     case "$rate" in
       '') ;;
       *[!0-9]*) die "用法：rt.sh latency [每分钟请求数]（只给这次测量用，例：4000；不写就按设置文件里的 PREDICT_RATE_PER_MIN）" ;;
     esac
-    remote "cd / && sudo -u ruletaker env RULE_TAKER=off ${rate:+PREDICT_RATE_PER_MIN=$rate }\$($RUN_ON_VM) latency --env /etc/ruletaker/ruletaker.env"
+    remote "cd / && if [ -f /opt/ruletaker/deploy/gcp/vm-key.sh ] && grep -q '^  measure)' /opt/ruletaker/deploy/gcp/vm-key.sh; then \
+      sudo bash /opt/ruletaker/deploy/gcp/vm-key.sh measure $rate; \
+      else sudo -u ruletaker env RULE_TAKER=off ${rate:+PREDICT_RATE_PER_MIN=$rate }\$($RUN_ON_VM) latency --env /etc/ruletaker/ruletaker.env; fi"
     ;;
   restart|stop|start) remote "sudo systemctl $cmd ruletaker && sudo systemctl --no-pager --lines=5 status ruletaker || true" ;;
   ssh) ssh_to "$VM" "$ZONE" ;;

@@ -326,7 +326,11 @@ def _request_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str,
                     trace["wrote_wall"] = int(time.time() * 1000)
             except (OSError, http.client.HTTPException) as error:
                 conn.close()
-                if reused:  # the server had closed it; nothing of this request was taken: once more, on a fresh one
+                # the server had closed it: once more, on another (judged again first). Safe for a POST too: a send that fails
+                # never handed the whole request to the kernel (sendall returns only once every byte is in), so the server has
+                # at most part of it, which it drops with the connection — no order can come of it. An answer that does not come
+                # after a whole request is another thing: below, never sent again.
+                if reused:
                     _count("retried")
                     waited = True
                     continue

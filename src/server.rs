@@ -27,6 +27,8 @@ pub const PAGE: &str = include_str!("../web/console.html");
 pub const MAX_BODY: usize = 65_536;
 /// Requests served at once (more are closed at once), and the pause after a failed accept.
 pub const MAX_CONNECTIONS: usize = 32;
+/// An answer's write given this long (s): a reader that stops reading lets go of its place then.
+pub const WRITE_TIMEOUT_S: f64 = 10.0;
 pub const ACCEPT_PAUSE_MS: u64 = 100;
 
 pub struct Reply {
@@ -354,8 +356,14 @@ async fn handle(me: Me, key: String, mut sock: tokio::net::TcpStream) {
     );
     let mut out = head.into_bytes();
     out.extend(data);
-    let _ = sock.write_all(&out).await;
-    let _ = sock.shutdown().await;
+    // (a reader that stops taking the answer holds its place WRITE_TIMEOUT_S at the most: never one of the MAX_CONNECTIONS for
+    // good)
+    let limit = std::time::Duration::from_secs_f64(WRITE_TIMEOUT_S);
+    let _ = tokio::time::timeout(limit, async {
+        let _ = sock.write_all(&out).await;
+        let _ = sock.shutdown().await;
+    })
+    .await;
 }
 
 /// A request's place among the MAX_CONNECTIONS, given back however its task ends.

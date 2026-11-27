@@ -395,6 +395,16 @@ impl Taker {
                 self.recs.shift_remove(&k);
             }
         }
+        // the order tests' records (test:<hash>) go the same way, KEEP_DAYS after the test
+        let tests: Vec<String> = self
+            .store
+            .items("test:")
+            .filter(|(_, v)| v.get("at").and_then(Value::as_i64).is_some_and(|at| at > 0 && at < now - KEEP_DAYS * DAY_MS))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !tests.is_empty() {
+            self.store.delete_keys(&tests);
+        }
     }
 }
 
@@ -411,6 +421,13 @@ pub async fn prepare(me: &Me) {
             let mut t = me.borrow_mut();
             t.ready_error.clear();
             t.ready_ms = t.now();
+        }
+        Err(e) if api.usable() => {
+            // a renewal ahead of the token's end that failed: the token in hand is good a while yet (an order uses it as it
+            // is) — nothing held up; the readiness loop tries again within READY_RETRY_MS, long before it runs out
+            let mut t = me.borrow_mut();
+            t.ready_error.clear();
+            crate::warn!("规则吃单：登录提前续期没成（{}），手上的登录还能用：稍后再续", clean(&e));
         }
         Err(e) => {
             let mut t = me.borrow_mut();
@@ -455,12 +472,22 @@ pub async fn refresh_balance(me: &Me) {
             t.balance_ms = t.now();
             t.balance_asked_ms = asked;
             t.balance_error.clear();
+            t.balance_fails = 0;
+            t.balance_retry_ms = 0;
         }
         (Err(e), _) | (_, Err(e)) => {
+            // (the balance read before kept, its time with it; tried again 15 s on, then 30, then every minute)
             t.balance_error = clean(&e);
-            t.balance_ms = t.now() - BALANCE_IDLE_MS + 15_000; // (again in 15 s)
+            t.balance_fails = t.balance_fails.saturating_add(1);
+            let wait = (BALANCE_RETRY_MS << (t.balance_fails - 1).min(8)).min(BALANCE_RETRY_MAX_MS);
+            t.balance_retry_ms = t.now() + wait;
         }
     }
+}
+
+/// A balance read due now: the last one ``every`` ms old (or none yet), and no failed read's backoff in the way.
+pub fn balance_due(t: &Taker, now: i64, every: i64) -> bool {
+    now - t.balance_ms >= every && now >= t.balance_retry_ms
 }
 
 /// Signed in, checked, the balance read — and kept so.
@@ -479,12 +506,12 @@ pub async fn ready_loop(me: Me) {
                 me.borrow_mut().ready_ms = now;
                 prepare(&me).await;
             }
-            let (busy, balance_ms) = {
+            let due = {
                 let t = me.borrow();
-                (t.busy_in(now), t.balance_ms)
+                let every = if t.busy_in(now).is_some_and(|b| b <= WARM_MS) { BALANCE_BUSY_MS } else { BALANCE_IDLE_MS };
+                balance_due(&t, now, every)
             };
-            let every = if busy.is_some_and(|b| b <= WARM_MS) { BALANCE_BUSY_MS } else { BALANCE_IDLE_MS };
-            if now - balance_ms >= every {
+            if due {
                 refresh_balance(&me).await;
             }
         }
@@ -959,7 +986,7 @@ async fn warm_inner(me: &Me) -> Res<()> {
     }
     let due = {
         let t = me.borrow();
-        t.now() - t.balance_ms >= BALANCE_BUSY_MS
+        balance_due(&t, t.now(), BALANCE_BUSY_MS)
     };
     if due {
         refresh_balance(me).await;

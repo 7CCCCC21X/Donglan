@@ -113,6 +113,11 @@ impl Store {
         }
     }
 
+    /// The keys under ``prefix`` and their values, as kept in memory.
+    pub fn items<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (&'a String, &'a Value)> + 'a {
+        self.data.iter().filter(move |(k, _)| k.starts_with(prefix))
+    }
+
     /// The keys under ``prefix`` and their values, taken out of memory (the caller keeps them from now on).
     pub fn take_prefix(&mut self, prefix: &str) -> Vec<(String, Value)> {
         let keys: Vec<String> = self.data.keys().filter(|k| k.starts_with(prefix)).cloned().collect();

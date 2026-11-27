@@ -271,6 +271,8 @@ pub(crate) struct Probe {
     pub rest_ages: Vec<f64>,
     pub rest_ahead: Vec<f64>,
     pub push_ahead: Vec<f64>,
+    /// this measurement's requests Predict refused with a 429 (the key's budget spent)
+    pub limited: usize,
 }
 
 /// ``latency`` on the API at ``base`` and the push connection at ``ws_url`` (stand-ins, for the tests; the Binance index at
@@ -289,6 +291,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
     let pool = http::http();
     // (this measurement's own requests: set against what Predict counts for the key's minute)
     let sent = std::cell::Cell::new(0usize);
+    let limited = std::cell::Cell::new(0usize);
     let now = now_ms();
     let slug = format!("btc-updown-15m-{}", (now - now % 900_000) / 1000);
     let mut market_id = String::new();
@@ -303,7 +306,10 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
                 if market_id.is_empty() { "没找到" } else { &market_id }
             ));
         }
-        Err(e) => say.line(format!("读市场失败：{}", clean_error(&e))),
+        Err(e) => {
+            limited.set(limited.get() + usize::from(e.status() == 429));
+            say.line(format!("读市场失败：{}", clean_error(&e)))
+        }
     }
     // (the next quarter hour's market too: twice the books to time)
     let next = format!("btc-updown-15m-{}", (now - now % 900_000) / 1000 + 900);
@@ -321,6 +327,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
         match pool.request(&format!("{base}{path}"), None, 10.0, &headers).await {
             Ok(_) => reads.push((mono() - began) * 1000.0),
             Err(e) => {
+                limited.set(limited.get() + usize::from(e.status() == 429));
                 why = clean_error(&e);
                 if why.starts_with("HTTP ") {
                     refused.push((mono() - began) * 1000.0);
@@ -360,7 +367,11 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
         while !polled.is_empty() && !watched_out.get() {
             let asked = mono();
             sent.set(sent.get() + 1);
-            if let Ok(answer) = pool.request_json(&format!("{base}/markets/{polled}/orderbook"), None, 10.0, &headers).await {
+            let answer = pool.request_json(&format!("{base}/markets/{polled}/orderbook"), None, 10.0, &headers).await;
+            if let Err(e) = &answer {
+                limited.set(limited.get() + usize::from(e.status() == 429));
+            }
+            if let Ok(answer) = answer {
                 let got = mono();
                 reads += 1;
                 let data = if answer["data"].is_object() { &answer["data"] } else { &answer };
@@ -555,7 +566,7 @@ pub(crate) async fn probe(config: Config, rounds: usize, base: &str, ws_url: &st
          “读盘口”代表不了下单：东京读一次约 12 ms，下单往返约 49 ms（下单在 Predict 那边走得更远）。下单往返只能用私钥量：\
          在候选区域临时部署一台只记录模式的机器跑 rt.sh test（README“为什么是东京、怎么确认”）。各区域请在同一时段量。",
     );
-    Probe { reads, lags, index: index.unwrap_or_default(), rest_ages, rest_ahead, push_ahead }
+    Probe { reads, lags, index: index.unwrap_or_default(), rest_ages, rest_ahead, push_ahead, limited: limited.get() }
 }
 
 /// The index the in-play rules buy on (Binance XAUUSDT markPrice, pushed every second) for ``seconds``: each push's delay from

@@ -83,6 +83,9 @@ REST_MIN_S = 0.1
 REST_SOON_S = 0.005
 FOLLOW_EVERY_MS = 1_000
 UNKNOWN_EVERY_MS = 10_000
+REVIEW_HELD = 8               # review spans kept worked out (review_data): the page's and /review's few
+REMOVE_SETTLE_MS = 3_000      # a withdrawal Predict confirmed, its record still open this long on: it did not take — asked again
+REMOVE_TRIES = 5              # asks to withdraw an order still on the book at the follow's pace; past them every UNKNOWN_EVERY_MS
 GIVE_UP_MS = 15 * 60_000
 REJECT_PAUSE_MS = 30_000
 RACE_WAIT_S = 30.0            # the status text and the CSV wait out the race's seconds this long at the most
@@ -114,6 +117,9 @@ CONFLICT_GRACE_MS = 90_000
 CONFLICT_MISSES = 6
 LAST_WITHDRAW_S = 4.0
 BALANCE_BUSY_MS, BALANCE_IDLE_MS = 20_000, 120_000  # the USDT balance read again this often (busy: an order may go out soon)
+# a balance read that failed is tried again this long on, twice that after a second failure in a row, … at most the second (on its
+# own clock: the busy stretches' BALANCE_BUSY_MS never hurries it)
+BALANCE_RETRY_MS, BALANCE_RETRY_MAX_MS = 15_000, 60_000
 BALANCE_LAG_MS = 10_000       # ...and an order placed this long before a read began is taken as not in it yet (usd)
 RECENT_MS = 2 * DAY_MS        # the records an order's checks sum over (usd, the day's spend): those of the last two days' windows
 SEND_WAIT_S = 25.0            # at a stop: the orders on their way given this long for their answers (an order's request: 20 s at most)
@@ -334,6 +340,8 @@ class RuleTaker:
         self.usdt: int | None = None
         self.bnb: int | None = None
         self.balance_ms = 0
+        self.balance_retry_ms = 0  # no balance read before this (the clock's ms): a failed read's backoff; 0 after a good read
+        self.balance_fails = 0     # failed balance reads in a row
         self.balance_asked_ms = 0
         self.balance_error = ""
         self.allowance: dict[str, tuple[int, int]] = {}
@@ -500,7 +508,12 @@ class RuleTaker:
             return None
         today = day_of(self.now())
         if self.loss_floor_at.get("day") == today:
-            return float(self.loss_floor_at.get("floor") or -cap)
+            # resumed today: the cap counted from the P&L then — the cap in force now (one changed since applies at once); a
+            # record of an earlier version holds its floor alone (0 among them: a floor, not a missing one)
+            if isinstance(self.loss_floor_at.get("base"), (int, float)):
+                return float(self.loss_floor_at["base"]) - cap
+            if isinstance(self.loss_floor_at.get("floor"), (int, float)):
+                return float(self.loss_floor_at["floor"])
         return -cap
 
     def hold_loss_stop(self) -> None:
@@ -624,9 +637,15 @@ class RuleTaker:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self.ready_error = clean_error(error) or type(error).__name__
-            if http_status(error) in {401, 403} and not self.config.api_key:
-                self.ready_error += "（可能需要 PREDICT_API_KEY）"
+            if self.api.usable():
+                # a renewal ahead of the token's end that failed: the token in hand is good a while yet (an order uses it as it
+                # is) — nothing held up; the readiness loop tries again within READY_RETRY_MS, long before it runs out
+                self.ready_error = ""
+                LOG.warning("规则吃单：登录提前续期没成（%s），手上的登录还能用：稍后再续", clean_error(error) or type(error).__name__)
+            else:
+                self.ready_error = clean_error(error) or type(error).__name__
+                if http_status(error) in {401, 403} and not self.config.api_key:
+                    self.ready_error += "（可能需要 PREDICT_API_KEY）"
         if self.wallet.predict_account and self.chain is not None:
             try:
                 owner = await self.chain.account_owner(self.wallet.predict_account)
@@ -651,11 +670,18 @@ class RuleTaker:
         try:
             self.usdt, self.bnb = await asyncio.gather(self.chain.usdt_balance(), self.chain.bnb_balance())
             self.balance_ms, self.balance_asked_ms, self.balance_error = self.now(), asked, ""
+            self.balance_fails, self.balance_retry_ms = 0, 0
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            # (the balance read before kept, its time with it; tried again 15 s on, then 30, then every minute)
             self.balance_error = clean_error(error) or type(error).__name__
-            self.balance_ms = self.now() - BALANCE_IDLE_MS + 15_000  # (again in 15 s)
+            self.balance_fails += 1
+            self.balance_retry_ms = self.now() + min(BALANCE_RETRY_MS << min(self.balance_fails - 1, 8), BALANCE_RETRY_MAX_MS)
+
+    def balance_due(self, now: int, every: int) -> bool:
+        """A balance read due now: the last one ``every`` ms old (or none yet), and no failed read's backoff in the way."""
+        return now - self.balance_ms >= every and now >= self.balance_retry_ms
 
     async def ready_loop(self) -> None:
         """Signed in, checked, the balance read — and kept so: retried while not ready, the balance read again every
@@ -668,7 +694,7 @@ class RuleTaker:
                     await self.prepare()
                 busy = self.busy_in(now)
                 every = BALANCE_BUSY_MS if busy is not None and busy <= WARM_MS else BALANCE_IDLE_MS
-                if now - self.balance_ms >= every:
+                if self.balance_due(now, every):
                     await self.refresh_balance()
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.stop.wait(), 2.0)
@@ -1026,7 +1052,7 @@ class RuleTaker:
             for exchange in sorted(exchanges):
                 if self.chain is not None:
                     self.allowance[exchange] = (self.now(), int(await self.chain.allowance(exchange)))
-            if self.now() - self.balance_ms >= BALANCE_BUSY_MS:
+            if self.balance_due(self.now(), BALANCE_BUSY_MS):
                 await self.refresh_balance()
         except asyncio.CancelledError:
             raise
@@ -1200,6 +1226,11 @@ class RuleTaker:
             self.store.delete_keys([PREFIX + key for key in old])
             for key in old:
                 self.recs.pop(key, None)
+        # the order tests' records (test:<hash>) go the same way, KEEP_DAYS after the test
+        tests = [key for key, v in self.store.items("test:")
+                 if isinstance(v, dict) and 0 < int(v.get("at") or 0) < now - KEEP_DAYS * DAY_MS]
+        if tests:
+            self.store.delete_keys(tests)
 
     def live_cents(self, rule: Rule) -> int:
         """The rule's highest price in its window's course (RULE_*_LIVE_CENTS), cents; 0 = it buys before the window alone."""
@@ -1915,11 +1946,13 @@ class RuleTaker:
         if float(order.get("filled") or 0) >= float(order["shares"]) - DUST:
             order["state"] = "final"
             return
-        if order_final(row, float(order["shares"])) and not order.get("removed") and not order.get("closed_as"):
-            # closed on Predict's side, never by us (a rest is withdrawn only here, at a follow): its word kept — an order
-            # meeting the account's own resting one is cancelled as the taker (self-trade prevention), nothing bought
+        closed = order_final(row, float(order["shares"]))
+        if closed and not order.get("removes") and not order.get("removed") and not order.get("closed_as"):
+            # closed on Predict's side, never asked of it by us (a rest is withdrawn at a follow, a pause or a stop, each ask
+            # counted): its word kept — an order meeting the account's own resting one is cancelled as the taker (self-trade
+            # prevention), nothing bought
             order["closed_as"] = str(row.get("status") or "") or "?"
-        if order_final(row, float(order["shares"])) or order.get("removed"):
+        if closed:  # off the book on Predict's own record: the late fills taken until LATE_FILL_MS after it left, then final
             order["left_ms"] = int(order.get("left_ms") or now)
             if now - order["left_ms"] >= LATE_FILL_MS or late:
                 order["state"] = "final"
@@ -1929,16 +1962,30 @@ class RuleTaker:
         if late:
             order.update(state="final", error="到期后仍显示挂着：按已知成交记")
             return
-        if order.get("id"):  # still open: the rest withdrawn (a taker never waits on the book)
-            result = await self.api.remove_orders([order["id"]])
-            if order["id"] in (result.get("removed") or []) or order["id"] in (result.get("noop") or []):
-                order.update(removed=now, left_ms=now)
-            order.update(state="cancelling", next_ms=now + FOLLOW_EVERY_MS)
-        else:
+        if order.get("removed"):
+            # its withdrawal confirmed, Predict's record of it still open: never final on the answer alone (an order still on the
+            # book may take shares no read would follow) — read again shortly; still open REMOVE_SETTLE_MS on, the withdrawal did
+            # not take: on the book, counted as open again, and asked to be withdrawn again
+            if now - int(order["removed"]) < REMOVE_SETTLE_MS:
+                order["next_ms"] = now + (UNKNOWN_EVERY_MS if int(order.get("removes") or 0) >= REMOVE_TRIES else FOLLOW_EVERY_MS)
+                return
+            order.update(removed=0, state="open")
+        if not order.get("id"):
             order["next_ms"] = now + UNKNOWN_EVERY_MS
+            return
+        # still open: the rest withdrawn (a taker never waits on the book); counted as it is asked — an answer lost on the way
+        # may have been carried out all the same
+        order["removes"] = int(order.get("removes") or 0) + 1
+        result = await self.api.remove_orders([order["id"]])
+        if order["id"] in (result.get("removed") or []) or order["id"] in (result.get("noop") or []):
+            order.update(removed=now, left_ms=now, state="cancelling")
+        # (not named in the answer: withdrawn as far as anyone knows only once Predict's record says so — open as it was, its
+        # shares still claimed, asked again at the next follow)
+        order["next_ms"] = now + (UNKNOWN_EVERY_MS if order["removes"] >= REMOVE_TRIES else FOLLOW_EVERY_MS)
 
     async def withdraw_one(self, order: dict) -> None:
         now = self.now()
+        order["removes"] = int(order.get("removes") or 0) + 1
         try:
             result = await self.api.remove_orders([order["id"]])
         except asyncio.CancelledError:
@@ -1973,6 +2020,8 @@ class RuleTaker:
         done: set[str] = set()
         error = ""
         if resting:
+            for _, o in resting:
+                o["removes"] = int(o.get("removes") or 0) + 1
             try:
                 result = await self.api.remove_orders([str(o["id"]) for _, o in resting])
                 done = {str(i) for i in (result.get("removed") or [])} | {str(i) for i in (result.get("noop") or [])}
@@ -2099,7 +2148,8 @@ class RuleTaker:
                 self.loss_stop = {}
                 self.store.put("control:loss_stop", {})
             if floor is not None and (pnl <= floor or held):
-                self.loss_floor_at = {"day": day_of(self.now()), "floor": pnl - self.loss_cap}
+                # (the P&L now kept: the floor follows the cap should it change later today)
+                self.loss_floor_at = {"day": day_of(self.now()), "base": pnl, "floor": pnl - self.loss_cap}
                 self.store.put("control:loss_floor", self.loss_floor_at)
                 parts.append(f"今日停机线移到 {money(self.loss_floor_at['floor'])}（从现在的 {money(pnl)} 起再亏 ${self.loss_cap:g} 再停）")
             reply = "▶️ " + ("；".join(parts) if parts else "本来就没有暂停") + f"｜现在：{self.mode_text()}"
@@ -2416,15 +2466,28 @@ class RuleTaker:
             if not 1 <= rate <= 6000:
                 return "用法：/speed，或 /speed 4000（4000 = 这次测量用的每分钟请求数，1～6000；设置不动）"
             config = dataclasses.replace(config, rate_per_min=rate)
+        if self.stop.is_set():
+            return "⏳ 服务正在停止：不测速"
+        # (the measurement goes through the main key: never while it cools — it would be refused, and its refusals add on)
+        left = max(self.api.key_cooling(0) if hasattr(self.api, "key_cooling") else 0.0, self.cooling())
+        if left > 0:
+            return f"⏳ 这把 Key 正在限流冷却（还要 {int(left) + 1} 秒）：不测速，过了再发 /speed"
         if self.speeding:
             return "⏳ 测速正在进行，等它的结果（同一时间只测一次）"
         self.speeding = True
         lines: list[str] = []
         try:
             import importlib  # (the command line's own measurement: one code for both)
-            await importlib.import_module("ruletaker.__main__").latency(config, say=lines.append)
+            found = await importlib.import_module("ruletaker.__main__").latency(config, say=lines.append)
         finally:
             self.speeding = False
+        if isinstance(found, dict) and found.get("limited"):
+            # its requests went through the main key outside the service's pace: a 429 on them is that key's budget spent — the
+            # service's own requests kept off it for the cooldown, as a 429 of theirs would
+            if hasattr(self.api, "cool_key"):
+                self.api.cool_key(0)
+            lines.append(f"⚠️ 测速的请求被 Predict 限流 {found['limited']} 次（429）：这把 Key 先冷却 {PredictApi.BACKOFF_SECONDS:g} 秒，"
+                         "服务的请求这期间走备用 Key（没有备用 Key 就等）——测速别用超过这把 Key 额度的速率")
         hedge = self.stream.hedge() if hasattr(self.stream, "hedge") else None
         if hedge is None:
             lines.append("服务自己的推送：1 条连接（RULE_WS_CONNECTIONS=3 开 3 条，谁先送到用谁的；开了以后这里写省了多少）")
@@ -2676,6 +2739,9 @@ class RuleTaker:
         if self.quiet_ms(now) > 0:
             return {"busy": "抢单时刻前后这几秒不算复盘数据，稍后再刷新", "computed_ms": now}
         data = review(self.recs, self.settings, now, days)
+        # (a few spans kept, the one asked longest ago let go: /review 1 … /review 3650 never pile up)
+        while len(self.review_held) >= REVIEW_HELD and days not in self.review_held:
+            self.review_held.pop(min(self.review_held, key=lambda d: self.review_held[d][0]))
         self.review_held[days] = (now, data)
         return {**data, "computed_ms": now}
 
@@ -2701,7 +2767,8 @@ class RuleTaker:
         wait = s.fast_in(now)
         floor = self.loss_floor()
         return {"version": VERSION, "now_ms": now, "region": self.region, "mode": s.mode, "env_mode": self.env_mode, "modes": MODES,
-                "paused": self.paused, "blocked": self.block(0.0) if s.mode == "on" else "", "ready": self.ready,
+                "paused": self.paused, "loss_stop": self.loss_stop_why(),
+                "blocked": self.block(0.0) if s.mode == "on" else "", "ready": self.ready,
                 "not_ready": self.not_ready_why if s.mode == "on" and not self.ready else "", "trading_allowed": self.config.trading_allowed,
                 "account": {"kind": self.wallet.kind if self.wallet else "", "maker": self.wallet.maker if self.wallet else "",
                             "usdt": from_wei(self.usdt) if self.usdt is not None else None, "spendable": self.usd(),

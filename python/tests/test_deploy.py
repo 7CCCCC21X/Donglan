@@ -311,6 +311,29 @@ class VmKeyTest(unittest.TestCase):
         self.assertIn("：PREDICT_API_KEY STATUS_KEY", out)
         self.assertNotIn("还有明文", out)
 
+    def test_the_latency_measurement_is_handed_the_api_keys_and_never_the_private_key(self) -> None:
+        self.settings(f"RULE_TAKER=on\nPREDICT_PRIVATE_KEY=0x{A}\nPREDICT_API_KEY=api-key-0123456789\nPREDICT_RATE_PER_MIN=220\n")
+        code, out = self.key_sh("move")
+        self.assertEqual(code, 0, out)
+        probe = os.path.join(self.dir, "bin", "probe")
+        self.tool(os.path.dirname(probe), "probe", '#!/usr/bin/env bash\n'
+                  'echo "args=$* taker=$RULE_TAKER rate=${PREDICT_RATE_PER_MIN:-file}"\n'
+                  'ls "${CREDENTIALS_DIRECTORY:-/nonexistent}" 2>/dev/null | sed "s/^/credential=/"\n')
+        code, out = self.key_sh("measure", "4000", RT_RUN=probe)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"args=latency --env {self.env_file} taker=off rate=4000", out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith("credential=")], ["credential=ruletaker_secrets"])
+        with open(self.log) as f:
+            self.assertIn("-p User=ruletaker", f.read())
+        code, out = self.key_sh("measure", RT_RUN=probe)  # no rate given: the settings file's own
+        self.assertIn("taker=off rate=file", out)
+        code, out = self.key_sh("measure", "4k", RT_RUN=probe)
+        self.assertEqual(code, 2, out)
+        # rt.sh latency goes this way (a VM on the version before: as before)
+        with open(os.path.join(ROOT, "deploy", "gcp", "rt.sh"), encoding="utf-8") as f:
+            rt = f.read()
+        self.assertIn("vm-key.sh measure $rate", rt[rt.index("  latency)"):rt.index("  restart|stop|start)")])
+
     def test_every_secret_is_kept_encrypted_and_the_settings_file_holds_none(self) -> None:
         before = ("RULE_TAKER=paper\n"
                   "PREDICT_API_KEY=api-key-0123456789\n"
